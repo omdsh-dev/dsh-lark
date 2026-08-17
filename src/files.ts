@@ -520,12 +520,20 @@ export function resolveOutboundFile(input: string, workspace: string, maxBytes: 
  * The bytes come from the verdict's canonical path and never from the caller's
  * own input, so a link the check already followed cannot be followed a second
  * time to somewhere else.
+ *
+ * The size is checked again against the verdict, because `readFile` treats the
+ * size it stats as a hint and reads to EOF regardless. A file still being
+ * appended to when it was cleared — an agent's own background process writing
+ * on — would otherwise come back BIGGER than the ceiling that just let it
+ * through, and the ceiling is the whole reason this function exists.
  * @param file - a file {@link resolveOutboundFile} cleared.
  * @returns its contents.
- * @throws {Error} when the file moved, shrank, or vanished after it was cleared.
+ * @throws {Error} when the file vanished after it was cleared, or is no longer the size it cleared at.
  */
 export async function readOutboundFile(file: OutboundFile): Promise<Buffer> {
-  return readFile(file.path)
+  const bytes = await readFile(file.path)
+  if (bytes.byteLength !== file.bytes) throw new Error(`${file.fileName} changed size after it was cleared`)
+  return bytes
 }
 
 /**

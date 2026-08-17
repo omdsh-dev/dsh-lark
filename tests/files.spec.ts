@@ -533,6 +533,19 @@ describe('resolveOutboundFile', () => {
 
     expect((await readOutboundFile(verdict.file)).toString('utf8')).toBe('# 报告')
   })
+
+  it('refuses to hand over a file that grew past the ceiling after it cleared', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'growing.log'), 'x'.repeat(512))
+    const verdict = resolveOutboundFile('growing.log', workspace, 1024)
+    if (!verdict.ok) throw new Error('a file under the ceiling should have cleared')
+
+    // What a background process the agent started does while it calls the tool:
+    // `readFile` reads to EOF and would return 4 KiB through a 1 KiB ceiling.
+    await writeFile(join(workspace, 'growing.log'), 'x'.repeat(4096))
+
+    await expect(readOutboundFile(verdict.file)).rejects.toThrow('growing.log changed size after it was cleared')
+  })
 })
 
 describe('outbound refusal wording', () => {
