@@ -12,3 +12,8 @@ coverage/
 # Locally installed agent skills; not part of the package.
 .agents/
 .claude/
+
+# Working notes: brainstorms, design drafts, decision records, plans. They
+# belong to whoever is doing the work, not to the published package — and a
+# draft two people edit at once has no business producing merge conflicts.
+docs/
