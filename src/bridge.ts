@@ -140,6 +140,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, In
    * as "not known yet".
    */
   getBotIdentity?(): { readonly openId: string; readonly name?: string }
+  /**
+   * List a chat's human roster when the transport exposes it. This is optional
+   * because older channel implementations can still settle approvals using the
+   * callback's open id alone.
+   */
+  getChatMembers?(chatId: string): Promise<readonly { readonly id: string; readonly name?: string }[]>
   /** Replace a sent card's content in place. */
   updateCard(messageId: string, card: object): Promise<void>
 }
@@ -1795,7 +1801,7 @@ export function installBridge(
    * @param evt - the click, for authorization and the decider's name.
    * @returns the toast and the settled card to paint over the live one.
    */
-  const decideApproval = (value: ApprovalActionValue, evt: CardActionEvent): CardActionResponse => {
+  const decideApproval = async (value: ApprovalActionValue, evt: CardActionEvent): Promise<CardActionResponse> => {
     const pending = pendingApprovals.get(value.id)
     // Only an OPEN question takes a click: `sending` has no real card yet (a
     // click claiming otherwise is forged or duplicated), and `settled` is
@@ -1817,7 +1823,7 @@ export function installBridge(
       return { toast: toast('error', TOAST.notApprover) }
     }
     const outcome: HostApprovalOutcome = value.decision === 'allow' ? 'allowed-once' : 'rejected'
-    const decidedBy = evt.operator.name ?? evt.operator.openId
+    const decidedBy = await resolveApprovalDecider(evt)
     // Captured before settling, which drops the question from the map: what this
     // click paints is decided by the kind of question it answered, not by this
     // dispatch — a tool escalation and an outbound file settle differently.
@@ -1833,6 +1839,27 @@ export function installBridge(
       // its decision is worse than any toast.
       card: { type: 'raw', data: paint(outcome, decidedBy) },
     }
+  }
+
+  /**
+   * Pick the name that a settled approval records without making the approval
+   * depend on the optional roster API. Card callbacks do not reliably contain
+   * `operator.name`; the channel caches its member roster, so an already-warm
+   * chat avoids another remote lookup.
+   * @param evt - an already-authorized approval click.
+   * @returns the callback name, resolved member name, or safe open-id fallback.
+   */
+  const resolveApprovalDecider = async (evt: CardActionEvent): Promise<string> => {
+    if (evt.operator.name !== undefined && evt.operator.name !== '') return evt.operator.name
+    try {
+      const members = await port.getChatMembers?.(evt.chatId)
+      const name = members?.find(member => member.id === evt.operator.openId)?.name
+      if (name !== undefined && name !== '') return name
+    } catch (error) {
+      // Name decoration must never turn a valid approval into a failed send.
+      ctx.logger.debug('could not resolve approval decider name', error)
+    }
+    return evt.operator.openId
   }
 
   // Inbound events. Registered before connect so no early event is dropped.

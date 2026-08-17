@@ -241,8 +241,10 @@ export interface Config {
   /**
    * Open ids (`ou_…`) allowed to answer approval questions. Empty lets whoever
    * may drive that chat answer it too, which in a group is the room; the
-   * settled card names who decided either way. Set this when an escalation
-   * should need a named human — it grants more power than the sandbox allows.
+   * settled card names who decided either way. When the callback omits a name,
+   * the channel may best-effort resolve it from the chat roster and safely
+   * falls back to the open id. Set this when an escalation should need a named
+   * human — it grants more power than the sandbox allows.
    */
   approvers?: string[]
 }

@@ -151,6 +151,7 @@ dsh web
 - Image input is off by default: turn on `attachImages` only for a model you know accepts images.
 - `receiveFiles` is on by default: inbound files land under `.dsh-lark/inbox/<timestamp>-<message hash>/` in the conversation's workspace and are never cleaned up automatically — that's on you. The first file into a workspace prompts a suggestion to add `.dsh-lark/` to `.gitignore`, but the channel never edits that file itself.
 - `sendFiles` is on by default too: a direct message sends straight through, a group shows an approval card with the full path and size on every send — and there is no setting to turn that group approval off, since it would be an official back door for a prompt-injection exfiltration chain.
+- Settled approval cards record who decided: when the callback omits a name, the channel best-effort resolves it from the current chat roster. Missing roster permission, lookup failures, or departed members safely show the open id instead and never block approval or file delivery.
 - The single-file ceiling defaults to 20 MiB, set separately for each direction with `maxReceiveFileBytes` and `maxSendFileBytes`; documents (pdf / xlsx / docx) only ever arrive as a download with no online preview, because the upstream SDK uploads every general file as the `stream` type instead of inferring one from the extension.
 - Voice messages land on disk like any other file; nothing transcribes them.
 - Configuration is read at startup; changing it needs a restart.

@@ -42,7 +42,8 @@
         # app is visible to.
         # senderAllowlist: []   # empty serves anyone who can DM the app
         # groupAllowlist: []    # empty serves any group
-        # approvers: []         # empty lets whoever drives a chat approve
+        # approvers: []         # empty lets whoever drives a chat approve;
+        #                       # settled cards best-effort name the decider, else show open_id
 
     # The invariant companion stays out of the default patch: the shipped
     # dsh-base/web profiles compose no `invariants` service (it comes from the

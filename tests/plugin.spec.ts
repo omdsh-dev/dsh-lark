@@ -255,6 +255,60 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('uses the callback name without looking up the roster', async () => {
+      const harness = await mountChannel()
+      const { values } = await boundApproval(harness)
+      const allow = values.find((value) => value.decision === 'allow')!
+
+      const response = await harness.fake.emitCardAction(clickAction(allow, { name: '回调姓名' }))
+
+      expect(cardTexts((response as { card: { data: object } }).card.data).map(text => text.content))
+        .toContain('bash · 决定人：回调姓名')
+      expect(harness.fake.memberLookups).toEqual([])
+      await harness.dispose()
+    })
+
+    it('resolves an authorized decider from the cached chat roster when the callback omits a name', async () => {
+      const harness = await mountChannel()
+      harness.fake.chatMembers.set('oc_chat_1', [{ id: SENDER_ID, name: '成员姓名' }])
+      const { values } = await boundApproval(harness)
+      const allow = values.find((value) => value.decision === 'allow')!
+
+      const response = await harness.fake.emitCardAction(clickAction(allow))
+
+      expect(cardTexts((response as { card: { data: object } }).card.data).map(text => text.content))
+        .toContain('bash · 决定人：成员姓名')
+      expect(harness.fake.memberLookups).toEqual(['oc_chat_1'])
+      await harness.dispose()
+    })
+
+    it('falls back to the open id when roster lookup fails or no member is returned', async () => {
+      const harness = await mountChannel()
+      harness.fake.state.failChatMembers = true
+      const { outcome, values } = await boundApproval(harness)
+      const allow = values.find((value) => value.decision === 'allow')!
+
+      const response = await harness.fake.emitCardAction(clickAction(allow))
+
+      expect(cardTexts((response as { card: { data: object } }).card.data).map(text => text.content))
+        .toContain(`bash · 决定人：${SENDER_ID}`)
+      await expect(outcome).resolves.toBe('allowed-once')
+      expect(harness.fake.memberLookups).toEqual(['oc_chat_1'])
+      await harness.dispose()
+    })
+
+    it('does not look up a name for a click that is not authorized to approve', async () => {
+      const harness = await mountChannel({ approvers: ['ou_lead'] })
+      const { values } = await boundApproval(harness)
+      const allow = values.find((value) => value.decision === 'allow')!
+
+      const response = await harness.fake.emitCardAction(clickAction(allow, { openId: 'ou_bystander' }))
+
+      expect(response).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(harness.fake.memberLookups).toEqual([])
+      await harness.dispose()
+    })
+
     it('rejects through the reject button', async () => {
       const harness = await mountChannel()
       const { outcome, values } = await boundApproval(harness)
@@ -926,14 +980,16 @@ describe('dsh-lark-channel', () => {
       expect(texts).toContain(`${Buffer.byteLength(contents)} B`)
 
       const allow = approvalValueFromCard(card).find((value) => value.decision === 'allow')!
+      harness.fake.chatMembers.set('oc_group_1', [{ id: SENDER_ID, name: '群成员姓名' }])
       const response = await harness.fake.emitCardAction(
-        clickAction(allow, { chatId: 'oc_group_1', name: '同事' }),
+        clickAction(allow, { chatId: 'oc_group_1' }),
       )
       // The settled card is the FILE's, not a tool escalation's: the room reads
       // back what it just decided.
       const painted = JSON.stringify((response as { card?: { data: unknown } }).card?.data)
       expect(painted).toContain('已允许发送')
-      expect(painted).toContain('同事')
+      expect(painted).toContain('群成员姓名')
+      expect(harness.fake.memberLookups).toEqual(['oc_group_1'])
 
       await expect(sending).resolves.toEqual({ sent: true })
       expect(filesSent(harness)).toHaveLength(1)

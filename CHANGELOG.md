@@ -8,6 +8,9 @@
 - `/get <path>` sends one workspace file to the chat, with no agent and no card: a human who typed the path has stated his intent, and making him approve his own command is theatre. It answers in a chat that has no session yet, resolves relative paths against the conversation's workspace, and walks the exact same containment check the model's tool does.
 - Four configuration fields, both switches on by default: `receiveFiles` (`true`) and `maxReceiveFileBytes` (20 MiB) for what arrives, `sendFiles` (`true`) and `maxSendFileBytes` (20 MiB) for what leaves. Inbound content never enters the model's context — it lands on disk and the model gets a path — and the outbound risk is handled structurally by the gate above, so a gate that only exists when a deployment goes looking for it would be a gate designed not to be used. Where `sendFiles` is off, or the host registry cannot take a per-agent tool, `send_file` is absent and the standing prompt says so, so the model writes its findings into the reply instead of offering an attachment forever; `/get` stays available either way.
 
+### Fixed
+- Settled approval cards best-effort resolve a decider name from the chat roster when the platform callback carries only an open id. Missing roster permission, lookup failures, and departed members still settle the approval and safely show the open id, while unauthorized clicks never trigger a roster lookup.
+
 ## 0.0.6 — 2026-08-15
 
 ### Added
