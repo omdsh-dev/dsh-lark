@@ -296,13 +296,17 @@ function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?:
 /**
  * Build the interactive card asking a group to authorize one outbound file.
  * @param file - the file the workspace check cleared.
+ * @param bytes - the length of the buffer that will go out if this is allowed.
+ * Taken from the buffer rather than from the verdict, so the size on the card
+ * measures the artefact being approved and not whatever was on disk before it
+ * was read.
  * @param id - correlation id carried by both decision buttons.
  * @returns a Feishu card object for `send({ card })`.
  */
-function fileApprovalCard(file: OutboundFile, id: string): object {
+function fileApprovalCard(file: OutboundFile, bytes: number, id: string): object {
   return buildFileApprovalCard({
     path: file.path,
-    bytes: file.bytes,
+    bytes,
     allow: { kind: APPROVAL_ACTION, id, decision: 'allow' },
     reject: { kind: APPROVAL_ACTION, id, decision: 'reject' },
   })
@@ -1533,6 +1537,9 @@ export function installBridge(
    * `paint` closure.
    * @param binding - the group chat this file would land in.
    * @param file - the file the workspace check cleared.
+   * @param sending - the bytes that will go out if the room allows it, already
+   * read: what the card quotes is this buffer's length, so the room is deciding
+   * about an artefact that exists rather than about a path that may still change.
    * @param signal - the calling execution's cancellation, so a stopped turn
    * takes its card down with it instead of leaving one that can still release
    * the file long after the turn that asked for it is gone.
@@ -1541,6 +1548,7 @@ export function installBridge(
   const askFileSend = async (
     binding: ChatBinding,
     file: OutboundFile,
+    sending: Buffer,
     signal?: AbortSignal,
   ): Promise<string | undefined> => {
     // Already cancelled: publishing a card here would ask a room to decide
@@ -1579,7 +1587,7 @@ export function installBridge(
     signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
-      if (!await sendApprovalCard(id, pending, fileApprovalCard(file, id))) {
+      if (!await sendApprovalCard(id, pending, fileApprovalCard(file, sending.byteLength, id))) {
         settleApproval(id, 'cancelled')
         pendingApprovals.delete(id)
         return 'The approval card could not be sent to this chat, so the file was not sent either.'
@@ -1616,6 +1624,16 @@ export function installBridge(
    * the human row of the matrix from ever drifting into the model's row — a
    * shared function with a "gate this one" flag is exactly how it would.
    *
+   * The bytes are read BEFORE the room is asked, and the buffer in hand is what
+   * goes out. Read afterwards, an approval would certify a PATH rather than a
+   * file: thirty minutes is ample for a background process the model started to
+   * leave a same-size `.env` under the name the card showed, and neither the
+   * size re-check in `readOutboundFile` nor the container check — which never
+   * runs again on the cleared path — can see that swap. Reading first makes the
+   * artefact the room approved and the artefact that leaves one object. The cost
+   * is up to `maxSendFileBytes` held per pending approval for the approval
+   * window, which is the memory ADR 0004 already budgets and bounds a send by.
+   *
    * Failures come back as a string rather than a throw: the caller is a tool
    * body that turns whatever it gets into the model's error, and one refusal
    * shape for "rejected", "timed out" and "the upload failed" is what keeps
@@ -1633,15 +1651,16 @@ export function installBridge(
   ): Promise<string | undefined> => {
     const binding = bySession.get(sessionId)
     if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
-    if (binding.chatType !== 'p2p') {
-      const refused = await askFileSend(binding, file, signal)
-      if (refused !== undefined) return refused
-    }
+    // First, so that everything after this point is about bytes that exist.
     let bytes: Buffer
     try {
       bytes = await readOutboundFile(file)
     } catch (error) {
       return `That file could not be read: ${failureDetail(error)}`
+    }
+    if (binding.chatType !== 'p2p') {
+      const refused = await askFileSend(binding, file, bytes, signal)
+      if (refused !== undefined) return refused
     }
     try {
       // A buffer, never a path (ADR 0004), and through the transport's own media

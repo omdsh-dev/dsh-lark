@@ -932,6 +932,32 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('sends the bytes the card was raised for, not what replaced them while it stood', async () => {
+      const { workspace, contents } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      // Exactly what a background process the model started can do while a room
+      // reads the card: the same number of bytes, different content. A size
+      // re-check cannot see it, so the only defence is having read the file
+      // before anyone was asked about it.
+      const swapped = 'S'.repeat(Buffer.byteLength(contents))
+      await writeFile(join(workspace, 'report.md'), swapped)
+
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!).find((value) => value.decision === 'allow')!
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+      await expect(sending).resolves.toEqual({ sent: true })
+
+      // The approved artefact is the one that left.
+      expect((filesSent(harness)[0]!.file.source as Buffer).toString('utf8')).toBe(contents)
+      // And the size the room judged came from that same buffer.
+      const texts = cardTexts(cardsSent(harness)[0]!).map((text) => text.content)
+      expect(texts).toContain(`${Buffer.byteLength(contents)} B`)
+      await harness.dispose()
+    })
+
     it('sends nothing when the group rejects, and tells the model it was rejected', async () => {
       const { workspace } = await workspaceWithArtifact()
       const harness = await mountChannel({ cwd: workspace })

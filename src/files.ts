@@ -38,8 +38,9 @@
 import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
 import { mkdir, readFile, rmdir, unlink } from 'node:fs/promises'
-import { basename, extname, join, resolve, sep } from 'node:path'
+import { basename, extname, join, resolve } from 'node:path'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
+import { canonicalPathOf, isWithinContainer } from './containment.ts'
 
 /** The channel's own directory inside a workspace. */
 const CHANNEL_DIRECTORY = '.dsh-lark'
@@ -331,8 +332,25 @@ export async function collectInboundFiles(
   try {
     // The transport streams into an existing directory; it does not make one.
     await mkdir(directory, { recursive: true })
+    // And the directory it just made has to be PROVEN inside the workspace
+    // rather than merely spelled that way. The sanitizer cannot see a symlink —
+    // it judges one name, while `resolve` and `join` fold `..` and then answer
+    // "inside the workspace" for a path whose own components lead anywhere at
+    // all: a `.dsh-lark/inbox` pointing elsewhere takes `mkdir` with it, and
+    // the sender's next file lands in the link's target under a name the sender
+    // chose. So containment is asked of the filesystem and not of the string,
+    // the same way outbound refuses to trust a path it has not canonicalized
+    // (ADR 0004) — and a write earns that question at least as much as a read.
+    const landing = realpathSync(directory)
+    const container = canonicalPathOf(options.workspace) ?? resolve(options.workspace)
+    if (!isWithinContainer(landing, container)) {
+      throw new Error('the inbox directory does not resolve inside the workspace')
+    }
   } catch (error) {
     const detail = failureDetail(error)
+    // Nothing was downloaded, so whatever this attempt did create is an empty
+    // directory nobody was promised — including one made through a link.
+    await discardDirectory(directory)
     options.report(`lark-channel: could not create the inbox directory ${directory}: ${detail}`)
     return {
       landed: [],
@@ -434,35 +452,6 @@ export type OutboundVerdict =
   | { readonly ok: false; readonly refusal: OutboundRefusal }
 
 /**
- * Whether one canonical path sits at or inside a canonical container.
- *
- * Spelled out here rather than reached for from `workspace.ts`: `withinRoots`
- * reads an empty list as "anywhere at all", and a predicate carrying an
- * allow-everything mode has no business under a security check.
- * @param path - a canonical path.
- * @param container - a canonical directory.
- * @returns true when the path is the container or below it.
- */
-function isWithinContainer(path: string, container: string): boolean {
-  if (path === container) return true
-  return path.startsWith(container.endsWith(sep) ? container : `${container}${sep}`)
-}
-
-/**
- * One path's canonical form, or undefined when the filesystem will not produce
- * one — nothing there, a dangling link, a component it will not traverse.
- * @param path - an absolute path.
- * @returns the canonical path, or undefined.
- */
-function canonicalPathOf(path: string): string | undefined {
-  try {
-    return realpathSync(path)
-  } catch {
-    return undefined
-  }
-}
-
-/**
  * What the filesystem says about one canonical path.
  * @param path - a canonical path.
  * @returns whether it is a regular file and how big, or undefined when it cannot be examined.
@@ -526,6 +515,13 @@ export function resolveOutboundFile(input: string, workspace: string, maxBytes: 
  * appended to when it was cleared — an agent's own background process writing
  * on — would otherwise come back BIGGER than the ceiling that just let it
  * through, and the ceiling is the whole reason this function exists.
+ *
+ * That check enforces the CEILING and closes no race: a rewrite to the same
+ * length passes it unnoticed, and this function re-examines neither the
+ * canonical path nor what it now points at. So it is not what makes a group's
+ * approval mean anything — the caller's ORDER is. `deliverFile` reads the bytes
+ * before it asks the room and sends the buffer it already holds, so the file the
+ * card certified is the object that leaves.
  * @param file - a file {@link resolveOutboundFile} cleared.
  * @returns its contents.
  * @throws {Error} when the file vanished after it was cleared, or is no longer the size it cleared at.

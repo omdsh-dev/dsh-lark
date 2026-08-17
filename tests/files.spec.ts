@@ -332,6 +332,35 @@ describe('collectInboundFiles', () => {
     expect(reports[0]).toContain('inbox directory')
   })
 
+  it('writes nothing through an inbox that is a symlink out of the workspace', async () => {
+    const workspace = createWorkspace()
+    const elsewhere = createWorkspace()
+    // What an injected model can arrange with one write inside its OWN
+    // workspace, which every preset allows: the inbox becomes a link, and the
+    // next file the sender names lands wherever it points.
+    await mkdir(join(workspace, '.dsh-lark'), { recursive: true })
+    symlinkSync(elsewhere, join(workspace, '.dsh-lark', 'inbox'))
+    const { port, calls } = stageResources({ fk_payload: 'payload' })
+    const { options, reports } = stageOptions(workspace)
+    const result = await collectInboundFiles(
+      fileMessage([resource('file', 'fk_payload', 'payload')]),
+      port,
+      options,
+    )
+
+    // The destination STRING resolves under the workspace — that is why a string
+    // check clears it — and the bytes would have landed outside it anyway.
+    expect(join(workspace, '.dsh-lark', 'inbox').startsWith(`${workspace}${sep}`)).toBe(true)
+    expect(result.landed).toEqual([])
+    expect(calls).toEqual([])
+    expect(await readdir(elsewhere)).toEqual([])
+    expect(result.notes).toHaveLength(1)
+    expect(result.notes[0]).toContain('收到 1 个文件')
+    expect(result.notes[0]).toContain('.dsh-lark/inbox/')
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toContain('inbox directory')
+  })
+
   it('hints at .gitignore once files really landed, and not otherwise', async () => {
     const workspace = createWorkspace()
     const { port } = stageResources({ fk_doc: 'log lines' })
