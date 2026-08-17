@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import type { HostAgentHandle } from '../src/host.ts'
 import { ConversationSessions, conversationKey, sessionIdFor } from '../src/session.ts'
 import type { SessionLadder, SessionScope } from '../src/session.ts'
@@ -39,7 +40,15 @@ function createFakeLadder(behavior: LadderBehavior = {}) {
     let handle = handles.get(sessionId)
     if (handle === undefined) {
       handle = {
-        agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+        agent: {
+          id: sessionId,
+          session: { id: sessionId },
+          // A live-reuse composes the chat-only parts on the agent's scope; the
+          // fake scope carries no tools, which is the safe-degradation path.
+          ctx: new Context(),
+          followup: () => {},
+          cancel: () => {},
+        },
         dispose: async () => {
           disposals.push(sessionId)
           if (behavior.failDispose === true) throw new Error(`dispose rejected (fake): ${sessionId}`)
@@ -406,7 +415,7 @@ describe('a release still tearing down', () => {
     let created = 0
     const handles = new Map<string, HostAgentHandle>()
     const handleFor = (sessionId: string, slow: boolean): HostAgentHandle => ({
-      agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+      agent: { id: sessionId, session: { id: sessionId }, ctx: new Context(), followup: () => {}, cancel: () => {} },
       dispose: async () => {
         // The registry only forgets it once disposal completes, as a host does.
         if (slow) await held
@@ -463,7 +472,7 @@ describe('a release whose walk is still running', () => {
       create: async (sessionId) => {
         created.push(sessionId)
         const handle: HostAgentHandle = {
-          agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+          agent: { id: sessionId, session: { id: sessionId }, ctx: new Context(), followup: () => {}, cancel: () => {} },
           dispose: async () => {
             disposed.push(sessionId)
             // Per AGENT, not per id: disposing a retired one must not evict the
@@ -520,7 +529,7 @@ describe('a release whose walk is still running', () => {
       lookup: () => undefined,
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => ({
-        agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+        agent: { id: sessionId, session: { id: sessionId }, ctx: new Context(), followup: () => {}, cancel: () => {} },
         dispose: async () => { await held; disposed.push(sessionId) },
       }),
       report: () => {},
@@ -558,7 +567,7 @@ describe('closing while a walk is still running', () => {
         created.push(sessionId)
         await held
         return {
-          agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+          agent: { id: sessionId, session: { id: sessionId }, ctx: new Context(), followup: () => {}, cancel: () => {} },
           dispose: async () => { disposed.push(sessionId) },
         }
       },
@@ -588,7 +597,7 @@ describe('closing while a walk is still running', () => {
       lookup: () => undefined,
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => ({
-        agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+        agent: { id: sessionId, session: { id: sessionId }, ctx: new Context(), followup: () => {}, cancel: () => {} },
         dispose: async () => { await held; disposed.push(sessionId) },
       }),
       report: () => {},

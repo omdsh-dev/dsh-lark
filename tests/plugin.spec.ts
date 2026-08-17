@@ -335,7 +335,7 @@ describe('dsh-lark-channel', () => {
     it('delegates questions about foreign agents', async () => {
       const harness = await mountChannel()
       const request: HostApprovalRequest = {
-        agent: { id: 'foreign', session: { id: 'foreign' }, followup: () => {}, cancel: () => {} },
+        agent: { id: 'foreign', session: { id: 'foreign' }, ctx: new Context(), followup: () => {}, cancel: () => {} },
         toolName: 'bash',
       }
       const outcome = await harness.ctx.waterfall(
@@ -1976,7 +1976,7 @@ describe('dsh-lark-channel', () => {
     const harness = await mountChannel({ output: 'stream' }, { competingAnswerer: competing })
     harness.ctx.waterfall(
       'approval/request',
-      { agent: { id: 'other', session: { id: 'other' }, followup: () => {}, cancel: () => {} }, toolName: 'fs_write' },
+      { agent: { id: 'other', session: { id: 'other' }, ctx: new Context(), followup: () => {}, cancel: () => {} }, toolName: 'fs_write' },
       async (): Promise<HostApprovalOutcome> => 'unavailable',
     ).catch(() => undefined)
 

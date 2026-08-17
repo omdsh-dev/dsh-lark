@@ -91,6 +91,8 @@ export interface HostPermissionPresets {
 export interface HostAgent {
   /** The single identity shared with {@link session}. */
   readonly id: string
+  /** The agent's scope context, where creation `setup` keeps its registrations. */
+  readonly ctx: Context
   readonly session: HostSession
   /** Queue an ordinary follow-up turn and wake the driver. */
   followup(message: HostUserMessage): void

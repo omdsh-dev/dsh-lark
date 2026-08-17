@@ -402,7 +402,12 @@ export interface CreatedAgent {
   registeredTools: { name: string }[]
   agent: {
     id: string
+<<<<<<< HEAD
     session: { id: string; events: { type: string; data: unknown }[] }
+=======
+    session: { id: string }
+    ctx: Context
+>>>>>>> 36725c7 (fix: compose shadow tools for a chat reusing a live agent)
     followup: ReturnType<typeof vi.fn<(m: HostUserMessage) => void>>
     cancel: ReturnType<typeof vi.fn<(cause: string) => void>>
     whenIdle: () => Promise<void>
@@ -461,6 +466,9 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       // A live session carries its log; several host services fold their state
       // out of it rather than mirroring it, and this channel reads two that way.
       session: { id: sessionId, events: [] },
+      // A live-reuse composes the chat-only parts on the agent's scope; the fake
+      // scope carries no tools, which is the safe-degradation path.
+      ctx: new Context(),
       followup: vi.fn<(m: HostUserMessage) => void>(),
       cancel: vi.fn<(cause: string) => void>(),
       whenIdle: async () => {
@@ -487,13 +495,15 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
    * carrying the per-agent tools and prompt services, awaited BEFORE the agent
    * is published, so a rejection surfaces to the caller and yields no agent.
    */
-  const compose = async (setup?: (agentCtx: Context) => Promise<void>) => {
+  const compose = async (setup?: (agentCtx: Context) => Promise<void>, agent?: CreatedAgent['agent']) => {
     const guards: ((execution: { name: string }) => string | undefined)[] = []
     const sections: { name: string; order: number; text: string }[] = []
     /** Tool definitions this agent's composition registered in its own layer. */
     const registered: { name: string }[] = []
     if (setup !== undefined) {
-      const agentCtx = new Context()
+      // The real factory hands setup the agent's own scope, extended with the
+      // agent so `agentCtx.agent` names it; the fake mirrors that shape.
+      const agentCtx = agent === undefined ? new Context() : new Context().extend({ agent })
       agentCtx.provide('tools', {
         guard: (g: (e: { name: string }) => string | undefined) => {
           guards.push(g)
@@ -554,7 +564,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
         sessionId: options.resumeSessionId,
         meta: undefined,
         agentOptions: options.agentOptions,
-        ...await compose(options.setup),
+        ...await compose(options.setup, agent),
         agent,
         dispose: vi.fn<() => Promise<void>>(async () => {}),
       }
@@ -572,7 +582,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
         sessionId: options.sessionId,
         meta: options.meta === undefined ? undefined : { ...options.meta },
         agentOptions: options.agentOptions,
-        ...await compose(options.setup),
+        ...await compose(options.setup, agent),
         agent,
         dispose: vi.fn<() => Promise<void>>(async () => {}),
       }

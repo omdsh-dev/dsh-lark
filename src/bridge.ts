@@ -1042,6 +1042,9 @@ export function installBridge(
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+        // The agent is now fully composed; a later live reuse must not run
+        // this again, or the shadow tools and prompt section double-register.
+        chatComposed.add((agentCtx as unknown as { agent: HostAgent }).agent)
       },
     }
   }
@@ -1065,12 +1068,38 @@ export function installBridge(
     return pending
   }
 
+  /** Agents this channel already composed, so a live reuse never double-registers. */
+  const chatComposed = new WeakSet<HostAgent>()
+
+  /**
+   * A chat reusing a live agent skips the create/resume setup that registers
+   * this channel's shadow tools — most visibly a session the Web UI created,
+   * which stays live and lets `ask_user_question` fall through to whichever
+   * surface claimed the single user-questions provider instead of becoming a
+   * chat card. Compose the chat-only parts on first reuse; the preset join is
+   * deliberately skipped because the live agent already has one.
+   * @param agent - the live agent being reused by a chat.
+   */
+  const ensureChatComposed = (agent: HostAgent): void => {
+    if (chatComposed.has(agent)) return
+    chatComposed.add(agent)
+    try {
+      composeChatAgent(agent.ctx, config, askQuestions, planReview, sendFilePorts, botSelf())
+    } catch (error) {
+      // Reuse must never take the chat down; the model still answers, just
+      // without this channel's card-backed tools.
+      notify(`lark-channel: composing a reused live agent failed: ${String(error)}`)
+    }
+  }
+
   const agents = ctx.agents as DurableAgentRegistry
 
   const ladder: SessionLadder = {
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
-      // An agent another owner published is theirs to dispose.
+      // An agent another owner published is theirs to dispose, but it still
+      // runs for this chat, so its composition is completed here.
+      if (agent !== undefined) ensureChatComposed(agent)
       return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
     },
     resume: async (sessionId) => {
