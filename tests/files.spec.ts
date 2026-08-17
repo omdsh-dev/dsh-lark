@@ -530,6 +530,46 @@ describe('resolveOutboundFile', () => {
     expect(resolveOutboundFile(join(linked, 'report.md'), linked, 1024)).toEqual({ ok: true, file: cleared })
   })
 
+  it('refuses a sibling directory whose name merely starts with the workspace\'s', async () => {
+    const parent = createWorkspace()
+    // Literal names, because `mkdtemp` names are never prefixes of each other:
+    // nothing else here would notice the check dropping the separator it appends.
+    const workspace = join(parent, 'ws')
+    const sibling = join(parent, 'ws-evil')
+    await mkdir(workspace)
+    await mkdir(sibling)
+    await writeFile(join(sibling, 'secret.md'), 'not yours')
+
+    expect(sibling.startsWith(workspace)).toBe(true)
+    expect(resolveOutboundFile(join(sibling, 'secret.md'), workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+    expect(resolveOutboundFile('../ws-evil/secret.md', workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+  })
+
+  it('refuses a path carrying a NUL byte instead of letting the filesystem throw', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+
+    // A model can write any string into the argument, and `path.resolve` keeps a
+    // NUL — only the filesystem rejects it, which must arrive as a refusal the
+    // model reads rather than as an ERR_INVALID_ARG_VALUE thrown mid-turn.
+    expect(resolveOutboundFile('report.md\u0000.png', workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'not_found' } })
+  })
+
+  it('refuses everything when the workspace itself is not there', () => {
+    const missing = join(createWorkspace(), 'never-created')
+
+    // The uncanonicalizable workspace still bounds the check rather than
+    // widening it: a `/cd` target removed under a live conversation must not
+    // turn the container check into "anywhere at all".
+    expect(resolveOutboundFile('report.md', missing, 1024))
+      .toEqual({ ok: false, refusal: { code: 'not_found' } })
+    expect(resolveOutboundFile('/etc/hosts', missing, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+  })
+
   it('refuses a directory, a path with nothing there, and no path at all', async () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'out'))
@@ -603,9 +643,22 @@ describe('outbound refusal wording', () => {
   it('carries the real size and the ceiling in both voices', () => {
     const refusal: OutboundRefusal = { code: 'too_large', bytes: 25 * 1024 * 1024, limit: 20 * 1024 * 1024 }
 
+    // One formatter serves the card and both refusal voices now, and it prints a
+    // whole size without a trailing `.0` — `25 MiB over a 20 MiB limit`.
     for (const text of [describeRefusalForModel(refusal), describeRefusalForChat(refusal)]) {
-      expect(text).toContain('25.0 MiB')
-      expect(text).toContain('20.0 MiB')
+      expect(text).toContain('25 MiB')
+      expect(text).toContain('20 MiB')
+    }
+  })
+
+  it('spells a size the way the approval card spells it', () => {
+    const refusal: OutboundRefusal = { code: 'too_large', bytes: 1258291, limit: 1024 * 1024 }
+
+    // The room reading the card and the model reading the error must not be told
+    // two different sizes for one file, which `KB` beside `KiB` guaranteed.
+    for (const text of [describeRefusalForModel(refusal), describeRefusalForChat(refusal)]) {
+      expect(text).toContain('1.2 MiB')
+      expect(text).not.toContain('MB')
     }
   })
 })
@@ -702,6 +755,17 @@ describe('send_file tool', () => {
     expect(refused.reports[0]).toContain('outside_workspace')
     expect(refused.reports[0]).toContain(escape)
     expect(refused.reports[0]).toMatch(/^lark-channel: /)
+
+    // And ONLY the escape: a model mistyping a path, naming a directory, or
+    // picking too big a file is making its own mistake, not an operator's event
+    // — reporting those hands a model that keeps guessing a console to write to.
+    const mundane = stageSendPorts(workspace)
+    const tool = sendFileTool(mundane.ports) as Runnable
+    await expect(tool.execute({ path: 'missing.md' }, execFor('s1'))).rejects.toThrow(/no file at that path/)
+    await expect(tool.execute({ path: '.' }, execFor('s1'))).rejects.toThrow(/not a regular file/)
+    await writeFile(join(workspace, 'huge.bin'), 'x'.repeat(2048))
+    await expect(tool.execute({ path: 'huge.bin' }, execFor('s1'))).rejects.toThrow(/single-file limit/)
+    expect(mundane.reports).toEqual([])
 
     // The deliverer reports its own failures, with the transport's code; saying
     // it again here would put every upload failure on the console twice.

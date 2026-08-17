@@ -62,16 +62,31 @@ describe('file approval card', () => {
     // The path exactly as it was handed over: a shortened or prettified form
     // would hide which file the room is about to publish.
     expect(texts.some((text) => text.content === path)).toBe(true)
-    expect(texts.some((text) => text.content === '1.2 MB')).toBe(true)
+    // `MiB`, not `MB`: the arithmetic above it divides by 1024, and the card and
+    // the tool error the model reads now spell one size one way.
+    expect(texts.some((text) => text.content === '1.2 MiB')).toBe(true)
   })
 
   it('reads a size in binary units, whole ones without a decimal', () => {
     const sizeShown = (bytes: number): string[] =>
       cardTexts(fileApprovalCard({ path: '/w/f', bytes, allow: {}, reject: {} })).map((text) => text.content)
     expect(sizeShown(12)).toContain('12 B')
-    expect(sizeShown(1024)).toContain('1 KB')
-    expect(sizeShown(840 * 1024)).toContain('840 KB')
-    expect(sizeShown(3 * 1024 * 1024 * 1024)).toContain('3 GB')
+    expect(sizeShown(1024)).toContain('1 KiB')
+    expect(sizeShown(840 * 1024)).toContain('840 KiB')
+    expect(sizeShown(3 * 1024 * 1024 * 1024)).toContain('3 GiB')
+    // The top of a band carries up instead of printing as the next unit's floor:
+    // `1024.0 KiB` is a size spelled in a unit that reads as the one above it.
+    expect(sizeShown(1024 * 1024 - 40)).toContain('1 MiB')
+    // And a size that rounds DOWN inside its band keeps that band.
+    expect(sizeShown(1024 * 1024 - 500)).toContain('1023.5 KiB')
+  })
+
+  it('wears the same heading a tool escalation wears', () => {
+    const asking = (card: object): string | undefined => cardTexts(card)[0]?.content
+    // One authorization, one word for it: two copies of the heading are two
+    // things to edit, and the room would end up asked in two different voices.
+    expect(asking(fileApprovalCard({ path: '/w/out.zip', bytes: 1, allow: {}, reject: {} })))
+      .toBe(asking(approvalCard({ toolName: 'bash', allow: {}, reject: {} })))
   })
 
   it('carries one decision payload per button, and nothing else clickable', () => {

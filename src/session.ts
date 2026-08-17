@@ -8,6 +8,7 @@
  */
 
 import type { NormalizedMessage } from '@larksuite/channel'
+import { failureDetail } from './format.ts'
 import type { HostAgentHandle } from './host.ts'
 
 /** Which conversation facet owns one agent session. */
@@ -21,15 +22,6 @@ const SESSION_PREFIX = 'lark-'
 
 /** Separator between a conversation key's facets; absent from Feishu open ids. */
 const FACET_SEPARATOR = ':'
-
-/**
- * Render a handled failure as one operator-readable detail.
- * @param error - the rejection value, which need not be an `Error`.
- * @returns the message, or the stringified value for a non-error rejection.
- */
-function failureDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
 
 /**
  * A walk finished under a generation that a release had already moved past.

@@ -41,6 +41,7 @@ import { mkdir, readFile, rmdir, unlink } from 'node:fs/promises'
 import { basename, extname, join, resolve } from 'node:path'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
 import { canonicalPathOf, isWithinContainer } from './containment.ts'
+import { failureDetail, formatBytesForChat, formatBytesForModel } from './format.ts'
 
 /** The channel's own directory inside a workspace. */
 const CHANNEL_DIRECTORY = '.dsh-lark'
@@ -134,47 +135,6 @@ function isLandableResource(resource: ResourceDescriptor): resource is LandableR
  */
 function downloadTypeOf(type: LandedFile['type']): 'image' | 'file' {
   return type === 'image' ? 'image' : 'file'
-}
-
-/**
- * Render a handled failure as one readable detail.
- * @param error - the rejection value, which need not be an `Error`.
- * @returns the message, or the stringified value for a non-error rejection.
- */
-function failureDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-/**
- * A size the way a note should carry it: exact below a kilobyte, one decimal
- * above it, so "25.4 MiB over a 20.0 MiB limit" reads as a comparison instead
- * of two long numbers to line up digit by digit.
- * @param bytes - the count.
- * @param byteUnit - what a raw count is called; KiB and MiB need no translation.
- * @returns the short form.
- */
-function formatSize(bytes: number, byteUnit: string): string {
-  if (bytes < 1024) return `${bytes} ${byteUnit}`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
-}
-
-/**
- * One size for a human reading the chat.
- * @param bytes - the count.
- * @returns the Chinese-facing short form.
- */
-function formatBytes(bytes: number): string {
-  return formatSize(bytes, '字节')
-}
-
-/**
- * One size for the model reading a tool error.
- * @param bytes - the count.
- * @returns the English short form.
- */
-function formatBytesInEnglish(bytes: number): string {
-  return formatSize(bytes, bytes === 1 ? 'byte' : 'bytes')
 }
 
 /**
@@ -325,7 +285,16 @@ export async function collectInboundFiles(
   if (resources.length === 0) return { landed: [], notes: [] }
   if (!options.enabled) {
     // Told, not hidden: someone who attaches a log is talking about the log.
-    return { landed: [], notes: [`（用户发送了 ${resources.length} 个文件，本渠道未接收它们：receiveFiles 未开启）`] }
+    //
+    // "Not saved" and not "not received": with `attachImages` on, an image this
+    // switch keeps off the disk is STILL attached as a content block by
+    // `images.ts` — a deliberate ruling — so a note claiming the channel never
+    // received it would contradict the picture sitting right beside it. What
+    // this switch actually costs the model is the path, and that is what it says.
+    return {
+      landed: [],
+      notes: [`（用户发送了 ${resources.length} 个文件，本渠道未把它们存入工作区，因此没有可读取的路径：receiveFiles 未开启）`],
+    }
   }
 
   const directory = inboxDirectoryFor(msg, options.workspace)
@@ -378,8 +347,8 @@ export async function collectInboundFiles(
       if (bytesWritten > options.maxFileBytes) {
         await discardFile(destination, options.report)
         skipped.push(
-          `（文件 ${fileName} 有 ${formatBytes(bytesWritten)}，`
-          + `超过单个文件上限 ${formatBytes(options.maxFileBytes)}，未保存）`,
+          `（文件 ${fileName} 有 ${formatBytesForChat(bytesWritten)}，`
+          + `超过单个文件上限 ${formatBytesForChat(options.maxFileBytes)}，未保存）`,
         )
         continue
       }
@@ -388,7 +357,7 @@ export async function collectInboundFiles(
         // it goes back off the disk, and everything behind it stays undownloaded.
         await discardFile(destination, options.report)
         skipped.push(
-          `（单条消息总量上限 ${formatBytes(messageCeiling)} 已用尽，`
+          `（单条消息总量上限 ${formatBytesForChat(messageCeiling)} 已用尽，`
           + `还有 ${resources.length - index} 个文件未保存）`,
         )
         break
@@ -548,8 +517,8 @@ export function describeRefusalForModel(refusal: OutboundRefusal): string {
     case 'not_a_file':
       return 'That path is not a regular file, so it has no bytes to send; a directory cannot be sent as one file.'
     case 'too_large':
-      return `That file is ${formatBytesInEnglish(refusal.bytes)}, over this chat's `
-        + `${formatBytesInEnglish(refusal.limit)} single-file limit; send a smaller file, or an excerpt in your reply.`
+      return `That file is ${formatBytesForModel(refusal.bytes)}, over this chat's `
+        + `${formatBytesForModel(refusal.limit)} single-file limit; send a smaller file, or an excerpt in your reply.`
   }
 }
 
@@ -568,7 +537,7 @@ export function describeRefusalForChat(refusal: OutboundRefusal): string {
     case 'not_a_file':
       return '这不是一个普通文件（目录不能作为一个文件发送）。'
     case 'too_large':
-      return `文件有 ${formatBytes(refusal.bytes)}，超过单个文件上限 ${formatBytes(refusal.limit)}。`
+      return `文件有 ${formatBytesForChat(refusal.bytes)}，超过单个文件上限 ${formatBytesForChat(refusal.limit)}。`
   }
 }
 
@@ -669,15 +638,19 @@ export function sendFileTool(ports: SendFilePorts): object {
       }
       const verdict = resolveOutboundFile(requested, workspace, ports.maxBytes)
       if (!verdict.ok) {
-        // Reported here and nowhere else: a refused path never reaches the
-        // delivery port, and a model reaching outside its workspace — the shape
-        // an injected instruction takes — is something an operator must be able
-        // to see. Collapsed to one bounded line first, because the path is
-        // model-authored text and a console line it could break in two is a
-        // console line it could forge.
-        const attempted = requested.replace(/\s+/g, ' ').slice(0, 200)
-        ports.report(`lark-channel: ${SEND_FILE_TOOL} refused ${attempted} `
-          + `in session ${sessionId}: ${verdict.refusal.code}`)
+        // The ESCAPE is reported, and only the escape. A model reaching outside
+        // its workspace is the shape an injected instruction takes, it never
+        // reaches the delivery port, so this is the only place it can leave a
+        // trace — while "not found", "not a file" and "too large" are the model
+        // mistyping a path or misjudging a size, and putting those on the
+        // console lets a model that keeps guessing write to it at will.
+        // Collapsed to one bounded line first, because the path is model-authored
+        // text and a console line it could break in two is one it could forge.
+        if (verdict.refusal.code === 'outside_workspace') {
+          const attempted = requested.replace(/\s+/g, ' ').slice(0, 200)
+          ports.report(`lark-channel: ${SEND_FILE_TOOL} refused ${attempted} `
+            + `in session ${sessionId}: ${verdict.refusal.code}`)
+        }
         throw new Error(describeRefusalForModel(verdict.refusal))
       }
       // Refused by its human, timed out, upload failed: one string, because to

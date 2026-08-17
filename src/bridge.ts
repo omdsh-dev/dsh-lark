@@ -86,6 +86,7 @@ import {
   sendFileTool,
 } from './files.ts'
 import type { CollectedFiles, InboundFilePort, OutboundFile, SendFilePorts } from './files.ts'
+import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
@@ -337,15 +338,6 @@ function channelErrorCode(error: unknown): string | undefined {
   return typeof code === 'string' && code !== '' ? code : undefined
 }
 
-/**
- * Render a handled failure as one readable detail.
- * @param error - the rejection value, which need not be an `Error`.
- * @returns the message, or the stringified value for a non-error rejection.
- */
-function failureDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 /** How long one tool-activity label may be before it is ellipsized. */
 const ACTIVITY_LABEL_MAX_CHARS = 90
 
@@ -498,7 +490,17 @@ function composeChatAgent(
     && !denied.has(SEND_FILE_TOOL)
     && tools?.register !== undefined
   if (registersSendFile) tools?.register?.(sendFileTool(sendFiles!))
-  else denied.add(SEND_FILE_TOOL)
+  else {
+    // A deployment that turned the switch off, or denied the name, decided this
+    // and needs no telling. A registry too old to take a per-agent tool did NOT:
+    // the capability the deployment configured ON is simply missing, and the
+    // console is the only place that fact can surface (§9 of the design).
+    if (sendFiles !== undefined && !denied.has(SEND_FILE_TOOL)) {
+      sendFiles.report(`lark-channel: ${SEND_FILE_TOOL} could not be registered for this agent `
+        + '(this host tool registry takes no per-agent tools), so the model cannot send files in this chat')
+    }
+    denied.add(SEND_FILE_TOOL)
+  }
 
   // Every chat agent gets its bearings, denials or none: an agent told nothing
   // about where it woke up treats a chat like a ticket queue.
@@ -515,11 +517,34 @@ function composeChatAgent(
   // not have, which would fail every chat agent's creation over a tool the
   // deployment simply never composed.
   tools?.guard(execution =>
-    denied.has(execution.name)
-      ? `${execution.name} is unavailable in this chat channel: its answer would surface on a `
-        + 'different interface. Ask the user directly in your reply instead, and continue when they answer.'
-      : undefined,
+    denied.has(execution.name) ? denialReason(execution.name) : undefined,
   )
+}
+
+/**
+ * Why one denied tool cannot run here, in words true of THAT tool.
+ *
+ * A refusal is what steers the model's next move, so a reason that does not
+ * describe its situation is worse than a terse one: telling it to "ask the user
+ * directly in your reply" about a file send names an answer that does not exist,
+ * and a model that reads it goes looking for a question to ask.
+ * @param name - the tool the guard is refusing.
+ * @returns the sentence the model reads instead of a result.
+ */
+function denialReason(name: string): string {
+  const unavailable = `${name} is unavailable in this chat channel`
+  if (name === QUESTION_TOOL || name === PLAN_TOOL) {
+    return `${unavailable}: its answer would surface on a different interface. `
+      + 'Ask the user directly in your reply instead, and continue when they answer.'
+  }
+  if (name === SEND_FILE_TOOL) {
+    // Nothing here is waiting for an answer: there is no file channel at all.
+    return `${unavailable}: no file can leave the workspace for this chat. `
+      + 'Put what matters into your reply — the findings, the excerpt that counts — rather than offering an attachment.'
+  }
+  // Anything the deployment denied by configuration. It may be a tool with no
+  // answer, no interface, and no substitute, so this promises none of those.
+  return `${unavailable}. Continue without it, and say in your reply what you could not do.`
 }
 
 /**

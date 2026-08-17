@@ -25,6 +25,8 @@
  * @module dsh-lark-channel/cards
  */
 
+import { formatByteSize } from './format.ts'
+
 /**
  * One string this module authored, in the languages a card can carry.
  *
@@ -425,31 +427,6 @@ function compactCount(tokens: number): string {
   return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`
 }
 
-/** Units past a byte, in the order a size climbs through them. */
-const BYTE_UNITS = ['KB', 'MB', 'GB', 'TB'] as const
-
-/**
- * A file size at a glance: binary steps, one decimal once it leaves bytes, and
- * no `.0` on a whole one.
- *
- * A bare `string` rather than a {@link Copy}, because digits and a unit symbol
- * read identically in both languages — a translated pair would only give the
- * two halves a way to drift apart while saying the same thing.
- * @param bytes - the size on disk.
- * @returns the short form, such as `1.2 MB`, `840 KB` or `12 B`.
- */
-function formatBytes(bytes: number): string {
-  let value = Number.isFinite(bytes) && bytes > 0 ? bytes : 0
-  let unit = 'B'
-  for (const larger of BYTE_UNITS) {
-    if (value < 1024) break
-    value /= 1024
-    unit = larger
-  }
-  const digits = unit === 'B' ? String(Math.round(value)) : value.toFixed(1)
-  return `${digits.endsWith('.0') ? digits.slice(0, -2) : digits} ${unit}`
-}
-
 /**
  * How full the context is: what the next request carries, and — when the
  * provider says how big the window is — the share of it that leaves.
@@ -580,7 +557,10 @@ export function settledApprovalCard(input: {
 
 /** Every string the outbound-file approval says, in both its languages. */
 const FILE_SEND = {
-  title: { zh: '需要你的授权', en: 'Approval needed' },
+  // The same heading a tool escalation wears, referenced rather than repeated:
+  // two rooms being asked to authorize something should not be able to end up
+  // asked in two different words because one copy was edited.
+  title: APPROVAL.title,
   context: { zh: 'Agent 想把一个文件发到这个群', en: 'The agent wants to send a file to this group' },
   path: { zh: '文件', en: 'File' },
   size: { zh: '大小', en: 'Size' },
@@ -613,7 +593,7 @@ export function fileApprovalCard(input: {
   return card('warning', join(FILE_SEND.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading('warning', FILE_SEND.title, FILE_SEND.context),
     quoted(FILE_SEND.path, path.shown, 'grey-50', path.hidden),
-    quoted(FILE_SEND.size, formatBytes(input.bytes), 'grey-50'),
+    quoted(FILE_SEND.size, formatByteSize(input.bytes), 'grey-50'),
     actions([
       { label: FILE_SEND.allow, value: input.allow, kind: 'primary' },
       { label: FILE_SEND.reject, value: input.reject, kind: 'danger' },

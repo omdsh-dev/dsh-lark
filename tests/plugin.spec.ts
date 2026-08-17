@@ -427,6 +427,11 @@ describe('dsh-lark-channel', () => {
       const created = await firstAgent(harness)
       expect(created.denyReason('web_search')).toBeDefined()
       expect(created.denyReason('ask_user_question')).toBeUndefined()
+      // A search has no answer for a chat to carry either, so the reason cannot
+      // promise the model one: what steers its next move has to be true of the
+      // tool actually refused.
+      expect(created.denyReason('web_search')).not.toContain('would surface on a different interface')
+      expect(created.denyReason('web_search')).toContain('Continue without it')
       await harness.dispose()
     })
 
@@ -712,7 +717,11 @@ describe('dsh-lark-channel', () => {
 
       // Not one byte on disk, not even the channel's own directory.
       expect(await readdir(workspace)).toEqual([])
-      expect(followupText(created)).toContain('未接收')
+      // What the switch costs is the PATH, and that is what the note says: the
+      // image below rides the same message, so a note claiming the channel never
+      // received it would contradict the block sitting beside it.
+      expect(followupText(created)).toContain('未把它们存入工作区')
+      expect(followupText(created)).not.toContain('未接收')
       // And the model is still SHOWN the screenshot: receiving no files must not
       // quietly turn an image-capable deployment blind.
       expect(created.agent.followup.mock.calls[0]![0].content[1]?.type).toBe('image')
@@ -996,6 +1005,29 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('refuses a file-card click that arrives from another chat', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!).find((value) => value.decision === 'allow')!
+
+      // A forwarded card must release nothing: the decision counts only from the
+      // room the file would land in. The rule lives in the dispatch both kinds of
+      // card now share, so it is pinned for the file kind too.
+      const refused = await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_elsewhere' }))
+      expect(refused).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(filesSent(harness)).toHaveLength(0)
+
+      // Still live for the room that was actually asked.
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+      await expect(sending).resolves.toEqual({ sent: true })
+      expect(filesSent(harness)).toHaveLength(1)
+      await harness.dispose()
+    })
+
     it('cancels a pending file approval when the fiber unwinds', async () => {
       const { workspace } = await workspaceWithArtifact()
       const harness = await mountChannel({ cwd: workspace })
@@ -1120,6 +1152,15 @@ describe('dsh-lark-channel', () => {
       // its findings into the reply instead of offering an attachment forever.
       const presence = created.promptSections.find((section) => section.name === 'lark-channel:presence')
       expect(presence?.text).toContain(SEND_FILE_TOOL)
+      // The refusal has to describe THIS tool's situation: a file send has no
+      // answer that surfaces anywhere, so telling the model to ask the user
+      // directly would send it looking for a question that does not exist.
+      const refusal = created.denyReason(SEND_FILE_TOOL)
+      expect(refusal).toContain('no file can leave the workspace')
+      expect(refusal).not.toContain('would surface on a different interface')
+      // Turning the switch off is the deployment's own decision, so the console
+      // says nothing about it.
+      expect(harness.notices.some((line) => line.includes('could not be registered'))).toBe(false)
 
       // `/get` is the human's own row of the matrix and stays open.
       await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2', content: `/${GET_COMMAND} report.md` }))
@@ -1138,6 +1179,11 @@ describe('dsh-lark-channel', () => {
       expect(created.denyReason(SEND_FILE_TOOL)).toBeDefined()
       const presence = created.promptSections.find((section) => section.name === 'lark-channel:presence')
       expect(presence?.text).toContain(SEND_FILE_TOOL)
+      // A deployment that switched sending off decided that; one whose registry
+      // cannot take the tool has lost a capability it asked for, and only the
+      // console can say so.
+      expect(harness.notices.some((line) =>
+        line.includes(SEND_FILE_TOOL) && line.includes('could not be registered'))).toBe(true)
 
       await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2', content: `/${GET_COMMAND} report.md` }))
       await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
