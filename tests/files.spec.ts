@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
 import { collectInboundFiles, MESSAGE_BYTES_FACTOR, sanitizeFileName } from '../src/files.ts'
 import type { InboundFilePort, InboundOptions } from '../src/files.ts'
-import { createFakePort, fakeMessage } from './harness.ts'
+import { collectImages } from '../src/images.ts'
+import type { ImagePort } from '../src/images.ts'
+import { createFakeAttachments, createFakePort, fakeMessage } from './harness.ts'
 
 /** Workspaces these tests wrote into, removed after each one. */
 const workspaces: string[] = []
@@ -47,13 +49,16 @@ function stageResources(bytes: Record<string, string>, contentTypes: Record<stri
     })
   }
   const calls: { fileKey: string; type: string; destPath: string }[] = []
-  const port: InboundFilePort = {
+  const port: InboundFilePort & ImagePort = {
     async downloadResourceToFile(messageId, fileKey, type, destPath) {
       calls.push({ fileKey, type, destPath })
       return fake.port.downloadResourceToFile(messageId, fileKey, type, destPath)
     },
+    downloadResourceWithMeta: fake.port.downloadResourceWithMeta,
   }
-  return { port, calls }
+  // `downloads` counts BOTH halves, which is what tells a spared round trip
+  // from a repeated one.
+  return { port, calls, downloads: fake.downloads }
 }
 
 /** Inbound options over one workspace, with a captured operator console. */
@@ -330,5 +335,44 @@ describe('collectInboundFiles', () => {
 
     expect(emptyResult.landed).toEqual([])
     expect(emptyResult.notes.some(note => note.includes('.gitignore'))).toBe(false)
+  })
+})
+
+describe('collectImages over what landed', () => {
+  it('reads a landed image off the disk instead of downloading it a second time', async () => {
+    const workspace = createWorkspace()
+    const { port, downloads } = stageResources({ fk_shot: 'png bytes' }, { fk_shot: 'image/png' })
+    const { options } = stageOptions(workspace)
+    const msg = fileMessage([resource('image', 'fk_shot', 'shot.png')])
+    const inbound = await collectInboundFiles(msg, port, options)
+    const attachments = createFakeAttachments()
+
+    const images = await collectImages(msg, port, inbound.landed, attachments.service, true)
+
+    // One download, the one that put the bytes on disk.
+    expect(downloads).toEqual([{ fileKey: 'fk_shot', via: 'disk' }])
+    expect(images.notes).toEqual([])
+    expect(images.blocks).toHaveLength(1)
+    // The bytes the store received are the ones sitting in the workspace, and
+    // the media type is the one the transport declared while landing them.
+    expect(attachments.saved[0]).toEqual({ mediaType: 'image/png', bytes: 9, name: 'shot.png' })
+  })
+
+  it('downloads an image that never landed, so a closed inbound channel still shows one', async () => {
+    const workspace = createWorkspace()
+    const { port, downloads } = stageResources({ fk_shot: 'png bytes' }, { fk_shot: 'image/png' })
+    // A deployment that receives no files but does pass images to its model.
+    const { options } = stageOptions(workspace, { enabled: false })
+    const msg = fileMessage([resource('image', 'fk_shot', 'shot.png')])
+    const inbound = await collectInboundFiles(msg, port, options)
+    const attachments = createFakeAttachments()
+
+    const images = await collectImages(msg, port, inbound.landed, attachments.service, true)
+
+    expect(inbound.landed).toEqual([])
+    // Still exactly one download, just the other half of the transport.
+    expect(downloads).toEqual([{ fileKey: 'fk_shot', via: 'memory' }])
+    expect(images.blocks).toHaveLength(1)
+    expect(attachments.saved[0]).toEqual({ mediaType: 'image/png', bytes: 9, name: 'shot.png' })
   })
 })

@@ -90,6 +90,12 @@ export function createFakePort() {
   }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
+  /**
+   * Every download the transport was asked for, and which half served it. An
+   * image that landed is read off the disk instead of fetched again, and only
+   * the call count can tell a spared round trip from a repeated one.
+   */
+  const downloads: { fileKey: string; via: 'memory' | 'disk' }[] = []
   /** Optional holds a test injects into port operations to stage races. */
   const gates: { beforeSend?: () => Promise<void> } = {}
   const state = {
@@ -185,11 +191,13 @@ export function createFakePort() {
       cot.timestamps.push(...events.map((e) => e.timestamp))
     },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
+      downloads.push({ fileKey, via: 'memory' })
       const stored = resourceBytes.get(fileKey)
       if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
       return stored
     },
     async downloadResourceToFile(messageId, fileKey, _type, destPath) {
+      downloads.push({ fileKey, via: 'disk' })
       const stored = resourceBytes.get(fileKey)
       if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
       // Real bytes on a real path: the caller's quota and note assertions are
@@ -246,6 +254,7 @@ export function createFakePort() {
     panelCreated,
     panelDeleted,
     resourceBytes,
+    downloads,
     cots,
     state,
     gates,

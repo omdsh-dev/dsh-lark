@@ -75,7 +75,8 @@ import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
-import type { InboundFilePort } from './files.ts'
+import { collectInboundFiles } from './files.ts'
+import type { CollectedFiles, InboundFilePort } from './files.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
@@ -411,7 +412,7 @@ function composeChatAgent(
   prompt?.section({
     name: PRESENCE_SECTION,
     order: PRESENCE_ORDER,
-    text: presenceSection(self, [...denied]),
+    text: presenceSection(self, [...denied], config.receiveFiles),
   })
 
   if (denied.size === 0) return
@@ -431,9 +432,15 @@ function composeChatAgent(
  * Create an identified user message from one chat input. Group messages carry
  * the sender so the model can tell voices apart; direct messages stay verbatim.
  * @param msg - normalized inbound chat message.
+ * @param images - what this message's images became.
+ * @param inbound - what this message's files became on disk.
  * @returns a frozen user message for `agent.followup()`.
  */
-export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages): HostUserMessage {
+export function chatUserMessage(
+  msg: NormalizedMessage,
+  images: CollectedImages,
+  inbound: CollectedFiles,
+): HostUserMessage {
   const spoken = msg.chatType === 'group'
     ? `${msg.senderName ?? msg.senderId}: ${msg.content}`
     : msg.content
@@ -441,8 +448,10 @@ export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages)
   // said in their own chat, mention or not.
   const note = msg.senderIsBot === true ? batonNote(msg.senderId) : ''
   // Notes ride the text so a model that cannot be shown an image still knows
-  // one was sent, instead of answering as though it had seen it.
-  const text = [spoken, note, ...images.notes].filter(line => line !== '').join('\n')
+  // one was sent, instead of answering as though it had seen it. Files come
+  // first: a path is something the model can act on, while an image note is
+  // usually the reason it cannot see one.
+  const text = [spoken, note, ...inbound.notes, ...images.notes].filter(line => line !== '').join('\n')
   const content: HostContentBlock[] = [
     ...text === '' ? [] : [{ type: 'text' as const, text }],
     ...images.blocks,
@@ -489,6 +498,15 @@ export function installBridge(
    * turn) because within a session an id is only known unique per turn.
    */
   const callSnapshots = new Map<string, Map<string, { readonly turn: number; readonly arguments: string }>>()
+  /**
+   * Workspaces already told that inbound files land inside them. Keyed by path
+   * rather than by conversation, because the untracked directory is the
+   * workspace's problem and not the chat's: two conversations in one directory
+   * have one `.gitignore` to edit between them, and a `/cd` into a directory
+   * nobody has mentioned yet earns the hint again. Per-bridge state, so a second
+   * plugin instance starts with its own — and a test does too.
+   */
+  const hintedWorkspaces = new Set<string>()
   const defaultCwd = resolve(config.cwd ?? process.cwd())
 
   /** Which directory each conversation runs in, and the session id that pair owns. */
@@ -1160,9 +1178,23 @@ export function installBridge(
       // dispatch, so `/stop` still interrupts a chat that owes an answer.
       if (questions.answerByText(opened.handle.agent.session.id, msg.content)) return
 
+      // Files land only once an agent exists to read them: acquisition is what
+      // can still fail here, and a failed one must leave no orphan in someone's
+      // repository. The workspace is the conversation's own, so `/cd` moves
+      // where the next message's files arrive.
+      const workspace = chatWorkspaces.pathFor(conversation)
+      const inbound = await collectInboundFiles(msg, port, {
+        workspace,
+        enabled: config.receiveFiles,
+        maxFileBytes: config.maxReceiveFileBytes,
+        report: notify,
+        hintWorkspace: !hintedWorkspaces.has(workspace),
+      })
+      if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
       const images = await collectImages(
         msg,
         port,
+        inbound.landed,
         ctx.get('attachments') as HostAttachments | undefined,
         config.attachImages,
       )
@@ -1172,7 +1204,7 @@ export function installBridge(
       // turn, so aiming at arrival — or by turn order — replies to the wrong
       // message the moment two overlap. When a turn consumes several, the last
       // claim wins: a batched answer addresses the latest ask.
-      const message = chatUserMessage(msg, images)
+      const message = chatUserMessage(msg, images, inbound)
       const target: ReplyTarget = {
         messageId: msg.messageId,
         ...msg.threadId === undefined ? {} : { threadId: msg.threadId },

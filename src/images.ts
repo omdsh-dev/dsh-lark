@@ -3,10 +3,17 @@
  * problem, so an image the model never receives is worse than a missing
  * feature: the model answers as if it had seen one. Every image that cannot be
  * attached therefore leaves a note in the text instead of disappearing.
+ *
+ * An image passes through `files.ts` as well as this module, and is downloaded
+ * exactly once: one that already landed in the workspace is read back off the
+ * disk here, and only one that did not — because this deployment receives no
+ * files — is fetched from the transport.
  * @module dsh-lark-channel/images
  */
 
+import { readFile } from 'node:fs/promises'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
+import type { LandedFile } from './files.ts'
 import type { HostAttachments, HostContentBlock } from './host.ts'
 
 /** The inbound half of the transport these images come from. */
@@ -50,13 +57,42 @@ function mediaTypeOf(
 }
 
 /**
- * Download and commit the images one message carried.
+ * The bytes of one image, and the media type declared for them.
+ *
+ * The workspace copy wins when there is one: those bytes crossed the network
+ * once already, and asking the transport for them again would spend a second
+ * round trip on a file this host can simply open. The download is the path for
+ * a deployment that lands no files, where there is nothing to read.
+ * @param msg - the message the image arrived on.
+ * @param port - transport used when the image did not land.
+ * @param landed - files this message already put in the workspace.
+ * @param image - the image resource to read.
+ * @returns the bytes and the transport-reported media type, when it named one.
+ * @throws whatever the read or the download failed with; the caller notes it.
+ */
+async function readImageBytes(
+  msg: NormalizedMessage,
+  port: ImagePort,
+  landed: readonly LandedFile[],
+  image: ResourceDescriptor,
+): Promise<{ buffer: Uint8Array; contentType?: string | undefined }> {
+  const onDisk = landed.find(file => file.fileKey === image.fileKey)
+  if (onDisk === undefined) return await port.downloadResourceWithMeta(msg.messageId, image.fileKey, 'image')
+  return {
+    buffer: await readFile(onDisk.path),
+    ...onDisk.contentType === undefined ? {} : { contentType: onDisk.contentType },
+  }
+}
+
+/**
+ * Commit the images one message carried, downloading only what did not land.
  *
  * Bounds come from the store rather than this plugin: it is the component that
  * knows what a model request may carry. An image past them is skipped with a
  * note, as is one whose type the store does not accept.
  * @param msg - the inbound message.
- * @param port - transport used to download the bytes.
+ * @param port - transport used to download an image that did not land.
+ * @param landed - files this message already put in the workspace.
  * @param attachments - the attachment store, when composed.
  * @param enabled - whether this deployment's route accepts images at all.
  * @returns the blocks to attach and the notes to append to the text.
@@ -64,6 +100,7 @@ function mediaTypeOf(
 export async function collectImages(
   msg: NormalizedMessage,
   port: ImagePort,
+  landed: readonly LandedFile[],
   attachments: HostAttachments | undefined,
   enabled: boolean,
 ): Promise<CollectedImages> {
@@ -91,7 +128,7 @@ export async function collectImages(
       break
     }
     try {
-      const { buffer, contentType } = await port.downloadResourceWithMeta(msg.messageId, image.fileKey, 'image')
+      const { buffer, contentType } = await readImageBytes(msg, port, landed, image)
       const mediaType = mediaTypeOf(contentType, image.fileName, limits.mediaTypes)
       if (mediaType === undefined) {
         notes.push(`（一张图片的格式 ${contentType ?? '未知'} 不被支持，未附加）`)
