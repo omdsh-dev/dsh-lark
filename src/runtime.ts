@@ -67,6 +67,7 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
     appSecret: config.appSecret,
     policy,
     source: 'dsh-lark-channel',
+    respectProxyEnv: true,
   }
   if (config.domain !== undefined) options.domain = config.domain
   const channel = createLarkChannel(options)
