@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
 import { mkdtempSync, realpathSync } from 'node:fs'
-import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
 import { collectInboundFiles, MESSAGE_BYTES_FACTOR, sanitizeFileName } from '../src/files.ts'
@@ -336,6 +336,57 @@ describe('collectInboundFiles', () => {
     expect(emptyResult.landed).toEqual([])
     expect(emptyResult.notes.some(note => note.includes('.gitignore'))).toBe(false)
   })
+
+  it('names an absolute path even when the caller\'s workspace is a relative one', async () => {
+    const workspace = createWorkspace()
+    const { port } = stageResources({ fk_doc: 'log lines' })
+    // The note goes to a model whose own tools run in some other directory, so
+    // a path relative to THIS process would point at nothing it can reach.
+    const { options } = stageOptions(relative(process.cwd(), workspace))
+    const result = await collectInboundFiles(fileMessage([resource('file', 'fk_doc', 'app.log')]), port, options)
+
+    expect(result.landed).toHaveLength(1)
+    expect(isAbsolute(result.landed[0]!.path)).toBe(true)
+    expect(await readFile(result.landed[0]!.path, 'utf8')).toBe('log lines')
+    expect(result.notes[0]).toContain(result.landed[0]!.path)
+  })
+
+  it('leaves no directory behind for a message whose files all fell away', async () => {
+    const workspace = createWorkspace()
+    const { port } = stageResources({ fk_big: 'x'.repeat(20) })
+    const { options } = stageOptions(workspace, { maxFileBytes: 10 })
+    const result = await collectInboundFiles(
+      fileMessage([resource('file', 'fk_big', 'big.log'), resource('file', 'fk_gone', 'gone.log')]),
+      port,
+      options,
+    )
+
+    // One file over the limit, one that never downloaded: an empty directory per
+    // rejected message would accumulate in the workspace forever.
+    expect(result.landed).toEqual([])
+    expect(await readdir(join(workspace, '.dsh-lark', 'inbox'))).toEqual([])
+  })
+
+  it('tells the operator when a file it must not keep will not go away', async () => {
+    const workspace = createWorkspace()
+    const stubborn: InboundFilePort = {
+      // A directory where the file belongs: `unlink` refuses one whoever runs
+      // these tests, which is the read-only-disk failure without a read-only disk.
+      async downloadResourceToFile(_messageId, _fileKey, _type, destPath) {
+        await mkdir(destPath)
+        return { bytesWritten: 20 }
+      },
+    }
+    const { options, reports } = stageOptions(workspace, { maxFileBytes: 10 })
+    const result = await collectInboundFiles(fileMessage([resource('file', 'fk_big', 'big.log')]), stubborn, options)
+
+    // The note says the file was not saved and the workspace disagrees; only the
+    // operator can see that, and a second note would just repeat the first.
+    expect(result.notes).toHaveLength(1)
+    expect(result.notes[0]).toContain('未保存')
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toContain('big.log')
+  })
 })
 
 describe('collectImages over what landed', () => {
@@ -376,3 +427,4 @@ describe('collectImages over what landed', () => {
     expect(attachments.saved[0]).toEqual({ mediaType: 'image/png', bytes: 9, name: 'shot.png' })
   })
 })
+

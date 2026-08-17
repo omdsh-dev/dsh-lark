@@ -26,8 +26,8 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir, unlink } from 'node:fs/promises'
-import { basename, extname, join } from 'node:path'
+import { mkdir, rmdir, unlink } from 'node:fs/promises'
+import { basename, extname, join, resolve } from 'node:path'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
 
 /** The channel's own directory inside a workspace. */
@@ -219,6 +219,10 @@ function claimFileName(taken: Set<string>, name: string): string {
  * The stamp is UTC: the name only has to be stable and sortable, and the local
  * zone of whichever host ran the channel is not something a later reader can
  * recover anyway. The digest is what ties a directory back to its message.
+ *
+ * `resolve`, not `join`: every path this module hands out is absolute, because a
+ * relative one rides into the note the model reads and points at whichever
+ * directory that model's own tools happen to run in.
  * @param msg - the inbound message.
  * @param workspace - the conversation's workspace directory.
  * @returns the absolute directory path.
@@ -227,17 +231,37 @@ function inboxDirectoryFor(msg: NormalizedMessage, workspace: string): string {
   const sentAt = Number.isFinite(msg.createTime) && msg.createTime > 0 ? msg.createTime : Date.now()
   const stamp = new Date(sentAt).toISOString().slice(0, 19).replace(/:/g, '')
   const digest = createHash('sha256').update(msg.messageId).digest('hex').slice(0, 8)
-  return join(workspace, CHANNEL_DIRECTORY, INBOX_DIRECTORY, `${stamp}-${digest}`)
+  return resolve(workspace, CHANNEL_DIRECTORY, INBOX_DIRECTORY, `${stamp}-${digest}`)
 }
 
 /**
- * Remove a file that must not stay. A failure here is swallowed on purpose:
- * the note explaining the skip is already written, and a second complaint
- * about a file nobody was promised is noise.
+ * Remove a file that must not stay. No second note on failure — the one
+ * explaining the skip is already written, and complaining twice about a file
+ * nobody was promised is noise. The operator does hear about a real failure:
+ * the note then says "not saved" while the file sits in the workspace, and
+ * nobody else is in a position to notice that they disagree.
  * @param path - the file to unlink.
+ * @param report - operator console line.
  */
-async function discardFile(path: string): Promise<void> {
-  await unlink(path).catch(() => {})
+async function discardFile(path: string, report: (line: string) => void): Promise<void> {
+  await unlink(path).catch((error: unknown) => {
+    // Nothing there is the outcome asked for, not a failure: a download that
+    // died before it created the file leaves nothing to remove.
+    if ((error as { code?: unknown } | null)?.code === 'ENOENT') return
+    report(`lark-channel: removing ${path} failed, so it stays in the workspace: ${failureDetail(error)}`)
+  })
+}
+
+/**
+ * Remove one message's directory once nothing landed in it. `rmdir` and not a
+ * recursive remove: it refuses a directory with anything in it, so a mistake
+ * here can never take bytes with it. A failure is swallowed and not reported —
+ * unlike a file that would not go away, a leftover empty directory contradicts
+ * nothing anyone was told.
+ * @param path - the message directory.
+ */
+async function discardDirectory(path: string): Promise<void> {
+  await rmdir(path).catch(() => {})
 }
 
 /**
@@ -289,7 +313,10 @@ export async function collectInboundFiles(
   const landed: LandedFile[] = []
   const skipped: string[] = []
   const claimed = new Set<string>()
-  let budget = options.maxFileBytes * MESSAGE_BYTES_FACTOR
+  // One name for the ceiling, so what the note quotes and what the loop
+  // enforces cannot drift apart.
+  const messageCeiling = options.maxFileBytes * MESSAGE_BYTES_FACTOR
+  let budget = messageCeiling
   for (const [index, resource] of resources.entries()) {
     const fileName = claimFileName(claimed, sanitizeFileName(resource.fileName))
     const destination = join(directory, fileName)
@@ -301,7 +328,7 @@ export async function collectInboundFiles(
         destination,
       )
       if (bytesWritten > options.maxFileBytes) {
-        await discardFile(destination)
+        await discardFile(destination, options.report)
         skipped.push(
           `（文件 ${fileName} 有 ${formatBytes(bytesWritten)}，`
           + `超过单个文件上限 ${formatBytes(options.maxFileBytes)}，未保存）`,
@@ -311,9 +338,9 @@ export async function collectInboundFiles(
       if (bytesWritten > budget) {
         // The message total is a ceiling, not a hint: the file that would break
         // it goes back off the disk, and everything behind it stays undownloaded.
-        await discardFile(destination)
+        await discardFile(destination, options.report)
         skipped.push(
-          `（单条消息总量上限 ${formatBytes(options.maxFileBytes * MESSAGE_BYTES_FACTOR)} 已用尽，`
+          `（单条消息总量上限 ${formatBytes(messageCeiling)} 已用尽，`
           + `还有 ${resources.length - index} 个文件未保存）`,
         )
         break
@@ -331,11 +358,16 @@ export async function collectInboundFiles(
       const detail = failureDetail(error)
       // A half-streamed file is indistinguishable from a complete one once it
       // sits in the workspace, so the remains of a failed download go away.
-      await discardFile(destination)
+      await discardFile(destination, options.report)
       options.report(`lark-channel: downloading ${fileName} of message ${msg.messageId} failed: ${detail}`)
       skipped.push(`（文件 ${fileName} 下载失败：${detail}）`)
     }
   }
+
+  // A message whose every file was refused would otherwise leave its directory
+  // behind, one empty `<stamp>-<digest>/` per rejected message, accumulating in
+  // exactly the directory the `.gitignore` hint sends people to look at.
+  if (landed.length === 0) await discardDirectory(directory)
 
   return {
     landed,
@@ -349,3 +381,4 @@ export async function collectInboundFiles(
     ],
   }
 }
+
