@@ -124,8 +124,64 @@ export interface Config {
    * good, with no way back from the chat, because compaction sends that history
    * too. The host exposes no way to ask a route whether it accepts images, so
    * the deployment that knows its route is a vision one says so here.
+   *
+   * This is the division of labour with {@link receiveFiles}: this field says
+   * whether an image's bytes reach the model's context, where token cost and
+   * pixel-borne prompt injection are the things to weigh; {@link receiveFiles}
+   * says whether the file behind any attachment — images included — lands on
+   * disk so the agent has a path to it, with the content never entering
+   * context either way. That split is also why there is no `attachFiles`:
+   * attaching and landing are different operations with different risk
+   * profiles, and one name should not paper over both.
    */
   attachImages?: boolean
+  /**
+   * Save files a chat sends into `.dsh-lark/inbox/` under the current
+   * conversation's workspace, so the agent gets a path to work with instead
+   * of a resource descriptor it has no way to read.
+   *
+   * On by default: a file's bytes never enter the model's context this way —
+   * only its path does — so turning this on does not widen what the model can
+   * see or do. It only fixes a worse status quo, where the transport already
+   * tells the model a file's name and leaves it with no way to reach the
+   * content behind it.
+   */
+  receiveFiles?: boolean
+  /**
+   * Ceiling, in bytes, on one inbound file; a file over it is discarded
+   * rather than landed anyway.
+   *
+   * A whole message's total is capped too, at three times this number — a
+   * message shipping twenty files each just under the per-file limit would
+   * otherwise write twenty times as much to disk in one shot. That multiplier
+   * is not its own setting: its only reason to exist is to track this one, so
+   * letting it drift on its own would just reopen the same hole from a
+   * different angle.
+   */
+  maxReceiveFileBytes?: number
+  /**
+   * Let chat agents send files out of their workspace back into the chat on
+   * their own initiative.
+   *
+   * On by default: the risk this would otherwise carry is already handled
+   * structurally rather than left for a deployment to opt into — a direct
+   * message reaches only the person whose authorization is driving the agent,
+   * so there is no exfiltration boundary to cross, while a group chat instead
+   * gets an approval card on every send. A gate that only takes effect once a
+   * deployment remembers to flip it is not a gate at all. There is
+   * deliberately no setting here to turn the group approval off: that would
+   * be an official back door for a prompt-injection exfiltration chain.
+   */
+  sendFiles?: boolean
+  /**
+   * Ceiling, in bytes, on one outbound file.
+   *
+   * An outbound file is read whole into a `Buffer` before the SDK ever sees
+   * it, rather than handed over by path, so this number bounds how much of
+   * the process's heap one send can claim — it is a memory safety limit
+   * first, and only a courtesy to the recipient second.
+   */
+  maxSendFileBytes?: number
   /**
    * Let the platform drop the process once its run finishes, leaving only the
    * answer in the conversation. `cot` output only.
@@ -210,6 +266,10 @@ export interface ResolvedConfig {
   output: 'cot' | 'stream'
   showProcess: boolean
   attachImages: boolean
+  receiveFiles: boolean
+  maxReceiveFileBytes: number
+  sendFiles: boolean
+  maxSendFileBytes: number
   hideProcessWhenDone: boolean
   syncSlashCommands: boolean
   denyTools: string[]
@@ -240,6 +300,10 @@ export const Config: z<Config> = z.object({
   output: z.union(['cot', 'stream'] as const).default('cot'),
   showProcess: z.boolean().default(true),
   attachImages: z.boolean().default(false),
+  receiveFiles: z.boolean().default(true),
+  maxReceiveFileBytes: z.number().default(20 * 1024 * 1024),
+  sendFiles: z.boolean().default(true),
+  maxSendFileBytes: z.number().default(20 * 1024 * 1024),
   hideProcessWhenDone: z.boolean().default(false),
   syncSlashCommands: z.boolean().default(true),
   denyTools: z.array(String).default([...DEFAULT_DENY_TOOLS]),
@@ -267,6 +331,10 @@ export function resolveConfig(config: Config): ResolvedConfig {
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,
     attachImages: config.attachImages ?? false,
+    receiveFiles: config.receiveFiles ?? true,
+    maxReceiveFileBytes: config.maxReceiveFileBytes ?? 20 * 1024 * 1024,
+    sendFiles: config.sendFiles ?? true,
+    maxSendFileBytes: config.maxSendFileBytes ?? 20 * 1024 * 1024,
     hideProcessWhenDone: config.hideProcessWhenDone ?? false,
     syncSlashCommands: config.syncSlashCommands ?? true,
     denyTools: config.denyTools ?? [...DEFAULT_DENY_TOOLS],
