@@ -602,9 +602,15 @@ export interface SendFilePorts {
    * Deliver one cleared file to the agent's own chat, gate included.
    * @param sessionId - the agent's session, which names the chat.
    * @param file - the file the check cleared.
+   * @param signal - the execution's cancellation. Passed on because a gate can
+   * outlive the call that opened it: a group approval waits for a human, and
+   * without this the card left behind by a cancelled turn stays live for the
+   * whole approval timeout — someone pressing "allow" twenty minutes after the
+   * turn was stopped would put the file in the group anyway, which is the leak
+   * the gate exists to prevent (ADR 0002).
    * @returns undefined on success, or the reason the send did not happen.
    */
-  deliver(sessionId: string, file: OutboundFile): Promise<string | undefined>
+  deliver(sessionId: string, file: OutboundFile, signal?: AbortSignal): Promise<string | undefined>
   /**
    * The conversation workspace one session runs in, or undefined when it has no chat.
    * @param sessionId - the agent's session.
@@ -613,6 +619,13 @@ export interface SendFilePorts {
   workspaceOf(sessionId: string): string | undefined
   /** The single-file ceiling. */
   readonly maxBytes: number
+  /**
+   * Operator console line. A path this check refuses never reaches
+   * {@link SendFilePorts.deliver}, so this is the only place an attempt to leave
+   * the workspace can be reported — and an escape attempt is an operator's
+   * event, not just the model's error.
+   */
+  readonly report: (line: string) => void
 }
 
 /**
@@ -649,7 +662,8 @@ export function sendFileTool(ports: SendFilePorts): object {
       // body IS the validation, and a path-shaped argument that is not a string
       // must reach the ordinary refusal rather than throw a type error.
       const requested = String((args as { path?: unknown } | null | undefined)?.path ?? '')
-      const sessionId = (exec as { agent?: { session?: { id?: string } } }).agent?.session?.id
+      const context = exec as { agent?: { session?: { id?: string } }; signal?: AbortSignal }
+      const sessionId = context.agent?.session?.id
       if (sessionId === undefined) {
         throw new Error(`${SEND_FILE_TOOL} requires a calling agent (no chat to send a file to)`)
       }
@@ -658,10 +672,23 @@ export function sendFileTool(ports: SendFilePorts): object {
         throw new Error(`${SEND_FILE_TOOL} found no chat for this session, so there is nowhere to send a file`)
       }
       const verdict = resolveOutboundFile(requested, workspace, ports.maxBytes)
-      if (!verdict.ok) throw new Error(describeRefusalForModel(verdict.refusal))
+      if (!verdict.ok) {
+        // Reported here and nowhere else: a refused path never reaches the
+        // delivery port, and a model reaching outside its workspace — the shape
+        // an injected instruction takes — is something an operator must be able
+        // to see. Collapsed to one bounded line first, because the path is
+        // model-authored text and a console line it could break in two is a
+        // console line it could forge.
+        const attempted = requested.replace(/\s+/g, ' ').slice(0, 200)
+        ports.report(`lark-channel: ${SEND_FILE_TOOL} refused ${attempted} `
+          + `in session ${sessionId}: ${verdict.refusal.code}`)
+        throw new Error(describeRefusalForModel(verdict.refusal))
+      }
       // Refused by its human, timed out, upload failed: one string, because to
-      // the model they are one thing — the file did not arrive, and why.
-      const failure = await ports.deliver(sessionId, verdict.file)
+      // the model they are one thing — the file did not arrive, and why. Those
+      // are reported by the deliverer itself, which is the half that knows the
+      // transport's own code for them.
+      const failure = await ports.deliver(sessionId, verdict.file, context.signal)
       if (failure !== undefined) throw new Error(failure)
       return { sent: true }
     },

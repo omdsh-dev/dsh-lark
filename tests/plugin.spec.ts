@@ -1013,16 +1013,55 @@ describe('dsh-lark-channel', () => {
       }
     })
 
-    it('tells the model why a path outside the workspace cannot be sent', async () => {
+    it('takes the card down when the turn that asked is cancelled', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+      const cancelled = new AbortController()
+
+      const refusal = tool.execute({ path: 'report.md' }, { agent: created.agent, signal: cancelled.signal })
+        .then(() => undefined, (error: unknown) => error)
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      cancelled.abort()
+
+      expect(String(await refusal)).toMatch(/withdrawn/)
+      // No live buttons left in the room for a turn that is gone.
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      expect(JSON.stringify(harness.fake.updated[0]!.card)).toContain('请求已撤回')
+
+      // And the settled question cannot be pressed back to life: a press twenty
+      // minutes after a `/stop` used to put the file in the group anyway.
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!).find((value) => value.decision === 'allow')!
+      const stale = await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+      expect(stale).toMatchObject({ toast: { type: 'info', content: '该审批已失效' } })
+      expect(filesSent(harness)).toHaveLength(0)
+
+      // A turn already cancelled when the tool runs asks nobody anything: a
+      // card for a decision no one is waiting on is worse than no card.
+      const dead = new AbortController()
+      dead.abort()
+      await expect(tool.execute({ path: 'report.md' }, { agent: created.agent, signal: dead.signal }))
+        .rejects.toThrow(/cancelled before/)
+      expect(cardsSent(harness)).toHaveLength(1)
+      await harness.dispose()
+    })
+
+    it('tells the model why a path outside the workspace cannot be sent, and tells the operator', async () => {
       const { workspace } = await workspaceWithArtifact()
       const outside = createWorkspace()
       await writeFile(join(outside, 'secret.env'), 'TOKEN=hunter2\n')
       const harness = await mountChannel({ cwd: workspace })
       const { created, tool } = await boundSender(harness)
+      const escape = join(outside, 'secret.env')
 
-      await expect(tool.execute({ path: join(outside, 'secret.env') }, { agent: created.agent }))
+      await expect(tool.execute({ path: escape }, { agent: created.agent }))
         .rejects.toThrow(/leaves the workspace/)
       expect(filesSent(harness)).toHaveLength(0)
+      // A model reaching outside its workspace is the shape an injected
+      // instruction takes, so it is on the console and not only in the turn.
+      const trace = harness.notices.find((line) => line.includes('outside_workspace'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain(escape)
       await harness.dispose()
     })
 

@@ -599,23 +599,25 @@ const SEND_FILE_DESCRIPTION = 'Send one file from the current workspace to this 
   + 'call it again for more.'
 
 /** One tool execution context, as the host passes it. */
-function execFor(sessionId: string) {
-  return { agent: { session: { id: sessionId } } }
+function execFor(sessionId: string, signal?: AbortSignal) {
+  return { agent: { session: { id: sessionId } }, ...signal === undefined ? {} : { signal } }
 }
 
-/** `send_file` ports over one workspace, recording what was delivered. */
+/** `send_file` ports over one workspace, recording what was delivered and reported. */
 function stageSendPorts(workspace: string | undefined, overrides: Partial<SendFilePorts> = {}) {
-  const delivered: { sessionId: string; file: OutboundFile }[] = []
+  const delivered: { sessionId: string; file: OutboundFile; signal: AbortSignal | undefined }[] = []
+  const reports: string[] = []
   const ports: SendFilePorts = {
-    deliver: async (sessionId, file) => {
-      delivered.push({ sessionId, file })
+    deliver: async (sessionId, file, signal) => {
+      delivered.push({ sessionId, file, signal })
       return undefined
     },
     workspaceOf: () => workspace,
     maxBytes: 1024,
+    report: (line) => { reports.push(line) },
     ...overrides,
   }
-  return { ports, delivered }
+  return { ports, delivered, reports }
 }
 
 describe('send_file tool', () => {
@@ -638,7 +640,46 @@ describe('send_file tool', () => {
     expect(delivered).toEqual([{
       sessionId: 's1',
       file: { path: join(workspace, 'report.md'), fileName: 'report.md', bytes: 4 },
+      signal: undefined,
     }])
+  })
+
+  it("hands the execution's cancellation down to the deliverer", async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    const { ports, delivered } = stageSendPorts(workspace)
+    const controller = new AbortController()
+
+    await (sendFileTool(ports) as Runnable).execute({ path: 'report.md' }, execFor('s1', controller.signal))
+    // The gate can outlive this call — a group approval waits for a human — so
+    // the cancellation has to travel with it, or a stopped turn leaves a live
+    // card that still releases the file.
+    expect(delivered[0]!.signal).toBe(controller.signal)
+  })
+
+  it('reports a refused path to the operator, once, and leaves delivery failures to the deliverer', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    await writeFile(join(outside, 'secret.env'), 'TOKEN=1')
+    const escape = join(outside, 'secret.env')
+    const refused = stageSendPorts(workspace)
+
+    await expect((sendFileTool(refused.ports) as Runnable).execute({ path: escape }, execFor('s1')))
+      .rejects.toThrow(describeRefusalForModel({ code: 'outside_workspace' }))
+    // A refused path never reaches the deliverer, so this is the only chance to
+    // leave a trace — and reaching outside the workspace is an operator's event.
+    expect(refused.reports).toHaveLength(1)
+    expect(refused.reports[0]).toContain('outside_workspace')
+    expect(refused.reports[0]).toContain(escape)
+    expect(refused.reports[0]).toMatch(/^lark-channel: /)
+
+    // The deliverer reports its own failures, with the transport's code; saying
+    // it again here would put every upload failure on the console twice.
+    const undelivered = stageSendPorts(workspace, { deliver: async () => 'The upload failed.' })
+    await expect((sendFileTool(undelivered.ports) as Runnable).execute({ path: 'report.md' }, execFor('s1')))
+      .rejects.toThrow('The upload failed.')
+    expect(undelivered.reports).toEqual([])
   })
 
   it('throws in English when there is no agent, and when its session has no chat', async () => {

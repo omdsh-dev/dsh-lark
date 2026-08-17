@@ -814,16 +814,13 @@ export function installBridge(
    */
   const sendFilePorts: SendFilePorts | undefined = config.sendFiles
     ? {
-        // The model-driven row of the gating matrix (ADR 0002): a group decides,
-        // a direct message goes straight out. `/get` is the OTHER row — a human
-        // typing a path has already stated his intent — and never comes through
-        // here, which is what makes that row unable to drift into this one.
-        deliver: (sessionId, file) => deliverFile(sessionId, file, true),
+        deliver: (sessionId, file, signal) => deliverFile(sessionId, file, signal),
         workspaceOf: (sessionId) => {
           const key = sessions.keyOf(sessionId)
           return key === undefined ? undefined : chatWorkspaces.pathFor(key)
         },
         maxBytes: config.maxSendFileBytes,
+        report: notify,
       }
     : undefined
 
@@ -1536,9 +1533,21 @@ export function installBridge(
    * `paint` closure.
    * @param binding - the group chat this file would land in.
    * @param file - the file the workspace check cleared.
+   * @param signal - the calling execution's cancellation, so a stopped turn
+   * takes its card down with it instead of leaving one that can still release
+   * the file long after the turn that asked for it is gone.
    * @returns undefined once it may go out, or the English reason it may not.
    */
-  const askFileSend = async (binding: ChatBinding, file: OutboundFile): Promise<string | undefined> => {
+  const askFileSend = async (
+    binding: ChatBinding,
+    file: OutboundFile,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    // Already cancelled: publishing a card here would ask a room to decide
+    // something nobody is waiting for any more.
+    if (signal?.aborted === true) {
+      return 'That turn was cancelled before this chat could be asked, so the file was not sent.'
+    }
     const id = randomUUID()
     let resolveOutcome!: (outcome: HostApprovalOutcome) => void
     const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
@@ -1553,6 +1562,10 @@ export function installBridge(
     }, QUESTION_TIMEOUT_MS)
     timer.unref?.()
 
+    // The same shape the tool escalations use, so the settle is the one that
+    // already guarantees a question closes once and its card stops offering
+    // buttons — this path adds no judgement of its own about that.
+    const onAbort = (): void => { settleApproval(id, 'cancelled') }
     const pending: PendingApproval = {
       chatId: binding.chatId,
       chatType: binding.chatType,
@@ -1560,8 +1573,10 @@ export function installBridge(
       paint: (outcome, decidedBy) => settledFileCard(file.path, outcome, decidedBy),
       state: 'sending',
       settle: resolveOutcome,
+      removeAbort: () => { signal?.removeEventListener('abort', onAbort) },
     }
     pendingApprovals.set(id, pending)
+    signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
       if (!await sendApprovalCard(id, pending, fileApprovalCard(file, id))) {
@@ -1588,27 +1603,38 @@ export function installBridge(
   /**
    * Send one cleared file to the chat its session belongs to, gate included.
    *
+   * This is the MODEL's way out, and the gating matrix lives here (ADR 0002): a
+   * direct message goes straight out, because its only reader is the person
+   * already authorized to drive this agent — who could have asked for the
+   * contents on screen instead, so the leak boundary is zero and an approval
+   * would only breed the fatigue that ends in blind approving. A group is where
+   * the leak lives, so a group asks.
+   *
+   * `/get` does NOT come through here, and that is the point: a human who typed
+   * a path has stated his intent, and making him approve his own command is
+   * theatre. It runs its own send in the command dispatch, which is what keeps
+   * the human row of the matrix from ever drifting into the model's row — a
+   * shared function with a "gate this one" flag is exactly how it would.
+   *
    * Failures come back as a string rather than a throw: the caller is a tool
    * body that turns whatever it gets into the model's error, and one refusal
    * shape for "rejected", "timed out" and "the upload failed" is what keeps
    * that body from having to know which of them happened.
    * @param sessionId - the agent's session, which names the chat.
    * @param file - the file the workspace check cleared.
-   * @param gated - whether a group must approve this send first (ADR 0002).
+   * @param signal - the calling execution's cancellation, which also takes down
+   * a group approval still waiting on a human.
    * @returns undefined once the file is in the chat, or the English reason it is not.
    */
   const deliverFile = async (
     sessionId: string,
     file: OutboundFile,
-    gated: boolean,
+    signal?: AbortSignal,
   ): Promise<string | undefined> => {
     const binding = bySession.get(sessionId)
     if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
-    // A direct message needs no approval: the only reader is the person already
-    // authorized to drive this agent, who could have asked for the contents on
-    // screen instead. A group is where the leak lives (ADR 0002).
-    if (gated && binding.chatType !== 'p2p') {
-      const refused = await askFileSend(binding, file)
+    if (binding.chatType !== 'p2p') {
+      const refused = await askFileSend(binding, file, signal)
       if (refused !== undefined) return refused
     }
     let bytes: Buffer
