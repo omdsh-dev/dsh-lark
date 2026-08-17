@@ -27,8 +27,12 @@
         # output: cot
         # showProcess: true          # off sends the answer alone
         # attachImages: false        # only for a route that accepts images
+        # receiveFiles: true         # inbound files land in .dsh-lark/inbox/
+        # maxReceiveFileBytes: 20971520
+        # sendFiles: true            # groups still gate every send behind a card
+        # maxSendFileBytes: 20971520
         # hideProcessWhenDone: false # let the platform drop a finished process
-        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here
+        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
         # syncSlashCommands: true    # publish commands to the bot's `/` panel
         # sessionScope: chat         # chat-thread / chat-sender split it finer
         requireMention: true

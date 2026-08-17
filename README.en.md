@@ -73,6 +73,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Session scope | One agent per chat, per topic thread, or per person in a shared chat |
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
 | Slash commands | Host commands (`/plan`, `/compact`, `/permission`, …) run straight through the DSH command runtime |
+| File transfer | A file sent into the chat becomes something the agent can read from the workspace; sending one back shows a group an approval card first |
 
 ## Commands
 
@@ -81,6 +82,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | `/status` | Show and refresh workspace, model, and session; context and tokens where available |
 | `/ws` | List the workspaces this channel can reach |
 | `/cd <name or path>` | Switch this conversation's workspace |
+| `/get <path>` | Send a workspace file to the chat |
 | `/model` | Open the model picker |
 | `/model use <provider/model>` | Switch without opening a card |
 | `/model reset` | Back to the deployment default |
@@ -147,6 +149,10 @@ dsh web
 - A card that changes state is bound to the chat it was sent to: forwarded elsewhere, it governs nothing.
 - Where the deployment composes a credentials service, the scanned app secret is stored there; one written into settings by an older version moves on the next boot.
 - Image input is off by default: turn on `attachImages` only for a model you know accepts images.
+- `receiveFiles` is on by default: inbound files land under `.dsh-lark/inbox/<timestamp>-<message hash>/` in the conversation's workspace and are never cleaned up automatically — that's on you. The first file into a workspace prompts a suggestion to add `.dsh-lark/` to `.gitignore`, but the channel never edits that file itself.
+- `sendFiles` is on by default too: a direct message sends straight through, a group shows an approval card with the full path and size on every send — and there is no setting to turn that group approval off, since it would be an official back door for a prompt-injection exfiltration chain.
+- The single-file ceiling defaults to 20 MiB, set separately for each direction with `maxReceiveFileBytes` and `maxSendFileBytes`; documents (pdf / xlsx / docx) only ever arrive as a download with no online preview, because the upstream SDK uploads every general file as the `stream` type instead of inferring one from the extension.
+- Voice messages land on disk like any other file; nothing transcribes them.
 - Configuration is read at startup; changing it needs a restart.
 
 </details>
