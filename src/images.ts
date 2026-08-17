@@ -7,7 +7,10 @@
  * An image passes through `files.ts` as well as this module, and is downloaded
  * exactly once: one that already landed in the workspace is read back off the
  * disk here, and only one that did not — because this deployment receives no
- * files — is fetched from the transport.
+ * files — is fetched from the transport. An image that TRIED to land and did
+ * not is absent from `landed` too — over the per-file limit, over the message
+ * budget, or a failed download — so it is fetched again here rather than
+ * silently going missing, which costs a round trip and keeps the model seeing.
  * @module dsh-lark-channel/images
  */
 

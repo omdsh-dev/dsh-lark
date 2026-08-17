@@ -1183,21 +1183,33 @@ export function installBridge(
       // repository. The workspace is the conversation's own, so `/cd` moves
       // where the next message's files arrive.
       const workspace = chatWorkspaces.pathFor(conversation)
-      const inbound = await collectInboundFiles(msg, port, {
-        workspace,
-        enabled: config.receiveFiles,
-        maxFileBytes: config.maxReceiveFileBytes,
-        report: notify,
-        hintWorkspace: !hintedWorkspaces.has(workspace),
-      })
-      if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
-      const images = await collectImages(
-        msg,
-        port,
-        inbound.landed,
-        ctx.get('attachments') as HostAttachments | undefined,
-        config.attachImages,
-      )
+      let inbound: CollectedFiles = { landed: [], notes: [] }
+      let images: CollectedImages = { blocks: [], notes: [] }
+      // Its own catch, and not the one below: both collectors handle their own
+      // failures today, so a rejection here is latent — but reported as agent
+      // creation it would name the wrong cause AND drop the turn, losing the
+      // message from the model's view entirely. A collection failure costs the
+      // attachments; it must not cost the conversation.
+      try {
+        inbound = await collectInboundFiles(msg, port, {
+          workspace,
+          enabled: config.receiveFiles,
+          maxFileBytes: config.maxReceiveFileBytes,
+          report: notify,
+          hintWorkspace: !hintedWorkspaces.has(workspace),
+        })
+        if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
+        images = await collectImages(
+          msg,
+          port,
+          inbound.landed,
+          ctx.get('attachments') as HostAttachments | undefined,
+          config.attachImages,
+        )
+      } catch (error) {
+        notify(`lark-channel: collecting the attachments of ${msg.messageId} failed: ${String(error)}`)
+        ctx.logger.warn('collecting attachments of %s failed: %s', msg.messageId, error)
+      }
       // The reply target is registered by MESSAGE ID and claimed when the
       // host's `user/message` event names it, because a turn is not one
       // message: the react loop drains several queued followups into a single
