@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { approvalCard, questionCard, settledApprovalCard, settledQuestionCard } from '../src/cards.ts'
+import {
+  approvalCard,
+  fileApprovalCard,
+  questionCard,
+  settledApprovalCard,
+  settledFileApprovalCard,
+  settledQuestionCard,
+} from '../src/cards.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 /** Content a model authored, written to look like the card's own markup. */
@@ -45,6 +52,78 @@ describe('approval card', () => {
     const named = cardTexts(card).filter((text) => text.content.includes(HOSTILE))
     expect(named).toHaveLength(1)
     expect(named[0]!.tag).toBe('plain_text')
+  })
+})
+
+describe('file approval card', () => {
+  it('shows the whole path and the size, so the room can judge what is leaving', () => {
+    const path = '/Users/alex/work/reports/q4-forecast.pdf'
+    const texts = cardTexts(fileApprovalCard({ path, bytes: 1_258_291, allow: {}, reject: {} }))
+    // The path exactly as it was handed over: a shortened or prettified form
+    // would hide which file the room is about to publish.
+    expect(texts.some((text) => text.content === path)).toBe(true)
+    expect(texts.some((text) => text.content === '1.2 MB')).toBe(true)
+  })
+
+  it('reads a size in binary units, whole ones without a decimal', () => {
+    const sizeShown = (bytes: number): string[] =>
+      cardTexts(fileApprovalCard({ path: '/w/f', bytes, allow: {}, reject: {} })).map((text) => text.content)
+    expect(sizeShown(12)).toContain('12 B')
+    expect(sizeShown(1024)).toContain('1 KB')
+    expect(sizeShown(840 * 1024)).toContain('840 KB')
+    expect(sizeShown(3 * 1024 * 1024 * 1024)).toContain('3 GB')
+  })
+
+  it('carries one decision payload per button, and nothing else clickable', () => {
+    const controls = cardControls(fileApprovalCard({
+      path: '/w/out.zip',
+      bytes: 4096,
+      allow: { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'allow' },
+      reject: { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'reject' },
+    }))
+    expect(controls.map((control) => control.value)).toEqual([
+      { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'allow' },
+      { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'reject' },
+    ])
+    expect(controls.map((control) => control.label)).toEqual(['允许发送', '拒绝'])
+  })
+
+  it('offers both languages for the words it authored itself', () => {
+    const texts = cardTexts(fileApprovalCard({ path: '/w/out.zip', bytes: 4096, allow: {}, reject: {} }))
+    const authored = (zh: string): Record<string, string> | undefined =>
+      texts.find((text) => text.content === zh)?.i18n
+    expect(authored('允许发送')).toEqual({ zh_cn: '允许发送', en_us: 'Send it' })
+    expect(authored('拒绝')).toEqual({ zh_cn: '拒绝', en_us: 'Reject' })
+    expect(authored('文件')).toEqual({ zh_cn: '文件', en_us: 'File' })
+    expect(authored('大小')).toEqual({ zh_cn: '大小', en_us: 'Size' })
+  })
+
+  it('says so when a path was too long to print whole', () => {
+    const path = `/w/${'x'.repeat(900)}`
+    const texts = cardTexts(fileApprovalCard({ path, bytes: 1, allow: {}, reject: {} }))
+    expect(texts.some((text) => text.content === path.slice(0, 600))).toBe(true)
+    // A silently shortened path is one the room approves believing it saw the
+    // whole thing.
+    expect(texts.some((text) => text.content === `已截断 ${path.length - 600} 个字符`)).toBe(true)
+  })
+
+  it('leaves nothing clickable once decided, and keeps the record of what happened', () => {
+    for (const outcome of ['allowed-once', 'rejected', 'cancelled', 'unavailable']) {
+      const card = settledFileApprovalCard({ path: '/w/out.zip', outcome, decidedBy: '陈晓' })
+      expect(cardControls(card)).toHaveLength(0)
+      const texts = cardTexts(card).map((text) => text.content)
+      expect(texts.some((content) => content.includes('/w/out.zip'))).toBe(true)
+      expect(texts.some((content) => content.includes('陈晓'))).toBe(true)
+    }
+  })
+
+  it('names who let the file out, without letting the name become markup', () => {
+    const card = settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: HOSTILE })
+    const named = cardTexts(card).filter((text) => text.content.includes(HOSTILE))
+    expect(named).toHaveLength(1)
+    expect(named[0]!.tag).toBe('plain_text')
+    // The outcome talks about sending, not about running something.
+    expect(cardTexts(card).some((text) => text.content.startsWith('已允许发送'))).toBe(true)
   })
 })
 
@@ -110,6 +189,10 @@ describe('localization', () => {
     approvalCard({ toolName: 'bash', command: 'x'.repeat(900), allow: {}, reject: {} }),
     settledApprovalCard({ toolName: 'bash', outcome: 'allowed-once', decidedBy: 'Alex' }),
     settledApprovalCard({ toolName: 'bash', outcome: 'cancelled' }),
+    fileApprovalCard({ path: '/w/out.zip', bytes: 1_258_291, allow: {}, reject: {} }),
+    fileApprovalCard({ path: `/w/${'x'.repeat(900)}`, bytes: 0, allow: {}, reject: {} }),
+    settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: 'Alex' }),
+    settledFileApprovalCard({ path: '/w/out.zip', outcome: 'rejected' }),
     questionCard({ question: 'go on?', options: [{ label: 'yes' }], valueFor: () => ({}) }),
     questionCard({ question: 'go on?', options: [], valueFor: () => ({}) }),
     settledQuestionCard({ question: 'go on?', answer: 'yes' }),
@@ -153,6 +236,8 @@ describe('card foundation', () => {
     const cards = [
       approvalCard({ toolName: 'bash', command: 'ls', reason: 'x', allow: {}, reject: {} }),
       settledApprovalCard({ toolName: 'bash', outcome: 'rejected' }),
+      fileApprovalCard({ path: '/w/out.zip', bytes: 4096, allow: {}, reject: {} }),
+      settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: 'Alex' }),
       questionCard({ question: '?', options: [{ label: 'a', description: 'b' }], valueFor: () => ({}) }),
       settledQuestionCard({ question: '?', answer: 'a' }),
     ]

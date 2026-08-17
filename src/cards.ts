@@ -425,6 +425,31 @@ function compactCount(tokens: number): string {
   return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`
 }
 
+/** Units past a byte, in the order a size climbs through them. */
+const BYTE_UNITS = ['KB', 'MB', 'GB', 'TB'] as const
+
+/**
+ * A file size at a glance: binary steps, one decimal once it leaves bytes, and
+ * no `.0` on a whole one.
+ *
+ * A bare `string` rather than a {@link Copy}, because digits and a unit symbol
+ * read identically in both languages — a translated pair would only give the
+ * two halves a way to drift apart while saying the same thing.
+ * @param bytes - the size on disk.
+ * @returns the short form, such as `1.2 MB`, `840 KB` or `12 B`.
+ */
+function formatBytes(bytes: number): string {
+  let value = Number.isFinite(bytes) && bytes > 0 ? bytes : 0
+  let unit = 'B'
+  for (const larger of BYTE_UNITS) {
+    if (value < 1024) break
+    value /= 1024
+    unit = larger
+  }
+  const digits = unit === 'B' ? String(Math.round(value)) : value.toFixed(1)
+  return `${digits.endsWith('.0') ? digits.slice(0, -2) : digits} ${unit}`
+}
+
 /**
  * How full the context is: what the next request carries, and — when the
  * provider says how big the window is — the share of it that leaves.
@@ -548,6 +573,89 @@ export function settledApprovalCard(input: {
     ? input.toolName
     : join(fill(APPROVAL.decidedBy, input.toolName), input.decidedBy)
   return card(settled.state, join(settled.title, `：${input.toolName}`, `: ${input.toolName}`), [
+    ...heading(settled.state, settled.title, context),
+    ...footer(APPROVAL.closed),
+  ])
+}
+
+/** Every string the outbound-file approval says, in both its languages. */
+const FILE_SEND = {
+  title: { zh: '需要你的授权', en: 'Approval needed' },
+  context: { zh: 'Agent 想把一个文件发到这个群', en: 'The agent wants to send a file to this group' },
+  path: { zh: '文件', en: 'File' },
+  size: { zh: '大小', en: 'Size' },
+  allow: { zh: '允许发送', en: 'Send it' },
+  reject: { zh: '拒绝', en: 'Reject' },
+  foot: {
+    zh: '文件会对群内所有人可见。确认这份内容可以公开后再允许。',
+    en: 'Everyone in this group will see it. Allow only if the content can be shared.',
+  },
+}
+
+/**
+ * The card that asks a group to authorize one outbound file.
+ *
+ * The path and the size are the whole card: an approver who cannot see what is
+ * leaving cannot judge whether it may leave, which is the same reason the tool
+ * approval prints its command verbatim. The path arrives canonical and is shown
+ * that way — a prettified or shortened form would let a symlink present itself
+ * as a file the room believes it is approving.
+ * @param input - the file being offered, and the payloads its buttons carry.
+ * @returns a schema 2.0 card object.
+ */
+export function fileApprovalCard(input: {
+  readonly path: string
+  readonly bytes: number
+  readonly allow: object
+  readonly reject: object
+}): object {
+  const path = clip(input.path, COMMAND_MAX_CHARS)
+  return card('warning', join(FILE_SEND.title, `：${path.shown}`, `: ${path.shown}`), [
+    ...heading('warning', FILE_SEND.title, FILE_SEND.context),
+    quoted(FILE_SEND.path, path.shown, 'grey-50', path.hidden),
+    quoted(FILE_SEND.size, formatBytes(input.bytes), 'grey-50'),
+    actions([
+      { label: FILE_SEND.allow, value: input.allow, kind: 'primary' },
+      { label: FILE_SEND.reject, value: input.reject, kind: 'danger' },
+    ]),
+    ...footer(FILE_SEND.foot),
+  ])
+}
+
+/**
+ * How one file approval ended. Its own set rather than {@link APPROVAL_OUTCOME}:
+ * that one speaks of running something, and what happened here is a send.
+ * A request nobody answered in time is presented as withdrawn, because from the
+ * room's side that is what it was.
+ */
+const FILE_SEND_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+  'allowed-once': { state: 'success', title: { zh: '已允许发送', en: 'Send allowed' } },
+  rejected: { state: 'danger', title: { zh: '已拒绝发送', en: 'Send rejected' } },
+  cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
+  unavailable: { state: 'neutral', title: { zh: '无法发送', en: 'Could not be sent' } },
+}
+
+/**
+ * The card a file approval is replaced with once decided — no live buttons, and
+ * the decision legible from the ink alone.
+ * @param input - the file, the outcome, and who decided when someone did.
+ * @returns a schema 2.0 card object.
+ */
+export function settledFileApprovalCard(input: {
+  readonly path: string
+  readonly outcome: string
+  readonly decidedBy?: string | undefined
+}): object {
+  const settled = FILE_SEND_OUTCOME[input.outcome] ?? FILE_SEND_OUTCOME.cancelled!
+  const path = clip(input.path, COMMAND_MAX_CHARS)
+  // Who decided, named rather than withheld: with approvals open to a room, the
+  // room should see whose press let the file out. The file itself stays in the
+  // record too — a settled card that only said "allowed" would leave nobody
+  // able to tell what was allowed.
+  const context = input.decidedBy === undefined || input.decidedBy === ''
+    ? path.shown
+    : join(fill(APPROVAL.decidedBy, path.shown), input.decidedBy)
+  return card(settled.state, join(settled.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
   ])
