@@ -817,6 +817,7 @@ const STATUS = {
   running: { zh: '正在跑一轮任务', en: 'Running a turn' },
   idle: { zh: '空闲', en: 'Idle' },
   unbound: { zh: '尚未创建，下一条消息会创建', en: 'Not created yet — your next message creates it' },
+  switched: { zh: '已切换到指定会话，下一条消息接续', en: 'Switched — resumed from your next message' },
   refresh: { zh: '刷新', en: 'Refresh' },
   foot: {
     zh: '工作区用 /cd 切换，模型用 /model 切换，两者都只影响本会话。',
@@ -916,7 +917,8 @@ export function statusCard(input: {
   readonly route: string
   readonly routeIsDefault: boolean
   readonly sessionId: string
-  readonly activity: 'running' | 'idle' | 'unbound'
+  readonly sessionTitle?: string | undefined
+  readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
   readonly pendingApprovals: number
   readonly version: string
   /** The permission preset in force, as the deployment defines it. */
@@ -951,11 +953,80 @@ export function statusCard(input: {
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
         )),
-      ...field(STATUS.session, input.sessionId),
+      ...(input.sessionTitle === undefined || input.sessionTitle === ''
+        ? field(STATUS.session, input.sessionId)
+        // Keep the 会话 label; title (grey subtitle) above, id (body) below, both in the value area.
+        : [
+            line(STATUS.session, SIZE.label, '14px 0px 0px 0px', 'grey'),
+            line(input.sessionTitle, SIZE.label, '2px 0px 0px 0px', 'grey'),
+            line(input.sessionId, SIZE.body, '2px 0px 0px 0px'),
+          ]),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
     ]),
     actions([{ label: STATUS.refresh, value: input.refresh }], true),
     ...footer(STATUS.foot),
+  ])
+}
+
+/** Session picker copy. */
+const SESSION = {
+  title: { zh: '可切换会话', en: 'Switchable sessions' },
+  subtitle: { zh: '选择要接续的对话', en: 'Pick a conversation to resume' },
+  current: { zh: '当前', en: 'current' },
+  currentOverride: { zh: '当前（已切换）', en: 'current (switched)' },
+  noSessions: { zh: '当前工作区暂无其他会话，发条消息即可创建。', en: 'No other sessions in this workspace — send a message to create one.' },
+  unavailable: { zh: '会话列表不可用。', en: 'Session list unavailable.' },
+  workspace: { zh: '工作区', en: 'Workspace' },
+  empty: { zh: '（无标题）', en: '(untitled)' },
+  footer: {
+    zh: '/session <id> 切换到列表中的会话；/session reset 解除切换。',
+    en: '/session <id> switches to a listed session; /session reset clears the switch.',
+  },
+  summary: { zh: '可切换会话', en: 'Switchable sessions' },
+}
+
+/** One row in the session picker. */
+export interface SessionCardRow {
+  readonly id: string
+  readonly title?: string | undefined
+  readonly current: boolean
+  readonly override: boolean
+}
+
+/**
+ * Render the session picker as a card: one field per session, label = title,
+ * value = id — so a phone user can copy the id without the title.
+ * @param input - sessions in the current workspace plus workspace path.
+ * @returns a schema 2.0 card object for `send({ card })`.
+ */
+export function sessionCard(input: {
+  readonly rows: readonly SessionCardRow[]
+  readonly workspace: string
+  readonly canList: boolean
+}): object {
+  const fields: object[] = []
+  if (!input.canList) {
+    fields.push(...field(SESSION.title, SESSION.unavailable, undefined, true))
+  } else if (input.rows.length === 0) {
+    fields.push(...field(SESSION.title, SESSION.noSessions, undefined, true))
+  } else {
+    for (const row of input.rows) {
+      // Title line (readable), id line (copyable on mobile), current marker as note.
+      const title = row.title !== undefined && row.title !== '' ? row.title : SESSION.empty
+      fields.push(line(title, SIZE.label, '14px 0px 0px 0px', 'grey'))
+      const note = row.current ? (row.override ? SESSION.currentOverride : SESSION.current) : undefined
+      fields.push(line(note === undefined ? row.id : `${row.id}（${note.zh}）`, SIZE.body, '2px 0px 0px 0px'))
+      if (row !== input.rows[input.rows.length - 1]) {
+        fields.push(line('', SIZE.body, '10px 0px 0px 0px'))
+      }
+    }
+  }
+  // Workspace goes in the header subtitle (readable); the panel holds only the session list.
+  const context: Line = input.canList && input.workspace !== '' ? input.workspace : SESSION.subtitle
+  return card('neutral', SESSION.summary, [
+    ...heading('neutral', SESSION.title, context),
+    panel(fields),
+    ...footer(SESSION.footer),
   ])
 }
 

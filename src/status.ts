@@ -116,6 +116,10 @@ export interface StatusFields {
   readonly sessionId: string
   /** Whether an agent is currently bound for the conversation. */
   readonly bound: boolean
+  /** Latest session title, when the log has one. */
+  readonly sessionTitle?: string | undefined
+  /** Whether this conversation has an explicit /session switch (resumed on next message). */
+  readonly switched?: boolean | undefined
   /** Whether a turn is running right now. */
   readonly running: boolean
   /** Open approval cards waiting in this chat. */
@@ -161,7 +165,8 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     route: fields.route,
     routeIsDefault: fields.routeIsDefault,
     sessionId: fields.sessionId,
-    activity: fields.running ? 'running' : fields.bound ? 'idle' : 'unbound',
+    ...fields.sessionTitle === undefined ? {} : { sessionTitle: fields.sessionTitle },
+    activity: fields.running ? 'running' : fields.bound ? 'idle' : fields.switched === true ? 'switched' : 'unbound',
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
     ...fields.preset === undefined ? {} : { preset: fields.preset },

@@ -18,6 +18,7 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
+  sessionCard,
   fileApprovalCard as buildFileApprovalCard,
   QUESTION_SELECT,
   permissionCard,
@@ -61,7 +62,7 @@ import { marked } from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
-import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import { CD_COMMAND, ChatSessionOverrides, ChatWorkspaces, runSessionCommand, runWorkspaceCommand, SESSION_COMMAND, WS_COMMAND } from './workspace.ts'
 import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
 import {
   ChatModels,
@@ -794,6 +795,13 @@ export function installBridge(
     report: notify,
   })
 
+  /** Per-conversation explicit session overrides (/session <id>), symmetric to ChatWorkspaces. */
+  const chatSessionOverrides = new ChatSessionOverrides({
+    entries: config.chatSessions,
+    persist: persistState,
+    report: notify,
+  })
+
   /**
    * The directory and route each session id was derived for. The ladder is
    * keyed by session id alone, so its rungs read these back here rather than
@@ -804,7 +812,9 @@ export function installBridge(
   const pathBySession = new Map<string, string>()
   const routeBySession = new Map<string, HostAgentOptions>()
   const sessionIdForKey = (key: string): string => {
-    const id = chatWorkspaces.sessionIdFor(key)
+    // An explicit /session override wins: the chat binds to any existing session (incl. Web UI ones).
+    const override = chatSessionOverrides.overrideFor(key)
+    const id = override ?? chatWorkspaces.sessionIdFor(key)
     pathBySession.set(id, chatWorkspaces.pathFor(key))
     const route = chatModels.routeFor(key)
     if (route === undefined) routeBySession.delete(id)
@@ -1213,6 +1223,7 @@ export function installBridge(
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
       { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
+      { name: SESSION_COMMAND, description: '查看或切换已有会话（/session <id> 或 /session reset）' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
     void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
@@ -1318,7 +1329,7 @@ export function installBridge(
    * not guaranteed to arrive.
    */
   const releaseFor = (key: string): (() => Promise<void>) => {
-    const releasedId = chatWorkspaces.sessionIdFor(key)
+    const releasedId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
     return async () => {
       // Cancelled BEFORE the release, and awaited: releasing is what makes an
       // agent idle, and a switch waiting for exactly that would slip through
@@ -1334,8 +1345,31 @@ export function installBridge(
   }
 
   /** Everything `/status` reports, read fresh from channel state. */
-  const statusFieldsFor = (subject: ConversationSubject): StatusFields => {
-    const sessionId = chatWorkspaces.sessionIdFor(subject.key)
+  /**
+   * Fold the latest title for one session via sessionQuery.readTitleSnapshots.
+   * Absent query service or title → undefined (card falls back to id only).
+   */
+  const sessionTitleFor = async (sessionId: string): Promise<string | undefined> => {
+    const query = ctx.get('sessionQuery') as { readTitleSnapshots?: (ids: readonly string[], signal?: AbortSignal) => Promise<unknown> } | undefined
+    if (query?.readTitleSnapshots === undefined) return undefined
+    try {
+      const snapshots = await query.readTitleSnapshots([sessionId]) as Array<{
+        sessionId?: string
+        status?: string
+        value?: { session?: { id?: string }; title?: { title?: string } } | undefined
+      } | undefined>
+      const snap = snapshots[0]
+      const sid = snap?.value?.session?.id ?? snap?.sessionId
+      if (sid !== sessionId) return undefined
+      const title = snap?.value?.title?.title
+      return title === undefined || title === '' ? undefined : title
+    } catch {
+      return undefined
+    }
+  }
+
+  const statusFieldsFor = async (subject: ConversationSubject): Promise<StatusFields> => {
+    const sessionId = chatSessionOverrides.overrideFor(subject.key) ?? chatWorkspaces.sessionIdFor(subject.key)
     const override = chatModels.routeFor(subject.key)
     const route = override === undefined ? deploymentRoute() : formatRoute(override)
     // Meters come off the LIVE session: a conversation whose agent has not been
@@ -1350,7 +1384,9 @@ export function installBridge(
       route,
       routeIsDefault: override === undefined,
       sessionId,
+      sessionTitle: await sessionTitleFor(sessionId),
       bound: sessions.keyOf(sessionId) !== undefined,
+      switched: chatSessionOverrides.has(subject.key),
       running: runningBySession.get(sessionId) === true,
       pendingApprovals: [...pendingApprovals.values()]
         .filter(pending => pending.chatId === subject.chatId).length,
@@ -1581,6 +1617,7 @@ export function installBridge(
       channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
       || channelCommand === NEW_COMMAND || channelCommand === GET_COMMAND
+      || channelCommand === SESSION_COMMAND
     ) {
       try {
         const key = conversation
@@ -1623,6 +1660,58 @@ export function installBridge(
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
         } else if (channelCommand === NEW_COMMAND) {
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
+        } else if (channelCommand === SESSION_COMMAND) {
+          const currentId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
+          const listSessions = async (): Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]> => {
+            const query = ctx.get('sessionQuery') as {
+              listSessions?: (signal?: AbortSignal) => Promise<unknown>
+              readTitleSnapshots?: (sessionIds: readonly string[], signal?: AbortSignal) => Promise<unknown>
+            } | undefined
+            if (query?.listSessions === undefined) return []
+            const currentPath = chatWorkspaces.pathFor(key)
+            try {
+              const records = await query.listSessions() as Array<{ header?: { id?: string; cwd?: string; createdAt?: number } }>
+              const registry = ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
+              const archived = new Set(registry?.archivedSessionIds ?? [])
+              const sessions = records
+                .filter(record => record.header?.id !== undefined)
+                .filter(record => !archived.has(record.header!.id!))
+                .filter(record => record.header?.cwd === currentPath)
+                .map(record => ({
+                  id: record.header!.id!,
+                  cwd: record.header?.cwd,
+                  createdAt: record.header?.createdAt,
+                }))
+              if (query.readTitleSnapshots !== undefined && sessions.length > 0) {
+                try {
+                  const snapshots = await query.readTitleSnapshots(sessions.map(s => s.id)) as Array<{
+                    sessionId?: string
+                    status?: string
+                    value?: { session?: { id?: string }; title?: { title?: string } } | undefined
+                  } | undefined>
+                  const byId = new Map<string, string | undefined>()
+                  for (const r of snapshots) {
+                    const sid = r?.value?.session?.id ?? r?.sessionId
+                    if (sid === undefined) continue
+                    const title = r?.value?.title?.title
+                    byId.set(sid, title === undefined || title === '' ? undefined : title)
+                  }
+                  return sessions.map(x => ({ ...x, title: byId.get(x.id) }))
+                } catch {
+                  return sessions
+                }
+              }
+              return sessions
+            } catch {
+              return []
+            }
+          }
+          {
+            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key))
+            reply = result.card === undefined
+              ? { markdown: result.markdown }
+              : { card: sessionCard({ rows: result.card.rows, workspace: result.card.workspace, canList: result.card.canList }) }
+          }
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
@@ -1630,7 +1719,7 @@ export function installBridge(
             release,
           })
         } else {
-          reply = { card: renderStatusCard({ ...statusFieldsFor(subject), ...presetOf(subject) }, subject) }
+          reply = { card: renderStatusCard({ ...(await statusFieldsFor(subject)), ...presetOf(subject) }, subject) }
         }
         await port.send(msg.chatId, reply).catch(reportSendFailure)
       } catch (error) {
@@ -2129,10 +2218,7 @@ export function installBridge(
       }
       return {
         toast: toast('success', TOAST.refreshed),
-        card: {
-          type: 'raw',
-          data: renderStatusCard({ ...statusFieldsFor(refresh), ...presetOf(refresh) }, refresh),
-        },
+        card: { type: 'raw', data: renderStatusCard({ ...(await statusFieldsFor(refresh)), ...presetOf(refresh) }, refresh) }
       }
     }
     const value = approvalActionValue(evt.action.value)

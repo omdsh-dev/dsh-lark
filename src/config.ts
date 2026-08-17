@@ -81,6 +81,12 @@ export interface Config {
    * zero. Absent is the first session, whose id is unchanged.
    */
   chatEpochs?: Record<string, string>
+  /**
+   * Managed state, not configuration: the session each conversation was
+   * explicitly bound to via /session <id>, keyed by conversation key. An
+   * empty-string value marks automatic derivation (the override was reset).
+   */
+  chatSessions?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -261,6 +267,7 @@ export interface ResolvedConfig {
   chatWorkspaces: Record<string, string>
   chatModels: Record<string, string>
   chatEpochs: Record<string, string>
+  chatSessions: Record<string, string>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -295,6 +302,7 @@ export const Config: z<Config> = z.object({
   chatWorkspaces: z.dict(String).default({}),
   chatModels: z.dict(String).default({}),
   chatEpochs: z.dict(String).default({}),
+  chatSessions: z.dict(String).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -329,6 +337,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     chatWorkspaces: config.chatWorkspaces ?? {},
     chatModels: config.chatModels ?? {},
     chatEpochs: config.chatEpochs ?? {},
+    chatSessions: config.chatSessions ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,

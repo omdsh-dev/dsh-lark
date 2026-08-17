@@ -350,3 +350,171 @@ export async function runWorkspaceCommand(
   const durability = result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'
   return `📁 ${where}\n下一条消息在该目录继续；这个目录之前的会话上下文会被续用。${durability}`
 }
+
+// ── Session overrides (/session): symmetric to ChatWorkspaces ───────────────
+
+/** Session override command name. */
+export const SESSION_COMMAND = 'session'
+
+/** Sentinel value for clearing an override. */
+const SESSION_RESET_MARKER = '__reset__'
+
+/** Construction options. */
+export interface ChatSessionOverridesOptions {
+  /** Persisted chatKey → sessionId override map. */
+  readonly entries?: Record<string, string> | undefined
+  /** Persist through the host settings service; false = no settings composed. */
+  readonly persist?: ((patch: { chatSessions: Record<string, string> }) => Promise<boolean>) | undefined
+  /** Single-line note for non-durable deployments. */
+  readonly report?: ((line: string) => void) | undefined
+}
+
+/**
+ * A conversation's explicit session override. By default each conversation's
+ * session id is derived from workspace/epoch; this class lets /session <id>
+ * bind the chat to any existing persisted session (including ones created in
+ * the Web UI), and /session reset returns to automatic derivation.
+ * Pure state plus injected effects, so tests drive it without a filesystem or
+ * a settings service.
+ */
+export class ChatSessionOverrides {
+  private readonly entries: Map<string, string>
+  private readonly persist: (patch: { chatSessions: Record<string, string> }) => Promise<boolean>
+  private readonly report: (line: string) => void
+  private warnedNotDurable = false
+
+  constructor(options: ChatSessionOverridesOptions) {
+    this.persist = options.persist ?? (async () => false)
+    this.report = options.report ?? (() => {})
+    this.entries = new Map(Object.entries(options.entries ?? {}))
+  }
+
+  /** The override session id for one conversation; undefined when none. */
+  overrideFor(key: string): string | undefined {
+    const entry = this.entries.get(key)
+    return entry === undefined || entry === SESSION_RESET_MARKER ? undefined : entry
+  }
+
+  /** Whether a conversation has an override. */
+  has(key: string): boolean {
+    return this.overrideFor(key) !== undefined
+  }
+
+  /** Bind a conversation to a session; undefined clears the override. */
+  async set(key: string, sessionId: string | undefined): Promise<boolean> {
+    const value = sessionId === undefined ? SESSION_RESET_MARKER : sessionId
+    const changed = (this.entries.get(key) ?? SESSION_RESET_MARKER) !== value
+    this.entries.set(key, value)
+    let durable = true
+    if (changed) {
+      durable = await this.persist({ chatSessions: { [key]: value } }).catch((error: unknown) => {
+        this.report(`lark-channel: persisting the session override failed: ${String(error)}`)
+        return false
+      })
+      if (!durable && !this.warnedNotDurable) {
+        this.warnedNotDurable = true
+        this.report('lark-channel: session overrides are in-memory only (no settings service); they reset on restart')
+      }
+    }
+    return durable
+  }
+}
+
+/** Result of one session-command execution. */
+export interface SessionCommandResult {
+  /** Text to show in chat (bind/reset/invalid-id feedback). */
+  readonly markdown: string
+  /** Card content (/session with no args); preferred over markdown when present. */
+  readonly card?: {
+    readonly rows: readonly { id: string; title?: string | undefined; current: boolean; override: boolean }[]
+    readonly workspace: string
+    readonly canList: boolean
+  } | undefined
+}
+
+/**
+ * Handle the /session command, symmetric to runWorkspaceCommand:
+ * - no argument: list sessions in the current workspace (card)
+ * - /session <id>: bind this conversation to an existing session
+ * - /session reset: clear the override, back to automatic derivation
+ * @param line - the full command line, leading slash included.
+ * @param key - conversation key.
+ * @param overrides - the override store.
+ * @param currentId - the session id this conversation resolves to today.
+ * @param listSessions - optional listing of sessions in the current workspace.
+ * @param currentPath - the conversation's current workspace path.
+ */
+export async function runSessionCommand(
+  line: string,
+  key: string,
+  overrides: ChatSessionOverrides,
+  currentId: string,
+  listSessions?: () => Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]>,
+  currentPath?: string | undefined,
+): Promise<SessionCommandResult> {
+  const argument = line.trimStart().slice(1 + SESSION_COMMAND.length).trim()
+  const lower = argument.toLowerCase()
+  if (lower === 'reset' || lower === 'clear') {
+    const durable = await overrides.set(key, undefined)
+    const durability = durable ? '' : '\n（本部署未组合 settings，重启后会回到自动派生。）'
+    return { markdown: `🔁 已解除会话切换，恢复自动路由。\n下一条消息按聊天/话题/工作区自动路由。${durability}` }
+  }
+  if (argument === '') {
+    const override = overrides.overrideFor(key)
+    // No argument = list switchable sessions in the current workspace (like /ws
+    // lists workspaces), not a duplicate of /status's "current session".
+    let listing = ''
+    if (listSessions !== undefined) {
+      try {
+        const sessions = await listSessions()
+        if (sessions.length === 0) {
+          listing = '\n\n_（当前工作区暂无其他会话，发条消息即可创建。）_'
+        } else {
+          const rows = sessions.map(s => {
+            const label = s.title !== undefined && s.title !== '' ? s.title : s.id
+            const mark = s.id === (override ?? currentId) ? '（当前）' : ''
+            return `- \`${label}\` ${s.id}${mark}`
+          })
+          const where = currentPath === undefined || currentPath === '' ? '当前工作区' : `当前工作区：\`${currentPath}\``
+          listing = `\n\n💬 **可切换会话**（${where}）\n${rows.join('\n')}`
+        }
+      } catch (error) {
+        listing = `\n\n_（会话列表不可用：${error instanceof Error ? error.message : String(error)}）_`
+      }
+    }
+    const status = override === undefined
+      ? `当前会话：\`${currentId}\``
+      : `当前会话：\`${override}\`（已切换）\n自动派生：\`${currentId}\``
+    // Card mode: return structured session data; the bridge renders sessionCard
+    // (label = title, value = id, copyable on mobile).
+    const canList = listSessions !== undefined
+    let rows: { id: string; title?: string | undefined; current: boolean; override: boolean }[] = []
+    if (canList) {
+      try {
+        const sessions = await listSessions!()
+        rows = sessions.map(s => ({
+          id: s.id,
+          title: s.title,
+          current: s.id === (override ?? currentId),
+          override: s.id === override && override !== undefined,
+        }))
+      } catch {
+        /* canList stays true; empty rows make the card show unavailable */
+      }
+    }
+    return {
+      markdown: `${status}${listing}\n\n用法：\n\`/session <id>\` — 切换到列表中的某个会话\n\`/session reset\` — 解除切换，恢复自动路由\n\`/new\` — 原地开新会话`,
+      card: {
+        rows,
+        workspace: currentPath ?? '',
+        canList: listSessions !== undefined,
+      },
+    }
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(argument)) {
+    return { markdown: `⚠️ 会话 ID 格式不合法：\`${argument}\`。\n合法字符：字母、数字、\`\.\`、\`_\`、\`-\`。` }
+  }
+  const durable = await overrides.set(key, argument)
+  const durability = durable ? '' : '\n（本部署未组合 settings，这次绑定在重启后会丢失。）'
+  return { markdown: `🔗 已切换到会话 \`${argument}\`。\n下一条消息继续该会话的上下文。${durability}\n\`/session reset\` 可解除切换。` }
+}
