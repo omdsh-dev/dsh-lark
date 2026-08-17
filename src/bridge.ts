@@ -77,15 +77,16 @@ import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
+import { collectInboundFiles } from './files.ts'
+import type { CollectedFiles, InboundFilePort } from './files.ts'
 import {
-  collectInboundFiles,
   GET_COMMAND,
   readOutboundFile,
   runGetCommand,
   SEND_FILE_TOOL,
   sendFileTool,
-} from './files.ts'
-import type { CollectedFiles, InboundFilePort, OutboundFile, SendFilePorts } from './files.ts'
+} from './outbound-file.ts'
+import type { OutboundFile, SendFilePorts } from './outbound-file.ts'
 import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'

@@ -10,7 +10,7 @@
  */
 
 import type { HostAgent, HostCommands } from './host.ts'
-import { GET_COMMAND } from './files.ts'
+import { GET_COMMAND } from './outbound-file.ts'
 import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
