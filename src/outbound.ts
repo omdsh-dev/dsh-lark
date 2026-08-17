@@ -128,10 +128,14 @@ function failureLine(detail: string): string {
  * Derive the send options one reply target implies. A target inside a topic
  * thread also needs `replyInThread`, or the reply leaves the thread and lands
  * in the chat's main channel.
+ *
+ * Exported because output this module does not render still belongs under the
+ * message that asked for it — an outbound file is sent by the bridge, and
+ * re-deriving `replyTo` / `replyInThread` there is how the two aims drift apart.
  * @param target - the aimed reply target, or undefined for plain chat sends.
- * @returns the options every outbound call of that reply carries, or undefined to send with none.
+ * @returns the options every outbound call of that reply carries.
  */
-function replyOptions(target: ReplyTarget | undefined): SendOptions {
+export function replyOptions(target: ReplyTarget | undefined): SendOptions {
   return {
     // An `@name` the model typed becomes a real mention, resolved against the
     // chat's own roster — the platform leaves an unknown or ambiguous name as

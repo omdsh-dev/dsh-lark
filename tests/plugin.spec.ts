@@ -1,12 +1,14 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
-import { readdir, readFile, rm } from 'node:fs/promises'
+import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { Context } from '@deepseek-ai/cordis'
-import type { CardActionEvent, NormalizedMessage } from '@larksuite/channel'
+import type { CardActionEvent, NormalizedMessage, SendOptions } from '@larksuite/channel'
 import * as plugin from '../src/index.ts'
+import { GET_COMMAND, SEND_FILE_TOOL } from '../src/files.ts'
+import { QUESTION_TIMEOUT_MS } from '../src/questions.ts'
 import { parseRoute } from '../src/model.ts'
 import * as invariant from '../src/invariant.ts'
 import type { HostApprovalOutcome, HostApprovalRequest } from '../src/host.ts'
@@ -804,6 +806,340 @@ describe('dsh-lark-channel', () => {
       expect(presence?.text).not.toContain('untrusted data')
       // The bearings are unconditional; only the file sentence is not.
       expect(presence?.text).toContain('Your reply IS the message')
+      await harness.dispose()
+    })
+  })
+
+  describe('outbound files', () => {
+    type Harness = Awaited<ReturnType<typeof mountChannel>>
+
+    /** A workspace holding one artifact an agent could hand over. */
+    async function workspaceWithArtifact(
+      name = 'report.md',
+      contents = '# findings\nnothing is on fire\n',
+    ): Promise<{ workspace: string; contents: string }> {
+      const workspace = createWorkspace()
+      await writeFile(join(workspace, name), contents)
+      return { workspace, contents }
+    }
+
+    /**
+     * The definition this agent's composition registered under one name, as the
+     * host would execute it. Registered definitions are what the model can
+     * reach, so calling one is the only honest way to test the tool's wiring.
+     */
+    function registeredTool(
+      created: CreatedAgent,
+      name: string,
+    ): { execute(args: unknown, exec: unknown): Promise<unknown> } {
+      const definition = created.registeredTools.find((tool) => tool.name === name)
+      if (definition === undefined) throw new Error(`no ${name} was registered on this agent`)
+      return definition as unknown as { execute(args: unknown, exec: unknown): Promise<unknown> }
+    }
+
+    /** Bind one chat to an agent and hand back the `send_file` it registered. */
+    async function boundSender(harness: Harness, overrides: Partial<NormalizedMessage> = {}) {
+      await harness.fake.emitMessage(fakeMessage(overrides))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const created = harness.agents.created[0]!
+      return { created, tool: registeredTool(created, SEND_FILE_TOOL) }
+    }
+
+    /** Every file message the chat received, payload narrowed. */
+    const filesSent = (harness: Harness): {
+      to: string
+      opts: SendOptions | undefined
+      file: { source: string | Buffer; fileName: string }
+    }[] => harness.fake.sent.flatMap((message) => 'file' in message.input
+      ? [{ to: message.to, opts: message.opts, file: message.input.file }]
+      : [])
+
+    /** Every card the chat received. */
+    const cardsSent = (harness: Harness): object[] => harness.fake.sent
+      .flatMap((message) => 'card' in message.input ? [message.input.card] : [])
+
+    /** Everything said to the chat in words, joined for containment checks. */
+    const sentText = (harness: Harness): string => harness.fake.sent
+      .map((message) => JSON.stringify(message.input)).join('\n')
+
+    it('sends a direct message its file straight away, with no card in the way', async () => {
+      const { workspace, contents } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness)
+
+      await expect(tool.execute({ path: 'report.md' }, { agent: created.agent })).resolves.toEqual({ sent: true })
+      // The only reader is the person already driving this agent (ADR 0002).
+      expect(cardsSent(harness)).toHaveLength(0)
+      const [sent] = filesSent(harness)
+      expect(sent?.file.fileName).toBe('report.md')
+      // A Buffer, not a path: the SDK's own local-path guard never runs for what
+      // this plugin hands it (ADR 0004), so nothing local may reach it.
+      expect(Buffer.isBuffer(sent?.file.source)).toBe(true)
+      expect((sent!.file.source as Buffer).toString('utf8')).toBe(contents)
+      await harness.dispose()
+    })
+
+    it('lands the artifact under the message that asked for it', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace, showProcess: false })
+      const { created, tool } = await boundSender(harness)
+      const session = created.agent.session
+      const messageId = created.agent.followup.mock.calls[0]![0].id
+
+      harness.ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } })
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: messageId } })
+      await tool.execute({ path: 'report.md' }, { agent: created.agent })
+      expect(filesSent(harness)[0]!.opts?.replyTo).toBe('om_in_1')
+
+      // And the aim is dropped with the turn: a file produced by later work
+      // nobody asked for must not be pinned under an unrelated message.
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+      })
+      await tool.execute({ path: 'report.md' }, { agent: created.agent })
+      expect(filesSent(harness)[1]!.opts?.replyTo).toBeUndefined()
+      await harness.dispose()
+    })
+
+    it('asks the group first, and sends only once someone presses allow', async () => {
+      const { workspace, contents } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      // The card is the gate, not a notification: nothing has left yet.
+      expect(filesSent(harness)).toHaveLength(0)
+      const card = cardsSent(harness)[0]!
+      const texts = cardTexts(card).map((text) => text.content)
+      // The last metre of this defense is an approver who can see what leaves.
+      expect(texts).toContain(join(workspace, 'report.md'))
+      expect(texts).toContain(`${Buffer.byteLength(contents)} B`)
+
+      const allow = approvalValueFromCard(card).find((value) => value.decision === 'allow')!
+      const response = await harness.fake.emitCardAction(
+        clickAction(allow, { chatId: 'oc_group_1', name: '同事' }),
+      )
+      // The settled card is the FILE's, not a tool escalation's: the room reads
+      // back what it just decided.
+      const painted = JSON.stringify((response as { card?: { data: unknown } }).card?.data)
+      expect(painted).toContain('已允许发送')
+      expect(painted).toContain('同事')
+
+      await expect(sending).resolves.toEqual({ sent: true })
+      expect(filesSent(harness)).toHaveLength(1)
+      expect(filesSent(harness)[0]!.to).toBe('oc_group_1')
+      await harness.dispose()
+    })
+
+    it('sends nothing when the group rejects, and tells the model it was rejected', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      const reject = approvalValueFromCard(cardsSent(harness)[0]!)
+        .find((value) => value.decision === 'reject')!
+      await harness.fake.emitCardAction(clickAction(reject, { chatId: 'oc_group_1' }))
+
+      await expect(sending).rejects.toThrow(/rejected sending that file/)
+      expect(filesSent(harness)).toHaveLength(0)
+      await harness.dispose()
+    })
+
+    it('lets only a configured approver release a file', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace, approvers: ['ou_lead'] })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!).find((value) => value.decision === 'allow')!
+
+      const refused = await harness.fake.emitCardAction(
+        clickAction(allow, { chatId: 'oc_group_1', openId: 'ou_bystander' }),
+      )
+      expect(refused).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(filesSent(harness)).toHaveLength(0)
+
+      // Still pending until the named human presses it.
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1', openId: 'ou_lead' }))
+      await expect(sending).resolves.toEqual({ sent: true })
+      expect(filesSent(harness)).toHaveLength(1)
+      await harness.dispose()
+    })
+
+    it('cancels a pending file approval when the fiber unwinds', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+
+      const sending = tool.execute({ path: 'report.md' }, { agent: created.agent })
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+      await harness.dispose()
+
+      await expect(sending).rejects.toThrow(/withdrawn/)
+      expect(filesSent(harness)).toHaveLength(0)
+      // And the card the room is looking at stops offering live buttons.
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      expect(JSON.stringify(harness.fake.updated[0]!.card)).toContain('请求已撤回')
+    })
+
+    it('tells the model an unanswered approval expired, not that it was refused', async () => {
+      // Installed before the ask, because a fake clock only owns timers created
+      // after it: the approval's own timer is the one under test.
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      try {
+        const { workspace } = await workspaceWithArtifact()
+        const harness = await mountChannel({ cwd: workspace })
+        const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+        // Captured now, not after the clock moves: the refusal lands somewhere
+        // inside those thirty minutes, and a handler attached afterwards would
+        // leave the run reporting an unhandled rejection.
+        const refusal = tool.execute({ path: 'report.md' }, { agent: created.agent })
+          .then(() => undefined, (error: unknown) => error)
+        await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(1) })
+
+        await vi.advanceTimersByTimeAsync(QUESTION_TIMEOUT_MS)
+        // "They said no" and "nobody was looking" call for different next moves,
+        // so the model is told which one happened.
+        expect(String(await refusal)).toMatch(/not refused/)
+        expect(filesSent(harness)).toHaveLength(0)
+        expect(harness.notices.some((line) => line.includes('went undecided'))).toBe(true)
+        await harness.dispose()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('tells the model why a path outside the workspace cannot be sent', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const outside = createWorkspace()
+      await writeFile(join(outside, 'secret.env'), 'TOKEN=hunter2\n')
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness)
+
+      await expect(tool.execute({ path: join(outside, 'secret.env') }, { agent: created.agent }))
+        .rejects.toThrow(/leaves the workspace/)
+      expect(filesSent(harness)).toHaveLength(0)
+      await harness.dispose()
+    })
+
+    it("keeps the transport's own failure code in what the model is told", async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness)
+      harness.fake.gates.beforeSend = () => {
+        throw Object.assign(new Error('file upload rejected'), { code: 'upload_failed' })
+      }
+
+      // `rate_limited` invites a retry and `permission_denied` never will, so
+      // the code is the half of the failure the model can act on.
+      await expect(tool.execute({ path: 'report.md' }, { agent: created.agent }))
+        .rejects.toThrow(/upload_failed/)
+      delete harness.fake.gates.beforeSend
+      expect(harness.notices.some((line) => line.includes('upload_failed'))).toBe(true)
+      await harness.dispose()
+    })
+
+    it('registers no send_file where the deployment closed the door, and says so', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace, sendFiles: false })
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const created = harness.agents.created[0]!
+
+      expect(created.registeredTools.map((tool) => tool.name)).not.toContain(SEND_FILE_TOOL)
+      // Named in the standing prompt: a model that knows it cannot send writes
+      // its findings into the reply instead of offering an attachment forever.
+      const presence = created.promptSections.find((section) => section.name === 'lark-channel:presence')
+      expect(presence?.text).toContain(SEND_FILE_TOOL)
+
+      // `/get` is the human's own row of the matrix and stays open.
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2', content: `/${GET_COMMAND} report.md` }))
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
+      await harness.dispose()
+    })
+
+    it('denies send_file where the registry cannot take it, and keeps /get', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace }, { agentsCanRegisterTools: false })
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const created = harness.agents.created[0]!
+
+      expect(created.registeredTools).toHaveLength(0)
+      expect(created.denyReason(SEND_FILE_TOOL)).toBeDefined()
+      const presence = created.promptSections.find((section) => section.name === 'lark-channel:presence')
+      expect(presence?.text).toContain(SEND_FILE_TOOL)
+
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2', content: `/${GET_COMMAND} report.md` }))
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
+      await harness.dispose()
+    })
+
+    it('serves /get in a group with no card at all, and spends no agent on it', async () => {
+      const { workspace, contents } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      await harness.fake.emitMessage(fakeMessage({
+        chatType: 'group',
+        chatId: 'oc_group_1',
+        content: `/${GET_COMMAND} report.md`,
+      }))
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
+
+      // A human typing the path has stated his intent; approving his own
+      // command is theatre, group or not (ADR 0002).
+      expect(cardsSent(harness)).toHaveLength(0)
+      expect(harness.agents.created).toHaveLength(0)
+      const [sent] = filesSent(harness)
+      expect(sent?.to).toBe('oc_group_1')
+      expect(sent?.opts?.replyTo).toBe('om_in_1')
+      expect(sent?.file.fileName).toBe('report.md')
+      expect((sent!.file.source as Buffer).toString('utf8')).toBe(contents)
+      await harness.dispose()
+    })
+
+    it('answers /get in a chat that has no session, and still opens one afterwards', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      await harness.fake.emitMessage(fakeMessage({ content: `/${GET_COMMAND} report.md` }))
+      await vi.waitFor(() => { expect(filesSent(harness)).toHaveLength(1) })
+      expect(harness.agents.created).toHaveLength(0)
+
+      // The command changed nothing about the conversation's identity, so the
+      // next ordinary message opens the session it always would have.
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2', content: '看下这个' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      await harness.dispose()
+    })
+
+    it('refuses a /get reaching outside the workspace, in Chinese', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const outside = createWorkspace()
+      await writeFile(join(outside, 'secret.env'), 'TOKEN=hunter2\n')
+      const harness = await mountChannel({ cwd: workspace })
+
+      await harness.fake.emitMessage(fakeMessage({ content: `/${GET_COMMAND} ${join(outside, 'secret.env')}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('只能发送工作区内的文件。') })
+      await harness.fake.emitMessage(
+        fakeMessage({ messageId: 'om_in_2', content: `/${GET_COMMAND} ../../etc/passwd` }),
+      )
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(2) })
+
+      // Refused in the chat's own language, and not one byte left the workspace.
+      expect(sentText(harness)).toContain('⚠️')
+      expect(filesSent(harness)).toHaveLength(0)
+      await harness.dispose()
+    })
+
+    it('shows the usage line for a bare /get', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      await harness.fake.emitMessage(fakeMessage({ content: `/${GET_COMMAND}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain(`/${GET_COMMAND} <路径>`) })
+      expect(filesSent(harness)).toHaveLength(0)
       await harness.dispose()
     })
   })
@@ -2121,10 +2457,12 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: '/help' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('/cd') })
       expect(sentText(harness)).toContain('/ws')
+      expect(sentText(harness)).toContain(`/${GET_COMMAND}`)
       expect(sentText(harness)).toContain('/model')
       expect(sentText(harness)).toContain('/status')
       await vi.waitFor(() => { expect(harness.fake.panelCreated).toContain('cd') })
       expect(harness.fake.panelCreated).toContain('ws')
+      expect(harness.fake.panelCreated).toContain(GET_COMMAND)
       expect(harness.fake.panelCreated).toContain('model')
       expect(harness.fake.panelCreated).toContain('status')
       await harness.dispose()
