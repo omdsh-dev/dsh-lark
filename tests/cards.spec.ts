@@ -56,20 +56,44 @@ describe('approval card', () => {
 })
 
 describe('file approval card', () => {
-  it('shows the whole path and the size, so the room can judge what is leaving', () => {
-    const path = '/Users/alex/work/reports/q4-forecast.pdf'
-    const texts = cardTexts(fileApprovalCard({ path, bytes: 1_258_291, allow: {}, reject: {} }))
-    // The path exactly as it was handed over: a shortened or prettified form
-    // would hide which file the room is about to publish.
-    expect(texts.some((text) => text.content === path)).toBe(true)
+  it('shows the file inside its workspace and the size, so the room can judge what is leaving', () => {
+    const texts = cardTexts(fileApprovalCard({
+      path: 'reports/q4-forecast.pdf',
+      workspace: 'forecasting',
+      bytes: 1_258_291,
+      allow: {},
+      reject: {},
+    }))
+    // The file exactly where it sits, in full: a prettified form — a `~`, an
+    // ellipsis, a bare basename — would hide which file the room is publishing.
+    expect(texts.some((text) => text.content === 'reports/q4-forecast.pdf')).toBe(true)
+    // And which workspace it came out of, on its own line.
+    expect(texts.some((text) => text.content === 'forecasting')).toBe(true)
     // `MiB`, not `MB`: the arithmetic above it divides by 1024, and the card and
     // the tool error the model reads now spell one size one way.
     expect(texts.some((text) => text.content === '1.2 MiB')).toBe(true)
   })
 
+  it('never prints the absolute path of the host it runs on', () => {
+    // The room is not judging whose laptop this is. An absolute path publishes
+    // the operator's login name and directory layout to everyone in the group,
+    // which is exactly what the workspace-relative form drops — and nothing
+    // else: the relative form is derived from the canonical path the container
+    // check cleared, so a symlink still shows the room the real object.
+    const cards = [
+      fileApprovalCard({ path: 'out/report.md', workspace: 'project', bytes: 12, allow: {}, reject: {} }),
+      settledFileApprovalCard({ path: 'out/report.md', workspace: 'project', outcome: 'allowed-once' }),
+    ]
+    for (const card of cards) {
+      expect(JSON.stringify(card)).not.toContain('/Users/')
+      expect(cardTexts(card).some((text) => text.content.startsWith('/'))).toBe(false)
+    }
+  })
+
   it('reads a size in binary units, whole ones without a decimal', () => {
     const sizeShown = (bytes: number): string[] =>
-      cardTexts(fileApprovalCard({ path: '/w/f', bytes, allow: {}, reject: {} })).map((text) => text.content)
+      cardTexts(fileApprovalCard({ path: 'f', workspace: 'w', bytes, allow: {}, reject: {} }))
+        .map((text) => text.content)
     expect(sizeShown(12)).toContain('12 B')
     expect(sizeShown(1024)).toContain('1 KiB')
     expect(sizeShown(840 * 1024)).toContain('840 KiB')
@@ -85,13 +109,14 @@ describe('file approval card', () => {
     const asking = (card: object): string | undefined => cardTexts(card)[0]?.content
     // One authorization, one word for it: two copies of the heading are two
     // things to edit, and the room would end up asked in two different voices.
-    expect(asking(fileApprovalCard({ path: '/w/out.zip', bytes: 1, allow: {}, reject: {} })))
+    expect(asking(fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 1, allow: {}, reject: {} })))
       .toBe(asking(approvalCard({ toolName: 'bash', allow: {}, reject: {} })))
   })
 
   it('carries one decision payload per button, and nothing else clickable', () => {
     const controls = cardControls(fileApprovalCard({
-      path: '/w/out.zip',
+      path: 'out.zip',
+      workspace: 'w',
       bytes: 4096,
       allow: { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'allow' },
       reject: { kind: 'dsh-lark-channel/approval', id: 'f1', decision: 'reject' },
@@ -104,18 +129,19 @@ describe('file approval card', () => {
   })
 
   it('offers both languages for the words it authored itself', () => {
-    const texts = cardTexts(fileApprovalCard({ path: '/w/out.zip', bytes: 4096, allow: {}, reject: {} }))
+    const texts = cardTexts(fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 4096, allow: {}, reject: {} }))
     const authored = (zh: string): Record<string, string> | undefined =>
       texts.find((text) => text.content === zh)?.i18n
     expect(authored('允许发送')).toEqual({ zh_cn: '允许发送', en_us: 'Send it' })
     expect(authored('拒绝')).toEqual({ zh_cn: '拒绝', en_us: 'Reject' })
     expect(authored('文件')).toEqual({ zh_cn: '文件', en_us: 'File' })
+    expect(authored('工作区')).toEqual({ zh_cn: '工作区', en_us: 'Workspace' })
     expect(authored('大小')).toEqual({ zh_cn: '大小', en_us: 'Size' })
   })
 
   it('says so when a path was too long to print whole', () => {
-    const path = `/w/${'x'.repeat(900)}`
-    const texts = cardTexts(fileApprovalCard({ path, bytes: 1, allow: {}, reject: {} }))
+    const path = 'x'.repeat(900)
+    const texts = cardTexts(fileApprovalCard({ path, workspace: 'w', bytes: 1, allow: {}, reject: {} }))
     expect(texts.some((text) => text.content === path.slice(0, 600))).toBe(true)
     // A silently shortened path is one the room approves believing it saw the
     // whole thing.
@@ -124,16 +150,24 @@ describe('file approval card', () => {
 
   it('leaves nothing clickable once decided, and keeps the record of what happened', () => {
     for (const outcome of ['allowed-once', 'rejected', 'cancelled', 'unavailable']) {
-      const card = settledFileApprovalCard({ path: '/w/out.zip', outcome, decidedBy: '陈晓' })
+      const card = settledFileApprovalCard({ path: 'out.zip', workspace: 'ws', outcome, decidedBy: '陈晓' })
       expect(cardControls(card)).toHaveLength(0)
       const texts = cardTexts(card).map((text) => text.content)
-      expect(texts.some((content) => content.includes('/w/out.zip'))).toBe(true)
+      expect(texts.some((content) => content.includes('out.zip'))).toBe(true)
+      // This card REPLACES the one the room read, so the workspace has to stay
+      // in the record: nobody could otherwise tell later where the file came from.
+      expect(texts.some((content) => content.includes('ws · out.zip'))).toBe(true)
       expect(texts.some((content) => content.includes('陈晓'))).toBe(true)
     }
   })
 
   it('names who let the file out, without letting the name become markup', () => {
-    const card = settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: HOSTILE })
+    const card = settledFileApprovalCard({
+      path: 'out.zip',
+      workspace: 'ws',
+      outcome: 'allowed-once',
+      decidedBy: HOSTILE,
+    })
     const named = cardTexts(card).filter((text) => text.content.includes(HOSTILE))
     expect(named).toHaveLength(1)
     expect(named[0]!.tag).toBe('plain_text')
@@ -204,10 +238,10 @@ describe('localization', () => {
     approvalCard({ toolName: 'bash', command: 'x'.repeat(900), allow: {}, reject: {} }),
     settledApprovalCard({ toolName: 'bash', outcome: 'allowed-once', decidedBy: 'Alex' }),
     settledApprovalCard({ toolName: 'bash', outcome: 'cancelled' }),
-    fileApprovalCard({ path: '/w/out.zip', bytes: 1_258_291, allow: {}, reject: {} }),
-    fileApprovalCard({ path: `/w/${'x'.repeat(900)}`, bytes: 0, allow: {}, reject: {} }),
-    settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: 'Alex' }),
-    settledFileApprovalCard({ path: '/w/out.zip', outcome: 'rejected' }),
+    fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 1_258_291, allow: {}, reject: {} }),
+    fileApprovalCard({ path: 'x'.repeat(900), workspace: 'w', bytes: 0, allow: {}, reject: {} }),
+    settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'allowed-once', decidedBy: 'Alex' }),
+    settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'rejected' }),
     questionCard({ question: 'go on?', options: [{ label: 'yes' }], valueFor: () => ({}) }),
     questionCard({ question: 'go on?', options: [], valueFor: () => ({}) }),
     settledQuestionCard({ question: 'go on?', answer: 'yes' }),
@@ -251,8 +285,8 @@ describe('card foundation', () => {
     const cards = [
       approvalCard({ toolName: 'bash', command: 'ls', reason: 'x', allow: {}, reject: {} }),
       settledApprovalCard({ toolName: 'bash', outcome: 'rejected' }),
-      fileApprovalCard({ path: '/w/out.zip', bytes: 4096, allow: {}, reject: {} }),
-      settledFileApprovalCard({ path: '/w/out.zip', outcome: 'allowed-once', decidedBy: 'Alex' }),
+      fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 4096, allow: {}, reject: {} }),
+      settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'allowed-once', decidedBy: 'Alex' }),
       questionCard({ question: '?', options: [{ label: 'a', description: 'b' }], valueFor: () => ({}) }),
       settledQuestionCard({ question: '?', answer: 'a' }),
     ]

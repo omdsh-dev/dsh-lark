@@ -80,6 +80,7 @@ import type { CollectedImages, ImagePort } from './images.ts'
 import { collectInboundFiles } from './files.ts'
 import type { CollectedFiles, InboundFilePort } from './files.ts'
 import {
+  describeReadFailure,
   GET_COMMAND,
   readOutboundFile,
   runGetCommand,
@@ -303,6 +304,13 @@ function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?:
 
 /**
  * Build the interactive card asking a group to authorize one outbound file.
+ *
+ * What the room is shown is the file's place inside the workspace and the
+ * workspace's own name, never {@link OutboundFile.path}: the canonical path is
+ * an absolute host path, and putting one in a group publishes the operator's
+ * home directory and login name to everyone in it. Both come off the canonical
+ * path the container check already cleared, so nothing about what the room is
+ * judging changes — only the prefix that identifies the machine goes.
  * @param file - the file the workspace check cleared.
  * @param bytes - the length of the buffer that will go out if this is allowed.
  * Taken from the buffer rather than from the verdict, so the size on the card
@@ -313,7 +321,8 @@ function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?:
  */
 function fileApprovalCard(file: OutboundFile, bytes: number, id: string): object {
   return buildFileApprovalCard({
-    path: file.path,
+    path: file.pathInWorkspace,
+    workspace: file.workspaceName,
     bytes,
     allow: { kind: APPROVAL_ACTION, id, decision: 'allow' },
     reject: { kind: APPROVAL_ACTION, id, decision: 'reject' },
@@ -322,13 +331,19 @@ function fileApprovalCard(file: OutboundFile, bytes: number, id: string): object
 
 /**
  * Build the static replacement card shown after a file approval settles.
- * @param path - the canonical path that was offered, kept so the record says what was decided.
+ * @param file - the file that was offered, kept so the record says what was
+ * decided — named the same way the live card named it, and for the same reason.
  * @param outcome - the closed decision; a timeout arrives here as `cancelled`.
  * @param decidedBy - who pressed, when a person did.
  * @returns a Feishu card object for `updateCard`.
  */
-function settledFileCard(path: string, outcome: HostApprovalOutcome, decidedBy?: string): object {
-  return buildSettledFileApprovalCard({ path, outcome, decidedBy })
+function settledFileCard(file: OutboundFile, outcome: HostApprovalOutcome, decidedBy?: string): object {
+  return buildSettledFileApprovalCard({
+    path: file.pathInWorkspace,
+    workspace: file.workspaceName,
+    outcome,
+    decidedBy,
+  })
 }
 
 /**
@@ -376,6 +391,30 @@ const QUESTION_TOOL = 'ask_user_question'
  * sentence cannot drift from the timer.
  */
 const TIMEOUT_MINUTES = Math.round(QUESTION_TIMEOUT_MS / 60_000)
+
+/**
+ * How many outbound files one group chat may have waiting on a decision at once.
+ *
+ * This is a MEMORY ceiling before it is a courtesy. A group send reads the whole
+ * file into a `Buffer` before the room is asked (ADR 0004, and `deliverFile` on
+ * why the order cannot be the other way round), so every undecided card pins up
+ * to `maxSendFileBytes` — 20 MiB by default — for as long as the approval
+ * timeout allows, half an hour. The per-file ceiling bounds one of those; this
+ * bounds how many a chat can hold at once, and without it the product has no
+ * bound at all: a file dropped into a workspace can carry "send these twenty
+ * files", the model can raise twenty parallel calls off one injected
+ * instruction, and 400 MiB of pinned heap per chat is a process the operator
+ * loses rather than a card someone declines.
+ *
+ * Three, because it is the count that has to survive both readings: enough that
+ * a turn legitimately handing over a diff, a log and a screenshot never meets
+ * the wall, and few enough that a room is never asked to triage a stack of
+ * decisions — an approver facing ten cards approves them, which is precisely the
+ * fatigue ADR 0002 declined to build. Not configurable, for that second reason:
+ * a deployment raising it to fifty would be buying back the fatigue and the
+ * heap together.
+ */
+const MAX_PENDING_FILE_SENDS = 3
 
 /**
  * How many unclaimed reply targets may wait for their `user/message` event. A
@@ -614,6 +653,19 @@ export function installBridge(
 ): void {
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
+  /**
+   * Outbound file sends holding a buffer, per chat id — the group ones, which
+   * are the sends that wait on a human while they hold it.
+   *
+   * A count of live SENDS rather than of open cards, because the buffer is read
+   * before the card exists: counting cards would leave every reader of the count
+   * blind to exactly the window where the bytes have been read and nobody has
+   * been asked yet, and a fistful of parallel calls all pass through that window
+   * together. Keyed by chat rather than by session so the several sessions a room
+   * can hold — one per thread, or per member — cannot each open their own quota
+   * into the same room.
+   */
+  const heldFileSends = new Map<string, number>()
   /**
    * Tool-call arguments by session, then call id, with the turn that made the
    * call. An approval names the call it decides but not what that call does,
@@ -1610,7 +1662,7 @@ export function installBridge(
       chatId: binding.chatId,
       chatType: binding.chatType,
       toolName: SEND_FILE_TOOL,
-      paint: (outcome, decidedBy) => settledFileCard(file.path, outcome, decidedBy),
+      paint: (outcome, decidedBy) => settledFileCard(file, outcome, decidedBy),
       state: 'sending',
       settle: resolveOutcome,
       removeAbort: () => { signal?.removeEventListener('abort', onAbort) },
@@ -1641,20 +1693,38 @@ export function installBridge(
   }
 
   /**
-   * Send one cleared file to the chat its session belongs to, gate included.
+   * Claim one of a chat's file-send slots.
+   * @param chatId - the chat the bytes would land in.
+   * @returns whether a slot was free; a claim taken must be released.
+   */
+  const holdFileSend = (chatId: string): boolean => {
+    const held = heldFileSends.get(chatId) ?? 0
+    if (held >= MAX_PENDING_FILE_SENDS) return false
+    heldFileSends.set(chatId, held + 1)
+    return true
+  }
+
+  /**
+   * Give one slot back, once the buffer it accounted for is off the heap.
+   * @param chatId - the chat the claim was taken against.
+   */
+  const releaseFileSend = (chatId: string): void => {
+    const left = (heldFileSends.get(chatId) ?? 1) - 1
+    // Deleted rather than left at zero: a long-lived process serving many rooms
+    // should not accumulate one entry per room it once sent a file to.
+    if (left > 0) heldFileSends.set(chatId, left)
+    else heldFileSends.delete(chatId)
+  }
+
+  /**
+   * Read one cleared file, ask the room when the room has to be asked, and put
+   * the bytes in the chat.
    *
-   * This is the MODEL's way out, and the gating matrix lives here (ADR 0002): a
-   * direct message goes straight out, because its only reader is the person
-   * already authorized to drive this agent — who could have asked for the
-   * contents on screen instead, so the leak boundary is zero and an approval
-   * would only breed the fatigue that ends in blind approving. A group is where
-   * the leak lives, so a group asks.
-   *
-   * `/get` does NOT come through here, and that is the point: a human who typed
-   * a path has stated his intent, and making him approve his own command is
-   * theatre. It runs its own send in the command dispatch, which is what keeps
-   * the human row of the matrix from ever drifting into the model's row — a
-   * shared function with a "gate this one" flag is exactly how it would.
+   * The gating matrix lives here (ADR 0002): a direct message goes straight out,
+   * because its only reader is the person already authorized to drive this agent
+   * — who could have asked for the contents on screen instead, so the leak
+   * boundary is zero and an approval would only breed the fatigue that ends in
+   * blind approving. A group is where the leak lives, so a group asks.
    *
    * The bytes are read BEFORE the room is asked, and the buffer in hand is what
    * goes out. Read afterwards, an approval would certify a PATH rather than a
@@ -1664,37 +1734,32 @@ export function installBridge(
    * runs again on the cleared path — can see that swap. Reading first makes the
    * artefact the room approved and the artefact that leaves one object.
    *
-   * It costs memory, and more than ADR 0004 set out to spend: that decision
-   * budgeted ONE buffer for the few seconds of a send, while this holds one per
-   * pending approval for as long as the room takes to answer. The real figure is
-   * therefore "concurrent undecided group approvals × `maxSendFileBytes`" — 20
-   * MiB each by default, for up to the thirty-minute timeout — and that
-   * aggregate has no ceiling of its own today. The per-file ceiling bounds each
-   * one; nothing bounds their sum.
-   *
-   * Failures come back as a string rather than a throw: the caller is a tool
-   * body that turns whatever it gets into the model's error, and one refusal
-   * shape for "rejected", "timed out" and "the upload failed" is what keeps
-   * that body from having to know which of them happened.
-   * @param sessionId - the agent's session, which names the chat.
+   * That order is what costs memory, and more than ADR 0004 set out to spend:
+   * that decision budgeted ONE buffer for the few seconds of a send, while a
+   * group send holds one for as long as the room takes to answer. What bounds the
+   * sum is the caller's slot, not anything here.
+   * @param binding - the chat the file goes to, which also decides whether it is gated.
+   * @param sessionId - the agent's session, for the reply target the file lands under.
    * @param file - the file the workspace check cleared.
    * @param signal - the calling execution's cancellation, which also takes down
    * a group approval still waiting on a human.
    * @returns undefined once the file is in the chat, or the English reason it is not.
    */
-  const deliverFile = async (
+  const offerFile = async (
+    binding: ChatBinding,
     sessionId: string,
     file: OutboundFile,
     signal?: AbortSignal,
   ): Promise<string | undefined> => {
-    const binding = bySession.get(sessionId)
-    if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
     // First, so that everything after this point is about bytes that exist.
     let bytes: Buffer
     try {
       bytes = await readOutboundFile(file)
     } catch (error) {
-      return `That file could not be read: ${failureDetail(error)}`
+      // Scrubbed, because an fs failure quotes the absolute path it was given and
+      // this sentence goes to the model — which `describeRefusalForModel` is
+      // careful never to hand a path it did not type itself.
+      return `That file could not be read: ${describeReadFailure(error, file)}`
     }
     if (binding.chatType !== 'p2p') {
       const refused = await askFileSend(binding, file, bytes, signal)
@@ -1718,6 +1783,58 @@ export function installBridge(
       return `The chat platform refused the upload [${code ?? 'unknown'}]: ${detail}`
     }
     return undefined
+  }
+
+  /**
+   * Send one cleared file to the chat its session belongs to, gate and quota
+   * included.
+   *
+   * This is the MODEL's way out. `/get` does NOT come through here, and that is
+   * the point: a human who typed a path has stated his intent, and making him
+   * approve his own command is theatre. It runs its own send in the command
+   * dispatch, which is what keeps the human row of the matrix from ever drifting
+   * into the model's row — a shared function with a "gate this one" flag is
+   * exactly how it would.
+   *
+   * What this function owns beyond that dispatch is the slot, and the ORDER in
+   * which it is taken: before {@link offerFile}, therefore before the file is
+   * read. A quota checked afterwards would be counting buffers that are already
+   * on the heap, which is the whole cost it exists to refuse — and one injected
+   * instruction can raise as many parallel calls as the model will emit, all of
+   * them passing a check that runs after their own read. The direct-message path
+   * takes no slot: it holds a buffer for the few seconds of a send and waits on
+   * nobody, which is exactly the spend ADR 0004 budgeted.
+   *
+   * Failures come back as a string rather than a throw: the caller is a tool
+   * body that turns whatever it gets into the model's error, and one refusal
+   * shape for "rejected", "timed out" and "the upload failed" is what keeps
+   * that body from having to know which of them happened.
+   * @param sessionId - the agent's session, which names the chat.
+   * @param file - the file the workspace check cleared.
+   * @param signal - the calling execution's cancellation, which also takes down
+   * a group approval still waiting on a human.
+   * @returns undefined once the file is in the chat, or the English reason it is not.
+   */
+  const deliverFile = async (
+    sessionId: string,
+    file: OutboundFile,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    const binding = bySession.get(sessionId)
+    if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
+    if (binding.chatType === 'p2p') return offerFile(binding, sessionId, file, signal)
+    if (!holdFileSend(binding.chatId)) {
+      return `This chat already has ${MAX_PENDING_FILE_SENDS} files waiting for someone to allow them, so this `
+        + 'one was not offered. Wait until those are decided before offering another file.'
+    }
+    try {
+      return await offerFile(binding, sessionId, file, signal)
+    } finally {
+      // Released only once the send is over: the buffer this slot accounts for
+      // lives until then, whether the room allowed it, refused it, or the upload
+      // failed on the way out.
+      releaseFileSend(binding.chatId)
+    }
   }
 
   const handleCardAction = async (evt: CardActionEvent): Promise<CardActionResponse | undefined> => {

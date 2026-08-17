@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
-import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { Context } from '@deepseek-ai/cordis'
@@ -975,9 +975,14 @@ describe('dsh-lark-channel', () => {
       expect(filesSent(harness)).toHaveLength(0)
       const card = cardsSent(harness)[0]!
       const texts = cardTexts(card).map((text) => text.content)
-      // The last metre of this defense is an approver who can see what leaves.
-      expect(texts).toContain(join(workspace, 'report.md'))
+      // The last metre of this defense is an approver who can see what leaves:
+      // the file where it sits, the workspace it sits in, and the size.
+      expect(texts).toContain('report.md')
+      expect(texts).toContain(basename(workspace))
       expect(texts).toContain(`${Buffer.byteLength(contents)} B`)
+      // And not one metre more than that. The room is not being told whose
+      // machine this is, nor how its directories are laid out.
+      expect(JSON.stringify(card)).not.toContain(workspace)
 
       const allow = approvalValueFromCard(card).find((value) => value.decision === 'allow')!
       harness.fake.chatMembers.set('oc_group_1', [{ id: SENDER_ID, name: '群成员姓名' }])
@@ -1021,6 +1026,44 @@ describe('dsh-lark-channel', () => {
       const texts = cardTexts(cardsSent(harness)[0]!).map((text) => text.content)
       expect(texts).toContain(`${Buffer.byteLength(contents)} B`)
       await harness.dispose()
+    })
+
+    it('holds at most three undecided file approvals in one chat, and frees a slot on each decision', async () => {
+      const { workspace } = await workspaceWithArtifact()
+      const harness = await mountChannel({ cwd: workspace })
+      const { created, tool } = await boundSender(harness, { chatType: 'group', chatId: 'oc_group_1' })
+      /** One `send_file` call, its rejection captured so nothing goes unhandled. */
+      const offer = (): Promise<unknown> => tool
+        .execute({ path: 'report.md' }, { agent: created.agent })
+        .then(() => undefined, (error: unknown) => error)
+
+      // Parallel calls are what one injected "send these files" looks like, and
+      // each of them reads the whole file into a buffer BEFORE the room is asked
+      // — so every card standing here pins up to `maxSendFileBytes` for as long
+      // as the approval timeout allows.
+      const standing = [offer(), offer(), offer()]
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(3) })
+
+      // The fourth is refused on the spot instead of pinning a fourth buffer,
+      // and the room is not asked a fourth time.
+      expect(String(await offer())).toMatch(/already has 3 files waiting/)
+      expect(cardsSent(harness)).toHaveLength(3)
+
+      // A decision hands the slot back: the ceiling is on files waiting, not on
+      // how many a conversation may ever send. Which of the three calls that
+      // first card belongs to is deliberately not assumed — three parallel reads
+      // settle in no fixed order — so the released one is whichever returns.
+      const allow = approvalValueFromCard(cardsSent(harness)[0]!).find((value) => value.decision === 'allow')!
+      await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_group_1' }))
+      expect(await Promise.race(standing)).toBeUndefined()
+      expect(filesSent(harness)).toHaveLength(1)
+
+      const fourth = offer()
+      await vi.waitFor(() => { expect(cardsSent(harness)).toHaveLength(4) })
+      await harness.dispose()
+      const outcomes = await Promise.all([...standing, fourth])
+      expect(outcomes.filter((outcome) => outcome === undefined)).toHaveLength(1)
+      expect(outcomes.filter((outcome) => /withdrawn/.test(String(outcome)))).toHaveLength(3)
     })
 
     it('sends nothing when the group rejects, and tells the model it was rejected', async () => {
@@ -1178,6 +1221,31 @@ describe('dsh-lark-channel', () => {
       expect(trace).toContain(escape)
       await harness.dispose()
     })
+
+    // Root reads a mode-000 file regardless, which would leave this passing for
+    // the wrong reason rather than failing.
+    it.skipIf(process.getuid?.() === 0)(
+      'tells the model a read failed without handing it the host path',
+      async () => {
+        const { workspace } = await workspaceWithArtifact()
+        const harness = await mountChannel({ cwd: workspace })
+        const { created, tool } = await boundSender(harness)
+        // Clears the containment check and the ceiling, then fails in the read —
+        // where the message Node builds quotes the absolute path it was given.
+        await chmod(join(workspace, 'report.md'), 0o000)
+
+        const failure = await tool.execute({ path: 'report.md' }, { agent: created.agent })
+          .then(() => undefined, (error: unknown) => error)
+
+        expect(String(failure)).toContain('EACCES')
+        // The model typed `report.md`; a failure branch that answered with the
+        // canonical path would hand whoever wrote the files it reads a map of the
+        // filesystem — which is exactly what every refusal here declines to do.
+        expect(String(failure)).not.toContain(workspace)
+        expect(filesSent(harness)).toHaveLength(0)
+        await harness.dispose()
+      },
+    )
 
     it("keeps the transport's own failure code in what the model is told", async () => {
       const { workspace } = await workspaceWithArtifact()

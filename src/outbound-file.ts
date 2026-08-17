@@ -23,7 +23,7 @@
 
 import { statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { basename, resolve } from 'node:path'
+import { basename, relative, resolve } from 'node:path'
 import { canonicalPathOf, isWithinContainer } from './containment.ts'
 import { failureDetail, formatBytesForChat, formatBytesForModel } from './format.ts'
 
@@ -41,12 +41,41 @@ export interface OutboundFile {
   /** The name the chat will show, i.e. the canonical path's basename. */
   readonly fileName: string
   readonly bytes: number
+  /**
+   * Where the file sits inside the workspace: {@link OutboundFile.path}
+   * expressed against the canonical workspace.
+   *
+   * Derived HERE rather than by whoever displays it, because this is the one
+   * place both canonical forms exist at once — and relativizing anything but a
+   * canonical path against a canonical container is how `<workspace>/link →
+   * /etc/shadow` would come back out as an innocent-looking `link`. What this
+   * names is the object the container check cleared, minus a prefix that says
+   * nothing about it.
+   */
+  readonly pathInWorkspace: string
+  /**
+   * The workspace's own name, i.e. the canonical workspace directory's basename.
+   * Enough to tell one conversation's workspace from another's without printing
+   * the operator's home directory.
+   */
+  readonly workspaceName: string
 }
 
 /** What one path turned out to be: a file cleared to leave, or a refusal. */
 export type OutboundVerdict =
   | { readonly ok: true; readonly file: OutboundFile }
   | { readonly ok: false; readonly refusal: OutboundRefusal }
+
+/**
+ * What one workspace directory is called.
+ * @param container - the canonical workspace directory.
+ * @returns its basename, or the directory itself when it has none — a workspace
+ * mounted at a filesystem root, whose name would otherwise come out empty.
+ */
+function workspaceNameOf(container: string): string {
+  const name = basename(container)
+  return name === '' ? container : name
+}
 
 /**
  * What the filesystem says about one canonical path.
@@ -97,7 +126,16 @@ export function resolveOutboundFile(input: string, workspace: string, maxBytes: 
   if (found.bytes > maxBytes) {
     return { ok: false, refusal: { code: 'too_large', bytes: found.bytes, limit: maxBytes } }
   }
-  return { ok: true, file: { path: canonical, fileName: basename(canonical), bytes: found.bytes } }
+  return {
+    ok: true,
+    file: {
+      path: canonical,
+      fileName: basename(canonical),
+      bytes: found.bytes,
+      pathInWorkspace: relative(container, canonical),
+      workspaceName: workspaceNameOf(container),
+    },
+  }
 }
 
 /**
@@ -127,6 +165,35 @@ export async function readOutboundFile(file: OutboundFile): Promise<Buffer> {
   const bytes = await readFile(file.path)
   if (bytes.byteLength !== file.bytes) throw new Error(`${file.fileName} changed size after it was cleared`)
   return bytes
+}
+
+/**
+ * Why a cleared file could not be read, said without spelling the host's path.
+ *
+ * `readFile`'s own failures quote the absolute path they were handed —
+ * `ENOENT: no such file or directory, open '/Users/…/project/out/a.md'` — so
+ * passing one straight through undoes in the failure branch exactly what every
+ * other branch here is careful about: the model gets a map of the filesystem it
+ * never typed, and a chat reply hands the same map to a whole room. The failure
+ * branch is if anything the likelier one to be read by a stranger, because it is
+ * the branch an injected instruction can provoke on purpose.
+ *
+ * The workspace prefix is cut rather than the whole path, so what a reader gets
+ * is the file's place inside the workspace and the reason it failed — `open
+ * 'out/a.md'`, still enough to act on. Both audiences share this one sentence:
+ * the technical detail is the same in either language, and a second copy of the
+ * scrub is a second place to forget it.
+ * @param error - the rejection from {@link readOutboundFile}.
+ * @param file - the file it was reading.
+ * @returns the reason, carrying no absolute path.
+ */
+export function describeReadFailure(error: unknown, file: OutboundFile): string {
+  const detail = failureDetail(error)
+  // Recovered from the two forms the verdict already holds rather than passed in
+  // again: `<container>/` is exactly what the canonical path has and the
+  // workspace-relative one does not.
+  const prefix = file.path.slice(0, file.path.length - file.pathInWorkspace.length)
+  return prefix === '' ? detail : detail.replaceAll(prefix, '')
 }
 
 /**
@@ -322,7 +389,9 @@ export async function runGetCommand(
   try {
     bytes = await readOutboundFile(verdict.file)
   } catch (error) {
-    return `⚠️ 读取 \`${verdict.file.path}\` 失败：${failureDetail(error)}`
+    // The path the human typed one line ago, not the canonical one it resolved
+    // to: `/get` answers in the chat, and in a group that is a room.
+    return `⚠️ 读取 \`${verdict.file.pathInWorkspace}\` 失败：${describeReadFailure(error, verdict.file)}`
   }
   try {
     await send(verdict.file, bytes)

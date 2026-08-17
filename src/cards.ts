@@ -563,6 +563,7 @@ const FILE_SEND = {
   title: APPROVAL.title,
   context: { zh: 'Agent 想把一个文件发到这个群', en: 'The agent wants to send a file to this group' },
   path: { zh: '文件', en: 'File' },
+  workspace: { zh: '工作区', en: 'Workspace' },
   size: { zh: '大小', en: 'Size' },
   allow: { zh: '允许发送', en: 'Send it' },
   reject: { zh: '拒绝', en: 'Reject' },
@@ -575,24 +576,37 @@ const FILE_SEND = {
 /**
  * The card that asks a group to authorize one outbound file.
  *
- * The path and the size are the whole card: an approver who cannot see what is
- * leaving cannot judge whether it may leave, which is the same reason the tool
- * approval prints its command verbatim. The path arrives canonical and is shown
- * that way — a prettified or shortened form would let a symlink present itself
- * as a file the room believes it is approving.
+ * The file, the workspace and the size are the whole card: an approver who
+ * cannot see what is leaving cannot judge whether it may leave, which is the
+ * same reason the tool approval prints its command verbatim.
+ *
+ * The file is named by its place INSIDE the workspace, and the workspace by its
+ * own name. An absolute path would publish the host's directory layout — the
+ * operator's login name included — to everyone in the room, none of which is
+ * what an approver is judging. What makes that safe to shorten is where the
+ * relative form comes from: `resolveOutboundFile` derives it from the canonical
+ * path it just cleared, so the room still reads the real object and a symlink
+ * cannot present itself as a file the room believes it is approving. A
+ * prettified path — `~`, an ellipsis, a bare basename — would give that away,
+ * and is exactly what this is not.
  * @param input - the file being offered, and the payloads its buttons carry.
  * @returns a schema 2.0 card object.
  */
 export function fileApprovalCard(input: {
+  /** Where the file sits inside the workspace, derived from its canonical path. */
   readonly path: string
+  /** The workspace's own name. */
+  readonly workspace: string
   readonly bytes: number
   readonly allow: object
   readonly reject: object
 }): object {
   const path = clip(input.path, COMMAND_MAX_CHARS)
+  const workspace = clip(input.workspace, COMMAND_MAX_CHARS)
   return card('warning', join(FILE_SEND.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading('warning', FILE_SEND.title, FILE_SEND.context),
     quoted(FILE_SEND.path, path.shown, 'grey-50', path.hidden),
+    quoted(FILE_SEND.workspace, workspace.shown, 'grey-50', workspace.hidden),
     quoted(FILE_SEND.size, formatByteSize(input.bytes), 'grey-50'),
     actions([
       { label: FILE_SEND.allow, value: input.allow, kind: 'primary' },
@@ -618,23 +632,36 @@ const FILE_SEND_OUTCOME: Record<string, { readonly state: CardState; readonly ti
 /**
  * The card a file approval is replaced with once decided — no live buttons, and
  * the decision legible from the ink alone.
- * @param input - the file, the outcome, and who decided when someone did.
+ *
+ * It names the same two things the live card named, and for the same reason it
+ * named them that way: this card REPLACES the one the room read, so a record
+ * that dropped the workspace would leave the room unable to tell later which
+ * directory the file came out of — and one that spelled the absolute path would
+ * put the host's layout back in the room the moment a decision was made.
+ * @param input - the file, its workspace, the outcome, and who decided when someone did.
  * @returns a schema 2.0 card object.
  */
 export function settledFileApprovalCard(input: {
+  /** Where the file sits inside the workspace, derived from its canonical path. */
   readonly path: string
+  /** The workspace's own name. */
+  readonly workspace: string
   readonly outcome: string
   readonly decidedBy?: string | undefined
 }): object {
   const settled = FILE_SEND_OUTCOME[input.outcome] ?? FILE_SEND_OUTCOME.cancelled!
   const path = clip(input.path, COMMAND_MAX_CHARS)
+  // One line rather than the live card's two rows: a settled card carries no
+  // labelled blocks, and the middot is the separator every other context line
+  // here already uses.
+  const where = `${clip(input.workspace, COMMAND_MAX_CHARS).shown} · ${path.shown}`
   // Who decided, named rather than withheld: with approvals open to a room, the
   // room should see whose press let the file out. The file itself stays in the
   // record too — a settled card that only said "allowed" would leave nobody
   // able to tell what was allowed.
   const context = input.decidedBy === undefined || input.decidedBy === ''
-    ? path.shown
-    : join(fill(APPROVAL.decidedBy, path.shown), input.decidedBy)
+    ? where
+    : join(fill(APPROVAL.decidedBy, where), input.decidedBy)
   return card(settled.state, join(settled.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),

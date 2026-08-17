@@ -1,9 +1,10 @@
 import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, sep } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  describeReadFailure,
   describeRefusalForChat,
   describeRefusalForModel,
   GET_COMMAND,
@@ -35,7 +36,13 @@ describe('resolveOutboundFile', () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'out'))
     await writeFile(join(workspace, 'out', 'report.md'), 'body')
-    const cleared = { path: join(workspace, 'out', 'report.md'), fileName: 'report.md', bytes: 4 }
+    const cleared = {
+      path: join(workspace, 'out', 'report.md'),
+      fileName: 'report.md',
+      bytes: 4,
+      pathInWorkspace: join('out', 'report.md'),
+      workspaceName: basename(workspace),
+    }
 
     expect(resolveOutboundFile('out/report.md', workspace, 1024)).toEqual({ ok: true, file: cleared })
     expect(resolveOutboundFile('./out/report.md', workspace, 1024)).toEqual({ ok: true, file: cleared })
@@ -76,13 +83,38 @@ describe('resolveOutboundFile', () => {
     const linked = join(elsewhere, 'project')
     symlinkSync(real, linked)
     await writeFile(join(real, 'report.md'), 'body')
-    const cleared = { path: join(real, 'report.md'), fileName: 'report.md', bytes: 4 }
+    const cleared = {
+      path: join(real, 'report.md'),
+      fileName: 'report.md',
+      bytes: 4,
+      pathInWorkspace: 'report.md',
+      // The canonical directory's name, not the link's: `project` is a name the
+      // caller typed, and everything a card shows has to come off what the
+      // filesystem actually holds.
+      workspaceName: basename(real),
+    }
 
     // macOS points `/tmp` at `/private/var/…`, so a workspace compared without
     // canonicalizing it first judges every file inside it an escape.
     expect(realpathSync(linked)).toBe(real)
     expect(resolveOutboundFile('report.md', linked, 1024)).toEqual({ ok: true, file: cleared })
     expect(resolveOutboundFile(join(linked, 'report.md'), linked, 1024)).toEqual({ ok: true, file: cleared })
+  })
+
+  it('names a file by where it really sits, so a symlink cannot rename it', async () => {
+    const workspace = createWorkspace()
+    await mkdir(join(workspace, 'secrets'))
+    await writeFile(join(workspace, 'secrets', 'tokens.env'), 'TOKEN=x')
+    symlinkSync(join(workspace, 'secrets', 'tokens.env'), join(workspace, 'report.md'))
+
+    const verdict = resolveOutboundFile('report.md', workspace, 1024)
+    if (!verdict.ok) throw new Error('a link to a file inside the workspace should have cleared')
+    // What an approval card shows is this, not the path the model typed: a room
+    // asked about `report.md` would allow a file it has not been shown. The
+    // relative form is cut from the canonical path, which is what keeps that
+    // shortening honest.
+    expect(verdict.file.pathInWorkspace).toBe(join('secrets', 'tokens.env'))
+    expect(verdict.file.fileName).toBe('tokens.env')
   })
 
   it('refuses a sibling directory whose name merely starts with the workspace\'s', async () => {
@@ -145,8 +177,16 @@ describe('resolveOutboundFile', () => {
     expect(resolveOutboundFile('big.bin', workspace, 1024))
       .toEqual({ ok: false, refusal: { code: 'too_large', bytes: 2048, limit: 1024 } })
     // The ceiling is a ceiling: a file sitting exactly on it goes.
-    expect(resolveOutboundFile('exact.bin', workspace, 1024))
-      .toEqual({ ok: true, file: { path: join(workspace, 'exact.bin'), fileName: 'exact.bin', bytes: 1024 } })
+    expect(resolveOutboundFile('exact.bin', workspace, 1024)).toEqual({
+      ok: true,
+      file: {
+        path: join(workspace, 'exact.bin'),
+        fileName: 'exact.bin',
+        bytes: 1024,
+        pathInWorkspace: 'exact.bin',
+        workspaceName: basename(workspace),
+      },
+    })
   })
 
   it('reads the cleared file\'s own bytes', async () => {
@@ -169,6 +209,45 @@ describe('resolveOutboundFile', () => {
     await writeFile(join(workspace, 'growing.log'), 'x'.repeat(4096))
 
     await expect(readOutboundFile(verdict.file)).rejects.toThrow('growing.log changed size after it was cleared')
+  })
+
+  it('reports a read failure without the host prefix Node puts in it', async () => {
+    const workspace = createWorkspace()
+    await mkdir(join(workspace, 'out'))
+    await writeFile(join(workspace, 'out', 'report.md'), 'body')
+    const verdict = resolveOutboundFile('out/report.md', workspace, 1024)
+    if (!verdict.ok) throw new Error('a file inside the workspace should have cleared')
+
+    // A genuine filesystem failure rather than a hand-written one: what has to be
+    // scrubbed is whatever Node actually writes into the message, and a test that
+    // invents the message would keep passing after Node changed it.
+    await rm(join(workspace, 'out', 'report.md'))
+    const failure = await readOutboundFile(verdict.file).then(() => undefined, (error: unknown) => error)
+
+    const detail = describeReadFailure(failure, verdict.file)
+    // The reason survives, and so does which file it was about.
+    expect(detail).toContain('ENOENT')
+    expect(detail).toContain(`'${join('out', 'report.md')}'`)
+    // The map of the host does not. This sentence reaches both a room and the
+    // model, and the failure branch is the one an injection can provoke.
+    expect(detail).not.toContain(workspace)
+  })
+
+  it('leaves a failure that names no path alone', () => {
+    const workspace = createWorkspace()
+    const file = {
+      path: join(workspace, 'out.zip'),
+      fileName: 'out.zip',
+      bytes: 1,
+      pathInWorkspace: 'out.zip',
+      workspaceName: basename(workspace),
+    }
+
+    expect(describeReadFailure(new Error('out.zip changed size after it was cleared'), file))
+      .toBe('out.zip changed size after it was cleared')
+    // Not every rejection is an `Error`, and the scrub must not be what decides
+    // whether one can be reported at all.
+    expect(describeReadFailure('nope', file)).toBe('nope')
   })
 })
 
@@ -298,7 +377,13 @@ describe('send_file tool', () => {
       .toEqual({ sent: true })
     expect(delivered).toEqual([{
       sessionId: 's1',
-      file: { path: join(workspace, 'report.md'), fileName: 'report.md', bytes: 4 },
+      file: {
+        path: join(workspace, 'report.md'),
+        fileName: 'report.md',
+        bytes: 4,
+        pathInWorkspace: 'report.md',
+        workspaceName: basename(workspace),
+      },
       signal: undefined,
     }])
   })
@@ -432,7 +517,13 @@ describe('runGetCommand', () => {
 
     expect(reply).toBeUndefined()
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.file).toEqual({ path: join(workspace, 'report.md'), fileName: 'report.md', bytes: 8 })
+    expect(sent[0]!.file).toEqual({
+      path: join(workspace, 'report.md'),
+      fileName: 'report.md',
+      bytes: 8,
+      pathInWorkspace: 'report.md',
+      workspaceName: basename(workspace),
+    })
     expect(sent[0]!.bytes.toString('utf8')).toBe('# 报告')
   })
 
@@ -446,5 +537,32 @@ describe('runGetCommand', () => {
     expect(reply).toContain('⚠️')
     expect(reply).toContain('report.md')
     expect(reply).toContain('230013')
+  })
+
+  // Root reads a mode-000 file regardless, which would leave this passing for the
+  // wrong reason rather than failing.
+  it.skipIf(process.getuid?.() === 0)('tells the chat a read failed without printing the host path', async () => {
+    const workspace = createWorkspace()
+    await mkdir(join(workspace, 'out'))
+    const path = join(workspace, 'out', 'report.md')
+    await writeFile(path, 'body')
+    // Stats as a regular file under the ceiling, so it clears the check and fails
+    // in the read — where the message Node builds quotes the absolute path.
+    await chmod(path, 0o000)
+    const sent: OutboundFile[] = []
+    const reply = await runGetCommand(
+      `/${GET_COMMAND} out/report.md`,
+      workspace,
+      1024,
+      async (file) => { sent.push(file) },
+    )
+
+    expect(sent).toEqual([])
+    expect(reply).toContain('⚠️')
+    // Which file, and why, in the form the human typed it.
+    expect(reply).toContain(join('out', 'report.md'))
+    expect(reply).toContain('EACCES')
+    // `/get` answers in the chat, and in a group that is a whole room.
+    expect(reply).not.toContain(workspace)
   })
 })

@@ -29,7 +29,8 @@
         # attachImages: false        # only for a route that accepts images
         # receiveFiles: true         # inbound files land in .dsh-lark/inbox/
         # maxReceiveFileBytes: 20971520
-        # sendFiles: true            # groups still gate every send behind a card
+        # sendFiles: true            # groups still gate every send behind a card,
+        #                            # at most three of them undecided at a time
         # maxSendFileBytes: 20971520
         # hideProcessWhenDone: false # let the platform drop a finished process
         # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
