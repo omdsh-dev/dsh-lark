@@ -1,15 +1,33 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, realpathSync } from 'node:fs'
+import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { NormalizedMessage, ResourceDescriptor } from '@larksuite/channel'
-import { collectInboundFiles, MESSAGE_BYTES_FACTOR, sanitizeFileName } from '../src/files.ts'
-import type { InboundFilePort, InboundOptions } from '../src/files.ts'
+import {
+  collectInboundFiles,
+  describeRefusalForChat,
+  describeRefusalForModel,
+  GET_COMMAND,
+  MESSAGE_BYTES_FACTOR,
+  readOutboundFile,
+  resolveOutboundFile,
+  runGetCommand,
+  sanitizeFileName,
+  SEND_FILE_TOOL,
+  sendFileTool,
+} from '../src/files.ts'
+import type {
+  InboundFilePort,
+  InboundOptions,
+  OutboundFile,
+  OutboundRefusal,
+  SendFilePorts,
+} from '../src/files.ts'
 import { collectImages } from '../src/images.ts'
 import type { ImagePort } from '../src/images.ts'
-import { createFakeAttachments, createFakePort, fakeMessage } from './harness.ts'
+import { assertRegistrableTool, createFakeAttachments, createFakePort, fakeMessage } from './harness.ts'
 
 /** Workspaces these tests wrote into, removed after each one. */
 const workspaces: string[] = []
@@ -428,3 +446,281 @@ describe('collectImages over what landed', () => {
   })
 })
 
+describe('resolveOutboundFile', () => {
+  it('resolves a relative path against the workspace, and an absolute one inside it', async () => {
+    const workspace = createWorkspace()
+    await mkdir(join(workspace, 'out'))
+    await writeFile(join(workspace, 'out', 'report.md'), 'body')
+    const cleared = { path: join(workspace, 'out', 'report.md'), fileName: 'report.md', bytes: 4 }
+
+    expect(resolveOutboundFile('out/report.md', workspace, 1024)).toEqual({ ok: true, file: cleared })
+    expect(resolveOutboundFile('./out/report.md', workspace, 1024)).toEqual({ ok: true, file: cleared })
+    expect(resolveOutboundFile(join(workspace, 'out', 'report.md'), workspace, 1024)).toEqual({ ok: true, file: cleared })
+  })
+
+  it('refuses a path that climbs out of the workspace', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(outside, 'secret.md'), 'not yours')
+
+    // Both spellings of the same escape: the folded `..` and the plain path.
+    expect(resolveOutboundFile(`../${basename(outside)}/secret.md`, workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+    expect(resolveOutboundFile(join(outside, 'secret.md'), workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+  })
+
+  it('follows a symlink before it decides, so one leaving the workspace is refused', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(outside, 'secret.md'), 'not yours')
+    const shortcut = join(workspace, 'shortcut.md')
+    symlinkSync(join(outside, 'secret.md'), shortcut)
+
+    // The link's OWN path is inside the workspace, which is the whole point: a
+    // container check running before realpath would clear it and the bytes
+    // would leave. This is the regression test for that ordering.
+    expect(shortcut.startsWith(`${workspace}${sep}`)).toBe(true)
+    expect(await readFile(shortcut, 'utf8')).toBe('not yours')
+    expect(resolveOutboundFile('shortcut.md', workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+  })
+
+  it('still clears a file when the workspace path is itself a symlink', async () => {
+    const real = createWorkspace()
+    const elsewhere = createWorkspace()
+    const linked = join(elsewhere, 'project')
+    symlinkSync(real, linked)
+    await writeFile(join(real, 'report.md'), 'body')
+    const cleared = { path: join(real, 'report.md'), fileName: 'report.md', bytes: 4 }
+
+    // macOS points `/tmp` at `/private/var/…`, so a workspace compared without
+    // canonicalizing it first judges every file inside it an escape.
+    expect(realpathSync(linked)).toBe(real)
+    expect(resolveOutboundFile('report.md', linked, 1024)).toEqual({ ok: true, file: cleared })
+    expect(resolveOutboundFile(join(linked, 'report.md'), linked, 1024)).toEqual({ ok: true, file: cleared })
+  })
+
+  it('refuses a directory, a path with nothing there, and no path at all', async () => {
+    const workspace = createWorkspace()
+    await mkdir(join(workspace, 'out'))
+
+    expect(resolveOutboundFile('out', workspace, 1024)).toEqual({ ok: false, refusal: { code: 'not_a_file' } })
+    expect(resolveOutboundFile('.', workspace, 1024)).toEqual({ ok: false, refusal: { code: 'not_a_file' } })
+    expect(resolveOutboundFile('missing.md', workspace, 1024)).toEqual({ ok: false, refusal: { code: 'not_found' } })
+    // Naming no file is a missing path, not "the workspace is not a file".
+    expect(resolveOutboundFile('', workspace, 1024)).toEqual({ ok: false, refusal: { code: 'not_found' } })
+    expect(resolveOutboundFile('   ', workspace, 1024)).toEqual({ ok: false, refusal: { code: 'not_found' } })
+  })
+
+  it('refuses a file over the ceiling and weighs it against the ceiling', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'big.bin'), 'x'.repeat(2048))
+    await writeFile(join(workspace, 'exact.bin'), 'x'.repeat(1024))
+
+    expect(resolveOutboundFile('big.bin', workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'too_large', bytes: 2048, limit: 1024 } })
+    // The ceiling is a ceiling: a file sitting exactly on it goes.
+    expect(resolveOutboundFile('exact.bin', workspace, 1024))
+      .toEqual({ ok: true, file: { path: join(workspace, 'exact.bin'), fileName: 'exact.bin', bytes: 1024 } })
+  })
+
+  it('reads the cleared file\'s own bytes', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), '# 报告')
+    const verdict = resolveOutboundFile('report.md', workspace, 1024)
+    if (!verdict.ok) throw new Error('a file inside the workspace should have cleared')
+
+    expect((await readOutboundFile(verdict.file)).toString('utf8')).toBe('# 报告')
+  })
+})
+
+describe('outbound refusal wording', () => {
+  /** Every refusal the check can reach, so neither voice can grow a hole. */
+  const refusals: OutboundRefusal[] = [
+    { code: 'outside_workspace' },
+    { code: 'not_found' },
+    { code: 'not_a_file' },
+    { code: 'too_large', bytes: 25 * 1024 * 1024, limit: 20 * 1024 * 1024 },
+  ]
+
+  it('speaks English to the model and 中文 to the chat', () => {
+    for (const refusal of refusals) {
+      expect(describeRefusalForModel(refusal)).not.toMatch(/[一-鿿]/)
+      expect(describeRefusalForChat(refusal)).toMatch(/[一-鿿]/)
+    }
+  })
+
+  it('tells the model where its boundary is, without naming a path it did not supply', () => {
+    const text = describeRefusalForModel({ code: 'outside_workspace' })
+
+    expect(text).toContain('only files inside the current workspace can be sent')
+    expect(text).not.toContain('/')
+  })
+
+  it('carries the real size and the ceiling in both voices', () => {
+    const refusal: OutboundRefusal = { code: 'too_large', bytes: 25 * 1024 * 1024, limit: 20 * 1024 * 1024 }
+
+    for (const text of [describeRefusalForModel(refusal), describeRefusalForChat(refusal)]) {
+      expect(text).toContain('25.0 MiB')
+      expect(text).toContain('20.0 MiB')
+    }
+  })
+})
+
+/** The tool as the registry hands it back, with the parts tests drive. */
+interface Runnable {
+  readonly name: string
+  readonly description: string
+  execute(args: unknown, exec: unknown): Promise<{ sent: true }>
+}
+
+/**
+ * The tool description, verbatim from the design. Pinned here because it IS the
+ * model's contract with the tool — including the sentence that keeps a short
+ * answer out of an attachment.
+ */
+const SEND_FILE_DESCRIPTION = 'Send one file from the current workspace to this chat, so the person who asked '
+  + 'can download it. Use it for artifacts: reports, diffs, generated images, exported data. Short content '
+  + 'belongs in your reply instead — never send a file just to say a few sentences. One call sends one file; '
+  + 'call it again for more.'
+
+/** One tool execution context, as the host passes it. */
+function execFor(sessionId: string) {
+  return { agent: { session: { id: sessionId } } }
+}
+
+/** `send_file` ports over one workspace, recording what was delivered. */
+function stageSendPorts(workspace: string | undefined, overrides: Partial<SendFilePorts> = {}) {
+  const delivered: { sessionId: string; file: OutboundFile }[] = []
+  const ports: SendFilePorts = {
+    deliver: async (sessionId, file) => {
+      delivered.push({ sessionId, file })
+      return undefined
+    },
+    workspaceOf: () => workspace,
+    maxBytes: 1024,
+    ...overrides,
+  }
+  return { ports, delivered }
+}
+
+describe('send_file tool', () => {
+  it('registers as a definition the host registry would accept', () => {
+    const { ports } = stageSendPorts(createWorkspace())
+    assertRegistrableTool(sendFileTool(ports) as { name: string })
+    const tool = sendFileTool(ports) as Runnable
+
+    expect(tool.name).toBe(SEND_FILE_TOOL)
+    expect(tool.description).toBe(SEND_FILE_DESCRIPTION)
+  })
+
+  it('delivers the canonical file to the calling session\'s chat', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    const { ports, delivered } = stageSendPorts(workspace)
+
+    expect(await (sendFileTool(ports) as Runnable).execute({ path: './report.md' }, execFor('s1')))
+      .toEqual({ sent: true })
+    expect(delivered).toEqual([{
+      sessionId: 's1',
+      file: { path: join(workspace, 'report.md'), fileName: 'report.md', bytes: 4 },
+    }])
+  })
+
+  it('throws in English when there is no agent, and when its session has no chat', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    const orphan = await (sendFileTool(stageSendPorts(workspace).ports) as Runnable)
+      .execute({ path: 'report.md' }, {})
+      .catch((error: Error) => error)
+    const chatless = await (sendFileTool(stageSendPorts(undefined).ports) as Runnable)
+      .execute({ path: 'report.md' }, execFor('s1'))
+      .catch((error: Error) => error)
+
+    expect(orphan).toBeInstanceOf(Error)
+    expect((orphan as Error).message).toContain('requires a calling agent')
+    expect(chatless).toBeInstanceOf(Error)
+    expect((chatless as Error).message).toContain('no chat for this session')
+    // A tool error is what the model reads next, so it is English like the rest.
+    for (const error of [orphan, chatless]) expect((error as Error).message).not.toMatch(/[一-鿿]/)
+  })
+
+  it('throws the refusal, and whatever else stopped the delivery', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    await writeFile(join(outside, 'secret.md'), 'not yours')
+    const refused = stageSendPorts(workspace)
+
+    await expect((sendFileTool(refused.ports) as Runnable).execute({ path: join(outside, 'secret.md') }, execFor('s1')))
+      .rejects.toThrow(describeRefusalForModel({ code: 'outside_workspace' }))
+    // A malformed call is the model's mistake to hear about as a refusal, not a
+    // type error thrown from inside its turn.
+    await expect((sendFileTool(refused.ports) as Runnable).execute({}, execFor('s1')))
+      .rejects.toThrow(describeRefusalForModel({ code: 'not_found' }))
+    await expect((sendFileTool(refused.ports) as Runnable).execute(null, execFor('s1')))
+      .rejects.toThrow(describeRefusalForModel({ code: 'not_found' }))
+    expect(refused.delivered).toEqual([])
+
+    const undelivered = stageSendPorts(workspace, { deliver: async () => 'The user rejected the send.' })
+    await expect((sendFileTool(undelivered.ports) as Runnable).execute({ path: 'report.md' }, execFor('s1')))
+      .rejects.toThrow('The user rejected the send.')
+  })
+})
+
+describe('runGetCommand', () => {
+  it('explains itself when the line carries no path', async () => {
+    const workspace = createWorkspace()
+    const sent: OutboundFile[] = []
+    const reply = await runGetCommand(`/${GET_COMMAND}`, workspace, 1024, async (file) => { sent.push(file) })
+
+    expect(reply).toContain(`/${GET_COMMAND} <路径>`)
+    expect(sent).toEqual([])
+  })
+
+  it('refuses in 中文 what the tool refuses in English, through the same check', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(outside, 'secret.md'), 'not yours')
+    const sent: OutboundFile[] = []
+    const reply = await runGetCommand(
+      `/${GET_COMMAND} ${join(outside, 'secret.md')}`,
+      workspace,
+      1024,
+      async (file) => { sent.push(file) },
+    )
+
+    expect(reply).toBe(`⚠️ ${describeRefusalForChat({ code: 'outside_workspace' })}`)
+    expect(sent).toEqual([])
+  })
+
+  it('says nothing at all when the file itself is the reply', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), '# 报告')
+    const sent: { file: OutboundFile; bytes: Buffer }[] = []
+    const reply = await runGetCommand(
+      `/${GET_COMMAND}   ./report.md  `,
+      workspace,
+      1024,
+      async (file, bytes) => { sent.push({ file, bytes }) },
+    )
+
+    expect(reply).toBeUndefined()
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.file).toEqual({ path: join(workspace, 'report.md'), fileName: 'report.md', bytes: 8 })
+    expect(sent[0]!.bytes.toString('utf8')).toBe('# 报告')
+  })
+
+  it('tells the chat when the send failed instead of going quiet', async () => {
+    const workspace = createWorkspace()
+    await writeFile(join(workspace, 'report.md'), 'body')
+    const reply = await runGetCommand(`/${GET_COMMAND} report.md`, workspace, 1024, async () => {
+      throw new Error('upload rejected: 230013')
+    })
+
+    expect(reply).toContain('⚠️')
+    expect(reply).toContain('report.md')
+    expect(reply).toContain('230013')
+  })
+})
