@@ -75,6 +75,7 @@ import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
+import type { InboundFilePort } from './files.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
@@ -89,7 +90,7 @@ import { instanceIdentity } from './instance.ts'
  * The transport surface the bridge drives. `LarkChannel` from
  * `@larksuite/channel` satisfies it structurally; tests substitute a fake.
  */
-export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, CotPort {
+export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, InboundFilePort, CotPort {
   /** Open the transport (WebSocket long connection by default). */
   connect(): Promise<void>
   /** Close the transport and release its resources. */

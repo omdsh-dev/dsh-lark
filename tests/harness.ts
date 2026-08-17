@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
 import { vi } from 'vitest'
 import type {
@@ -187,6 +188,17 @@ export function createFakePort() {
       const stored = resourceBytes.get(fileKey)
       if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
       return stored
+    },
+    async downloadResourceToFile(messageId, fileKey, _type, destPath) {
+      const stored = resourceBytes.get(fileKey)
+      if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
+      // Real bytes on a real path: the caller's quota and note assertions are
+      // about what a later read finds, not about what this fake returned.
+      await writeFile(destPath, stored.buffer)
+      return {
+        ...stored.contentType === undefined ? {} : { contentType: stored.contentType },
+        bytesWritten: stored.buffer.byteLength,
+      }
     },
     async listSlashCommands() {
       if (state.failPanelList) throw new Error('no permission to list commands (fake)')
