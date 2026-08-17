@@ -1656,9 +1656,15 @@ export function installBridge(
    * leave a same-size `.env` under the name the card showed, and neither the
    * size re-check in `readOutboundFile` nor the container check — which never
    * runs again on the cleared path — can see that swap. Reading first makes the
-   * artefact the room approved and the artefact that leaves one object. The cost
-   * is up to `maxSendFileBytes` held per pending approval for the approval
-   * window, which is the memory ADR 0004 already budgets and bounds a send by.
+   * artefact the room approved and the artefact that leaves one object.
+   *
+   * It costs memory, and more than ADR 0004 set out to spend: that decision
+   * budgeted ONE buffer for the few seconds of a send, while this holds one per
+   * pending approval for as long as the room takes to answer. The real figure is
+   * therefore "concurrent undecided group approvals × `maxSendFileBytes`" — 20
+   * MiB each by default, for up to the thirty-minute timeout — and that
+   * aggregate has no ceiling of its own today. The per-file ceiling bounds each
+   * one; nothing bounds their sum.
    *
    * Failures come back as a string rather than a throw: the caller is a tool
    * body that turns whatever it gets into the model's error, and one refusal

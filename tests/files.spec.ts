@@ -343,6 +343,29 @@ describe('collectInboundFiles', () => {
     expect(reports[0]).toContain('inbox directory')
   })
 
+  it('downloads through the directory it proved, not the one it was spelled', async () => {
+    const workspace = createWorkspace()
+    // A link that stays INSIDE the workspace, so containment clears it and the
+    // two spellings of one landing directory become distinguishable.
+    await mkdir(join(workspace, 'channel'))
+    symlinkSync(join(workspace, 'channel'), join(workspace, '.dsh-lark'))
+    const { port, calls } = stageResources({ fk_doc: 'log lines' })
+    const { options } = stageOptions(workspace)
+    const result = await collectInboundFiles(fileMessage([resource('file', 'fk_doc', 'app.log')]), port, options)
+
+    // The transport is aimed at the canonical directory the check cleared. A
+    // proof taken on one path and a write performed through another leaves the
+    // link in between free to be swapped after the proof.
+    expect(result.landed).toHaveLength(1)
+    const landedPath = result.landed[0]!.path
+    expect(landedPath.startsWith(join(workspace, 'channel', 'inbox') + sep)).toBe(true)
+    expect(landedPath).not.toContain('.dsh-lark')
+    expect(calls.map(call => call.destPath)).toEqual([landedPath])
+    expect(await readFile(landedPath, 'utf8')).toBe('log lines')
+    // And the note names that same path, so what the model reads is what exists.
+    expect(result.notes[0]).toContain(landedPath)
+  })
+
   it('hints at .gitignore once files really landed, and not otherwise', async () => {
     const workspace = createWorkspace()
     const { port } = stageResources({ fk_doc: 'log lines' })

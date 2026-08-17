@@ -292,10 +292,14 @@ export async function collectInboundFiles(
     }
   }
 
-  const directory = inboxDirectoryFor(msg, options.workspace)
+  const requested = inboxDirectoryFor(msg, options.workspace)
+  // The PROVEN directory, and what every path below is built from. Spelled and
+  // canonical are two different directories whenever a link sits between them,
+  // and a proof taken on one of them says nothing about the other.
+  let directory: string
   try {
     // The transport streams into an existing directory; it does not make one.
-    await mkdir(directory, { recursive: true })
+    await mkdir(requested, { recursive: true })
     // And the directory it just made has to be PROVEN inside the workspace
     // rather than merely spelled that way. The sanitizer cannot see a symlink —
     // it judges one name, while `resolve` and `join` fold `..` and then answer
@@ -305,17 +309,24 @@ export async function collectInboundFiles(
     // chose. So containment is asked of the filesystem and not of the string,
     // the same way outbound refuses to trust a path it has not canonicalized
     // (ADR 0004) — and a write earns that question at least as much as a read.
-    const landing = realpathSync(directory)
+    //
+    // The canonical form is then KEPT and joined onto, because a proof is only
+    // worth anything on the path the bytes actually travel: writing through
+    // `requested` after canonicalizing it would leave the same link free to be
+    // swapped in between the check and the download, and the check would have
+    // been about a directory nothing was written to.
+    const landing = realpathSync(requested)
     const container = canonicalPathOf(options.workspace) ?? resolve(options.workspace)
     if (!isWithinContainer(landing, container)) {
       throw new Error('the inbox directory does not resolve inside the workspace')
     }
+    directory = landing
   } catch (error) {
     const detail = failureDetail(error)
     // Nothing was downloaded, so whatever this attempt did create is an empty
     // directory nobody was promised — including one made through a link.
-    await discardDirectory(directory)
-    options.report(`lark-channel: could not create the inbox directory ${directory}: ${detail}`)
+    await discardDirectory(requested)
+    options.report(`lark-channel: could not create the inbox directory ${requested}: ${detail}`)
     return {
       landed: [],
       notes: [`（收到 ${resources.length} 个文件，但无法在工作区创建 ${CHANNEL_DIRECTORY}/${INBOX_DIRECTORY}/：${detail}）`],

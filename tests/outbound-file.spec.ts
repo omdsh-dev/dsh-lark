@@ -206,6 +206,28 @@ describe('outbound refusal wording', () => {
     }
   })
 
+  it('climbs past MiB instead of quoting thousands of them', () => {
+    const refusal: OutboundRefusal = { code: 'too_large', bytes: 3 * 1024 ** 3, limit: 2 * 1024 ** 3 }
+
+    // The formatter these voices used to own stopped at MiB, so a 3 GiB file
+    // read as `3072.0 MiB` — digits to parse rather than a size to read.
+    for (const text of [describeRefusalForModel(refusal), describeRefusalForChat(refusal)]) {
+      expect(text).toContain('3 GiB')
+      expect(text).toContain('2 GiB')
+      expect(text).not.toContain('MiB')
+    }
+  })
+
+  it('collapses a size that is not a size, instead of printing NaN at a reader', () => {
+    const refusal: OutboundRefusal = { code: 'too_large', bytes: Number.NaN, limit: -1 }
+
+    // The old formatter divided whatever it was handed and printed the result;
+    // the shared one guards its input, so a broken stat reads as zero.
+    expect(describeRefusalForChat(refusal)).toContain('0 字节')
+    expect(describeRefusalForChat(refusal)).not.toContain('NaN')
+    expect(describeRefusalForModel(refusal)).toContain('0 bytes')
+  })
+
   it('spells a size the way the approval card spells it', () => {
     const refusal: OutboundRefusal = { code: 'too_large', bytes: 1258291, limit: 1024 * 1024 }
 
