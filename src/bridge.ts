@@ -63,6 +63,7 @@ import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
 import { CD_COMMAND, ChatSessionOverrides, ChatWorkspaces, runSessionCommand, runWorkspaceCommand, SESSION_COMMAND, WS_COMMAND } from './workspace.ts'
+import type { SessionResolve } from './workspace.ts'
 import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
 import {
   ChatModels,
@@ -1736,26 +1737,6 @@ export function installBridge(
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
         } else if (channelCommand === SESSION_COMMAND) {
           const currentId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
-          // /session <id> binds to an EXISTING session; an id nobody has would
-          // otherwise bind fine and then silently CREATE an empty session on
-          // the next message (the ladder's resume-then-create fallback).
-          // Verify against the FULL persisted list — not the cwd/archived
-          // filtered listing — so cross-directory and archived sessions stay
-          // switchable, and only ids that are not sessions at all are refused.
-          const verifySession = async (id: string): Promise<boolean> => {
-            const query = ctx.get('sessionQuery') as {
-              listSessions?: (signal?: AbortSignal) => Promise<unknown>
-            } | undefined
-            if (query?.listSessions === undefined) return true
-            try {
-              const records = await query.listSessions() as Array<{ header?: { id?: string } }>
-              return records.some(record => record.header?.id === id)
-            } catch {
-              // A broken query must not block switching; degrade to trusting
-              // the id, the same way listSessions degrades to no listing.
-              return true
-            }
-          }
           const listSessions = async (): Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]> => {
             const query = ctx.get('sessionQuery') as {
               listSessions?: (signal?: AbortSignal) => Promise<unknown>
@@ -1800,8 +1781,50 @@ export function installBridge(
               return []
             }
           }
+          // /session <arg> resolves to an EXISTING session — an argument that
+          // resolves to nothing would bind fine and then silently CREATE an
+          // empty session on the next message (the ladder's resume-then-create
+          // fallback). An id is exact and unique, so it is tried first against
+          // the FULL persisted list (cross-directory and archived sessions
+          // stay switchable by id); a title match is scoped to the current
+          // workspace's switchable sessions, mirroring how /cd accepts a
+          // directory's basename. A tie refuses with candidates; nothing found
+          // refuses with guidance.
+          const resolveSession = async (argument: string): Promise<SessionResolve> => {
+            const query = ctx.get('sessionQuery') as {
+              listSessions?: (signal?: AbortSignal) => Promise<unknown>
+            } | undefined
+            if (query?.listSessions === undefined) return { ok: true, kind: 'id', id: argument }
+            try {
+              const records = await query.listSessions() as Array<{ header?: { id?: string } }>
+              const ids = new Set(
+                records.map(record => record.header?.id).filter((id): id is string => id !== undefined),
+              )
+              if (ids.has(argument)) return { ok: true, kind: 'id', id: argument }
+              const sessions = await listSessions()
+              const byTitle = sessions.filter(session => session.title === argument)
+              if (byTitle.length === 1) {
+                const hit = byTitle[0]!
+                return { ok: true, kind: 'title', id: hit.id, title: hit.title }
+              }
+              if (byTitle.length > 1) {
+                return {
+                  ok: false,
+                  reason: `标题 \`${argument}\` 对应多个会话：\n${byTitle.map(s => `- \`${s.id}\``).join('\n')}\n请用完整 ID。`,
+                }
+              }
+              return {
+                ok: false,
+                reason: `找不到会话 \`${argument}\`：不是已知的会话 ID，也不是当前工作区可切换会话的标题。\n\`/session\` 可查看可切换会话。`,
+              }
+            } catch {
+              // A broken query must not block switching; degrade to trusting
+              // the argument, the same way listSessions degrades to no listing.
+              return { ok: true, kind: 'id', id: argument }
+            }
+          }
           {
-            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key), verifySession)
+            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key), resolveSession)
             reply = result.card === undefined
               ? { markdown: result.markdown }
               : { card: sessionCard({ rows: result.card.rows, workspace: result.card.workspace, canList: result.card.canList }) }

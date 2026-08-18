@@ -1491,6 +1491,46 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('switches by a unique session title, showing both title and id', async () => {
+      const fake = createFakeSettings()
+      const query = createFakeSessionQuery([
+        { id: 'session-aaa', cwd: '/workspace/运维' },
+        { id: 'session-bbb', cwd: '/workspace/运维' },
+      ])
+      // Titles come from readTitleSnapshots; the fake returns none, so build
+      // a query whose snapshots name the sessions.
+      query.service.readTitleSnapshots = async (ids: readonly string[]) =>
+        ids.map(sessionId => ({ sessionId, status: 'fulfilled', value: { session: { id: sessionId }, title: { title: sessionId === 'session-bbb' ? '插件开发' : undefined } } }))
+      const harness = await mountChannel({ cwd: '/workspace/运维' }, { settings: fake.settings, sessionQuery: query.service })
+      await harness.fake.emitMessage(fakeMessage({ content: '/session 插件开发' }))
+      await vi.waitFor(() => {
+        expect(fake.updates.some((patch) =>
+          (patch as { chatSessions?: Record<string, string> }).chatSessions?.['oc_chat_1'] === 'session-bbb',
+        )).toBe(true)
+      })
+      await harness.dispose()
+    })
+
+    it('refuses an ambiguous session title and lists the candidates', async () => {
+      const fake = createFakeSettings()
+      const query = createFakeSessionQuery([
+        { id: 'session-aaa', cwd: '/workspace/运维' },
+        { id: 'session-bbb', cwd: '/workspace/运维' },
+      ])
+      query.service.readTitleSnapshots = async (ids: readonly string[]) =>
+        ids.map(sessionId => ({ sessionId, status: 'fulfilled', value: { session: { id: sessionId }, title: { title: '同名' } } }))
+      const harness = await mountChannel({ cwd: '/workspace/运维' }, { settings: fake.settings, sessionQuery: query.service })
+      await harness.fake.emitMessage(fakeMessage({ content: '/session 同名' }))
+      await vi.waitFor(() => {
+        expect(harness.fake.sent.some((m) =>
+          'markdown' in m.input && m.input.markdown.includes('对应多个会话'),
+        )).toBe(true)
+      })
+      // Nothing was persisted: an ambiguous title binds no session.
+      expect(fake.updates).toEqual([])
+      await harness.dispose()
+    })
+
     it('refuses to bind a session id that does not exist, instead of creating one', async () => {
       const fake = createFakeSettings()
       const query = createFakeSessionQuery([{ id: 'session-real', cwd: '/workspace/运维' }])
@@ -1503,7 +1543,7 @@ describe('dsh-lark-channel', () => {
       // CREATE an empty session under that id on the next message.
       await vi.waitFor(() => {
         expect(harness.fake.sent.some((m) =>
-          'markdown' in m.input && m.input.markdown.includes('不存在，无法切换'),
+          'markdown' in m.input && m.input.markdown.includes('找不到会话'),
         )).toBe(true)
       })
       // The existing override is untouched — nothing was persisted.

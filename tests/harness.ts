@@ -856,11 +856,24 @@ export function createFakeWorkspaces(registered: Record<string, string> = {}) {
 
 /** An in-memory `sessionQuery` listing a fixed set of persisted sessions. */
 export function createFakeSessionQuery(sessions: Array<{ id: string; cwd?: string; createdAt?: number }> = []) {
-  const service = {
+  const service: {
+    listSessions(): Promise<Array<{ header?: { id?: string; cwd?: string; createdAt?: number } }>>
+    readTitleSnapshots(ids: readonly string[]): Promise<Array<{
+      sessionId: string
+      status: string
+      value: { session: { id: string }; title: { title?: string | undefined } }
+    }>>
+  } = {
     async listSessions() {
-      return sessions.map(session => ({ header: { id: session.id, cwd: session.cwd, createdAt: session.createdAt } }))
+      return sessions.map(session => ({
+        header: {
+          id: session.id,
+          ...session.cwd === undefined ? {} : { cwd: session.cwd },
+          ...session.createdAt === undefined ? {} : { createdAt: session.createdAt },
+        },
+      }))
     },
-    async readTitleSnapshots(ids: readonly string[]) {
+    async readTitleSnapshots(ids) {
       return ids.map(sessionId => ({ sessionId, status: 'fulfilled', value: { session: { id: sessionId }, title: { title: undefined } } }))
     },
   }

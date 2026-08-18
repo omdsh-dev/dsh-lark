@@ -444,6 +444,11 @@ export interface SessionCommandResult {
  * @param listSessions - optional listing of sessions in the current workspace.
  * @param currentPath - the conversation's current workspace path.
  */
+/** One `/session <arg>` resolution: a direct id, a title-resolved id, or a refusal. */
+export type SessionResolve =
+  | { readonly ok: true; readonly kind: 'id' | 'title'; readonly id: string; readonly title?: string | undefined }
+  | { readonly ok: false; readonly reason: string }
+
 export async function runSessionCommand(
   line: string,
   key: string,
@@ -451,9 +456,14 @@ export async function runSessionCommand(
   currentId: string,
   listSessions?: () => Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]>,
   currentPath?: string | undefined,
-  verifySession?: (id: string) => Promise<boolean>,
+  resolveSession?: (argument: string) => Promise<SessionResolve>,
 ): Promise<SessionCommandResult> {
-  const argument = line.trimStart().slice(1 + SESSION_COMMAND.length).trim()
+  // /session <id|title> means switch to an EXISTING session. An argument that
+  // resolves to nothing would bind fine and then silently CREATE an empty
+  // session on the next message (the ladder's resume-then-create fallback),
+  // so a refusal is surfaced up front instead of leaving the operator in a
+  // surprise shell.
+  let argument = line.trimStart().slice(1 + SESSION_COMMAND.length).trim()
   const lower = argument.toLowerCase()
   if (lower === 'reset' || lower === 'clear') {
     const durable = await overrides.set(key, undefined)
@@ -512,22 +522,26 @@ export async function runSessionCommand(
       },
     }
   }
+  // /session <id|title> means switch to an EXISTING session. An argument that
+  // resolves to nothing would bind fine and then silently CREATE an empty
+  // session on the next message (the ladder's resume-then-create fallback),
+  // so a refusal is surfaced up front instead of leaving the operator in a
+  // surprise shell. Resolution runs BEFORE the id-format check so a title —
+  // which may contain any characters — is tried first.
+  let resolved: SessionResolve | undefined
+  if (resolveSession !== undefined) {
+    resolved = await resolveSession(argument)
+    if (!resolved.ok) return { markdown: resolved.reason }
+    // The id to bind: the argument itself, or the id a title resolved to.
+    argument = resolved.id
+  }
   if (!/^[A-Za-z0-9._-]+$/.test(argument)) {
     return { markdown: `⚠️ 会话 ID 格式不合法：\`${argument}\`。\n合法字符：字母、数字、\`\.\`、\`_\`、\`-\`。` }
   }
-  // /session <id> means switch to an EXISTING session. Binding an id nobody
-  // has would bind fine and then silently CREATE an empty session on the next
-  // message (the ladder's resume-then-create fallback), so a non-existent id
-  // is refused up front instead of leaving the operator in a surprise shell.
-  if (verifySession !== undefined) {
-    const exists = await verifySession(argument)
-    if (!exists) {
-      return {
-        markdown: `⚠️ 会话 \`${argument}\` 不存在，无法切换。\n\`/session\` 可查看当前工作区的可切换会话；已归档或其他工作区的会话只要有 ID 也可切换。`,
-      }
-    }
-  }
   const durable = await overrides.set(key, argument)
   const durability = durable ? '' : '\n（本部署未组合 settings，这次绑定在重启后会丢失。）'
-  return { markdown: `🔗 已切换到会话 \`${argument}\`。\n下一条消息继续该会话的上下文。${durability}\n\`/session reset\` 可解除切换。` }
+  const shown = resolved !== undefined && resolved.ok && resolved.kind === 'title' && resolved.title !== undefined
+    ? `「${resolved.title}」(\`${argument}\`)`
+    : `\`${argument}\``
+  return { markdown: `🔗 已切换到会话 ${shown}。\n下一条消息继续该会话的上下文。${durability}\n\`/session reset\` 可解除切换。` }
 }
