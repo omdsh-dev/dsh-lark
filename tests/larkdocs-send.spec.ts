@@ -194,11 +194,16 @@ describe('send_doc and /put bridge wiring', () => {
     const timedBound = await bind(timed, { chatType: 'group', chatId: 'oc_group_2' })
     vi.useFakeTimers()
     const waiting = timedBound.tool.execute({ path: 'report.md' }, { agent: timedBound.created.agent })
-    const timedOut = expect(waiting).rejects.toThrow(/within 30 minutes/)
+    // An undecided card is not a rejection, and the document path must say so
+    // in the same breath the file path does: "they said no" and "nobody was
+    // looking" call for different next moves from the model.
+    const timedOut = expect(waiting).rejects.toThrow(/within 30 minutes[\s\S]*not refused/u)
     await vi.waitFor(() => { expect(cards(timed)).toHaveLength(1) })
     await vi.advanceTimersByTimeAsync(QUESTION_TIMEOUT_MS)
     await timedOut
     expect(timed.fake.documentRequests).toHaveLength(0)
+    expect(timed.notices.some(line => line.includes('document approval') && line.includes('went undecided')))
+      .toBe(true)
     vi.useRealTimers()
     await timed.dispose()
 
@@ -229,8 +234,15 @@ describe('send_doc and /put bridge wiring', () => {
       warning: expect.stringContaining('只有机器人能打开'),
     })
     expect(sentText(harness)).toContain('https://acme.feishu.cn/docx/doc_created')
-    expect(sentText(harness)).toContain('只有机器人能打开，请手动共享')
-    expect(harness.notices.some(line => line.includes('exists but granting'))).toBe(true)
+    // What it must NOT say is "share it by hand": opening the document is the
+    // first step of sharing it, and that is the one thing nobody but the bot
+    // can do. The actionable instruction is to publish the workspace copy again.
+    expect(sentText(harness)).not.toContain('请手动共享')
+    expect(sentText(harness)).toContain('无法自行共享')
+    expect(sentText(harness)).toContain('重新发布')
+    // Named on the console by token, so an orphan is an operator's problem.
+    expect(harness.notices.some(line => line.includes('exists but granting')
+      && line.includes('doc_created') && line.includes('report.md'))).toBe(true)
     await harness.dispose()
   })
 
@@ -284,7 +296,7 @@ describe('send_doc and /put bridge wiring', () => {
     await acl.dispose()
   })
 
-  it('passes cancellation to deferred create/append and stops before permission or receipt', async () => {
+  it('carries cancellation into a deferred write but never hides one that already landed', async () => {
     const workspace = await workspaceWithReport()
     const createHarness = await mountChannel({ cwd: workspace })
     const createResponse = deferred<object>()
@@ -302,15 +314,24 @@ describe('send_doc and /put bridge wiring', () => {
       expect(createHarness.fake.documentRequests.some(request => request.method === 'POST'
         && request.url === '/open-apis/docs_ai/v1/documents')).toBe(true)
     })
+    // The signal still rides every request, which is what lets a stop abort one
+    // that is genuinely still in flight.
     expect(createHarness.fake.documentRequests.at(-1)?.signal).toBe(createController.signal)
     createController.abort(new Error('cancelled deferred create'))
     createResponse.resolve({
       code: 0,
       data: { document: { document_id: 'created_but_cancelled', url: 'https://acme.feishu.cn/docx/cancelled' } },
     })
-    expect(String(await creating)).toContain('cancelled deferred create')
+    // A document that exists is reported as existing. The grant is refused
+    // before its request (nothing was sent), so this is the orphan case: only
+    // the bot can open it, and the console carries its token.
+    await expect(creating).resolves.toMatchObject({ sent: true, link: 'https://acme.feishu.cn/docx/cancelled' })
     expect(createHarness.fake.permissionRequests).toHaveLength(0)
-    expect(sentText(createHarness)).not.toContain('/docx/cancelled')
+    expect(sentText(createHarness)).toContain('/docx/cancelled')
+    expect(sentText(createHarness)).toContain('不要重发')
+    expect(sentText(createHarness)).toContain('无法自行共享')
+    expect(createHarness.notices.some(line => line.includes('created_but_cancelled')
+      && line.includes('only the bot can open it'))).toBe(true)
     await createHarness.dispose()
 
     const appendHarness = await mountChannel({ cwd: workspace })
@@ -333,8 +354,13 @@ describe('send_doc and /put bridge wiring', () => {
     expect(appendHarness.fake.documentRequests.at(-1)?.signal).toBe(appendController.signal)
     appendController.abort(new Error('cancelled deferred append'))
     appendResponse.resolve({ code: 0, data: { document: { revision_id: 2 } } })
-    expect(String(await appending)).toContain('cancelled deferred append')
-    expect(sentText(appendHarness)).not.toContain('已追加')
+    // The append landed. Calling this "failed" is what made a person send the
+    // same content again, so the room is told it worked and told not to resend.
+    await expect(appending).resolves.toMatchObject({ sent: true, appended: true })
+    expect(sentText(appendHarness)).toContain('已追加')
+    expect(sentText(appendHarness)).toContain('不要重发')
+    expect(appendHarness.notices.some(line => line.includes('the write did land'))).toBe(true)
+    expect(appendHarness.notices.some(line => line.includes('failed'))).toBe(false)
     await appendHarness.dispose()
 
     const grantHarness = await mountChannel({ cwd: workspace })
@@ -350,8 +376,12 @@ describe('send_doc and /put bridge wiring', () => {
     await vi.waitFor(() => { expect(grantHarness.fake.permissionRequests).toHaveLength(1) })
     grantController.abort(new Error('cancelled deferred grant'))
     grantResponse.resolve({ code: 0, msg: 'ok' })
-    expect(String(await granting)).toContain('cancelled deferred grant')
-    expect(sentText(grantHarness)).not.toContain('/docx/grant_cancelled')
+    // The reader was added before the stop arrived, so the audience really can
+    // see it: withholding the link would leave a document nobody was told about.
+    await expect(granting).resolves.toMatchObject({ sent: true, link: 'https://acme.feishu.cn/docx/grant_cancelled' })
+    expect(sentText(grantHarness)).toContain('/docx/grant_cancelled')
+    expect(sentText(grantHarness)).toContain('不要重发')
+    expect(sentText(grantHarness)).not.toContain('无法自行共享')
     await grantHarness.dispose()
   })
 

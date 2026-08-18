@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   classifyLarkDocumentUrl,
+  createAnchoredLarkDocumentComment,
   createLarkDocument,
   fetchLarkDocumentMarkdown,
   grantLarkDocumentReader,
@@ -159,6 +160,97 @@ describe('Lark document links and protocol', () => {
       params: { type: 'docx', need_notification: false },
       path: { token: 'doc_created' },
     }])
+  })
+
+  it('reports a write that landed even when the turn was stopped on the way back', async () => {
+    const { fake } = stage()
+    fake.documentWriteResponses.set('POST /open-apis/docs_ai/v1/documents', {
+      code: 0,
+      data: { document: { document_id: 'doc_stopped', url: 'https://acme.feishu.cn/docx/doc_stopped' } },
+    })
+    fake.documentWriteResponses.set('PUT /open-apis/docs_ai/v1/documents/doc_stopped', {
+      code: 0,
+      data: { document: { revision_id: 2 } },
+    })
+    fake.documentWriteResponses.set('POST /open-apis/drive/v1/files/doc_stopped/new_comments', {
+      code: 0,
+      data: { comment_id: 'cmt_stopped' },
+    })
+
+    /**
+     * A port whose answer and the cancellation arrive together: the write HAS
+     * landed by the time the signal aborts. Each write gets its own controller,
+     * because cancelling BEFORE a request is the branch that must still refuse.
+     */
+    const stopOnAnswer = (controller: AbortController) => ({
+      ...fake.port,
+      rawClient: {
+        ...fake.port.rawClient,
+        request: async (request: { method: string; url: string; data?: unknown; signal?: AbortSignal }) => {
+          const response = await fake.port.rawClient.request(request)
+          controller.abort(new Error('turn stopped'))
+          return response
+        },
+        drive: {
+          v1: {
+            permissionMember: {
+              create: async (payload: {
+                data: { member_type: 'openid' | 'openchat'; member_id: string; perm: 'view' }
+                params: { type: 'docx'; need_notification?: boolean }
+                path: { token: string }
+              }) => {
+                const created = fake.port.rawClient.drive?.v1.permissionMember.create
+                const response = await created!(payload)
+                controller.abort(new Error('turn stopped'))
+                return response
+              },
+            },
+          },
+        },
+      },
+    })
+
+    const creating = new AbortController()
+    await expect(createLarkDocument(stopOnAnswer(creating), 'Stopped', '# body', { signal: creating.signal }))
+      .resolves.toMatchObject({ fileToken: 'doc_stopped', appended: false })
+    expect(creating.signal.aborted).toBe(true)
+
+    const appending = new AbortController()
+    await expect(appendLarkDocument(
+      stopOnAnswer(appending),
+      { fileToken: 'doc_stopped', sourceUrl: 'https://acme.feishu.cn/docx/doc_stopped' },
+      'Stopped',
+      'more',
+      appending.signal,
+    )).resolves.toMatchObject({ fileToken: 'doc_stopped', appended: true })
+
+    const granting = new AbortController()
+    await expect(grantLarkDocumentReader(
+      stopOnAnswer(granting),
+      'doc_stopped',
+      { type: 'openchat', id: 'oc_group_1' },
+      granting.signal,
+    )).resolves.toBeUndefined()
+
+    const commenting = new AbortController()
+    await expect(createAnchoredLarkDocumentComment(
+      stopOnAnswer(commenting),
+      'doc_stopped',
+      'blk_1',
+      [{ type: 'text_run', text: 'note' }],
+      commenting.signal,
+    )).resolves.toBe('cmt_stopped')
+
+    // …and a cancellation that arrives BEFORE the request still costs nothing.
+    const early = new AbortController()
+    early.abort(new Error('turn stopped'))
+    await expect(appendLarkDocument(
+      stopOnAnswer(early),
+      { fileToken: 'doc_stopped', sourceUrl: 'https://acme.feishu.cn/docx/doc_stopped' },
+      'Stopped',
+      'more',
+      early.signal,
+    )).rejects.toThrow(/turn stopped/u)
   })
 
   it('preserves backend create URLs and uses brand-standard Feishu/Lark fallbacks when absent', async () => {

@@ -527,6 +527,17 @@ export async function fetchLarkDocumentAnchors(
   }
 }
 
+/*
+ * Every write below honours cancellation BEFORE its request and never after it.
+ * Once the platform has answered, the write HAS landed, and throwing a
+ * cancellation there turns a landed write into "failed" for every caller above:
+ * the operator console read `writing document … failed: turn stopped` for an
+ * append that really appended, and a person told "failed" sends it again, so the
+ * same content lands twice. A stopped turn is closed by naming what already
+ * exists (design §12), not by denying it. The pre-request check is where a
+ * cancellation is still free.
+ */
+
 /** Create exactly one anchored docx comment through the V2 endpoint. */
 export async function createAnchoredLarkDocumentComment(
   port: LarkDocsProtocolPort,
@@ -543,7 +554,6 @@ export async function createAnchoredLarkDocumentComment(
     data: larkDocumentCommentData(blockId, replyElements),
     ...signal === undefined ? {} : { signal },
   })
-  signal?.throwIfAborted()
   const response = checkedLarkDocsResponse(raw) as CreateCommentResponse
   const commentId = response.data?.comment_id
   if (typeof commentId !== 'string' || commentId === '') {
@@ -566,7 +576,6 @@ export async function createLarkDocument(
     data: larkDocumentCreateData(title, content),
     ...options.signal === undefined ? {} : { signal: options.signal },
   })) as CreateDocumentResponse
-  options.signal?.throwIfAborted()
   const document = response.data?.document
   if (typeof document?.document_id !== 'string' || document.document_id === '') {
     throw new Error('docs_ai create returned no document_id')
@@ -598,7 +607,6 @@ export async function appendLarkDocument(
     data: larkDocumentAppendData(content),
     ...signal === undefined ? {} : { signal },
   }))
-  signal?.throwIfAborted()
   return { fileToken: target.fileToken, url: target.sourceUrl, title, appended: true }
 }
 
@@ -617,7 +625,6 @@ export async function grantLarkDocumentReader(
     params: { type: 'docx', need_notification: false },
     path: { token: fileToken },
   }))
-  signal?.throwIfAborted()
 }
 
 /** Read and validate one typed wiki node without leaking its SDK shape. */

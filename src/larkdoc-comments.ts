@@ -526,9 +526,25 @@ export function commentOnDocTool(ports: CommentDocPorts): object {
           replyElements,
           context.signal,
         )
-        context.signal?.throwIfAborted()
+        // No cancellation check after the comment exists. Reporting a landed
+        // comment as failed sends the model back to write the same note again,
+        // and the platform keeps both — the same trap the document write path
+        // fell into. A stopped turn is closed by naming what landed (§12).
+        if (context.signal?.aborted === true) {
+          ports.report(`lark-channel: this turn was cancelled after comment ${commentId} landed on `
+            + `${target.fileToken}; the comment did land, so the same note must not be written again`)
+        }
         return { commented: true, comment_id: commentId }
       } catch (error) {
+        if (context.signal?.aborted === true) {
+          // Cancelled with the request on the wire: whether the platform kept
+          // the comment is unknown from here, and a stop is not a permission
+          // problem, so the capability table is left alone.
+          const cancelled = `lark-channel: commenting on document ${target.fileToken} was cancelled in flight; `
+            + 'whether the platform kept it is unknown, so check before writing the same note again'
+          ports.report(cancelled)
+          throw error
+        }
         await Promise.resolve(ports.correctFailure(sessionId, error)).catch((correctionError: unknown) => {
           ports.report(`lark-channel: correcting document comment capability failed: ${failureDetail(correctionError)}`)
         })

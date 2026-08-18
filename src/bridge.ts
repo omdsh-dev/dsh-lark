@@ -343,6 +343,26 @@ interface PendingApproval {
   removeAbort?: (() => void) | undefined
 }
 
+/**
+ * What one approval path says for every ending other than "allow".
+ *
+ * Five sentences rather than one, because the model's next move differs for
+ * each: a rejection means stop offering, an undecided card means nobody looked
+ * and the content belongs in the reply, and an undeliverable card means the
+ * chat never got to decide at all.
+ */
+interface ApprovalRefusals {
+  /** The turn was already cancelled, so no card was published. */
+  readonly preCancelled: string
+  /** The platform would not accept the card. */
+  readonly undeliverable: string
+  /** Nobody decided before the question timeout; NOT a refusal. */
+  readonly undecided: string
+  readonly rejected: string
+  /** Settled as cancelled — the asking turn unwound while the card stood. */
+  readonly withdrawn: string
+}
+
 /** Marker distinguishing this plugin's approval buttons from other card actions. */
 const APPROVAL_ACTION = 'dsh-lark-channel/approval'
 
@@ -548,6 +568,20 @@ const TIMEOUT_MINUTES = Math.round(QUESTION_TIMEOUT_MS / 60_000)
  * heap together.
  */
 const MAX_PENDING_OUTBOUND_SENDS = 3
+
+/**
+ * The one refusal both outbound paths give when a chat's content slots are all
+ * held.
+ *
+ * One sentence for both, because there is one counter: `send_file` and
+ * `send_doc` claim the same slots, so "files waiting for someone to allow them"
+ * described a room holding no pending file card at all whenever documents were
+ * holding those slots — and a model told about files it cannot see answers by
+ * offering the same artifact again.
+ */
+const OUTBOUND_SLOTS_FULL = `This chat already has ${MAX_PENDING_OUTBOUND_SENDS} outbound artifacts waiting to `
+  + 'finish, files and documents sharing the same slots, so this one was not sent. Wait until those are decided '
+  + 'before offering another.'
 
 /**
  * How many unclaimed reply targets may wait for their `user/message` event. A
@@ -1873,7 +1907,7 @@ export function installBridge(
             chatWorkspaces.pathFor(key),
             config.maxSendFileBytes,
             (value, signal) => resolveWritableDocumentTarget(msg.chatId, value, signal),
-            (artifact, target, signal) => publishDocumentToChat(
+            (artifact, target, signal) => publishDocumentForHuman(
               {
                 chatId: msg.chatId,
                 chatType: msg.chatType,
@@ -1882,7 +1916,6 @@ export function installBridge(
               },
               artifact,
               target,
-              false,
               signal,
             ),
             commandSignal(),
@@ -2182,14 +2215,89 @@ export function installBridge(
   }
 
   /**
-   * Ask one group to authorize one outbound file, and wait for its answer.
+   * Ask one chat to authorize one outbound artifact, and wait for its answer.
    *
    * Registered in the same `pendingApprovals` the tool escalations use, so it
    * inherits every property that map's machinery already guarantees: settled
    * exactly once, painted by whichever of the click and the send gets there,
    * judged by `refuseApprovalClick`, counted by `/status`, and cancelled when
-   * the fiber unwinds. Only the card and the words differ, and those ride the
-   * `paint` closure.
+   * the fiber unwinds. Only the card, the settled repaint and the sentences
+   * differ, and all three arrive as arguments.
+   *
+   * One function rather than one per artifact kind, because the copy proved the
+   * cost: publishing a document repeated this lifecycle line for line, dropped
+   * the paragraph on why an undecided card is not a rejection, and then drifted
+   * — the file path told the model what to do instead, the document path did
+   * not. A shared lifecycle with per-path words cannot drift that way, while
+   * the gate each caller applies stays in the caller (see {@link deliverFile}).
+   * @param input - the chat to ask, what to paint, and the words for every way
+   * this can end other than "allow".
+   * @returns undefined once the artifact may go out, or the English reason it
+   * may not.
+   */
+  const askApproval = async (input: {
+    readonly chatId: string
+    readonly chatType: string
+    readonly toolName: string
+    /** Builds the live card; the id is the button payload's own. */
+    readonly card: (id: string) => object
+    readonly paint: PendingApproval['paint']
+    /** The operator line written if nobody decides in time. */
+    readonly undecidedNotice: string
+    readonly refusals: ApprovalRefusals
+    readonly signal?: AbortSignal | undefined
+  }): Promise<string | undefined> => {
+    // Already cancelled: publishing a card here would ask a room to decide
+    // something nobody is waiting for any more.
+    if (input.signal?.aborted === true) return input.refusals.preCancelled
+    const id = randomUUID()
+    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
+    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
+    // A card nobody answers must not hold the model's turn open forever, and it
+    // is NOT a refusal: the model is told which of the two happened, because
+    // "they said no" and "nobody was looking" call for different next moves.
+    let expired = false
+    const timer = setTimeout(() => {
+      expired = true
+      notify(input.undecidedNotice)
+      settleApproval(id, 'cancelled')
+    }, QUESTION_TIMEOUT_MS)
+    timer.unref?.()
+
+    // The same shape the tool escalations use, so the settle is the one that
+    // already guarantees a question closes once and its card stops offering
+    // buttons — this path adds no judgement of its own about that.
+    const onAbort = (): void => { settleApproval(id, 'cancelled') }
+    const pending: PendingApproval = {
+      chatId: input.chatId,
+      chatType: input.chatType,
+      toolName: input.toolName,
+      paint: input.paint,
+      state: 'sending',
+      settle: resolveOutcome,
+      removeAbort: () => { input.signal?.removeEventListener('abort', onAbort) },
+    }
+    pendingApprovals.set(id, pending)
+    input.signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      if (!await sendApprovalCard(id, pending, input.card(id))) {
+        settleApproval(id, 'cancelled')
+        pendingApprovals.delete(id)
+        return input.refusals.undeliverable
+      }
+      const outcome = await settled
+      if (outcome === 'allowed-once') return undefined
+      if (expired) return input.refusals.undecided
+      if (outcome === 'rejected') return input.refusals.rejected
+      return input.refusals.withdrawn
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Ask one group to authorize one outbound file.
    * @param binding - the group chat this file would land in.
    * @param file - the file the workspace check cleared.
    * @param sending - the bytes that will go out if the room allows it, already
@@ -2205,115 +2313,58 @@ export function installBridge(
     file: OutboundFile,
     sending: Buffer,
     signal?: AbortSignal,
-  ): Promise<string | undefined> => {
-    // Already cancelled: publishing a card here would ask a room to decide
-    // something nobody is waiting for any more.
-    if (signal?.aborted === true) {
-      return 'That turn was cancelled before this chat could be asked, so the file was not sent.'
-    }
-    const id = randomUUID()
-    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
-    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
-    // A card nobody answers must not hold the model's turn open forever, and it
-    // is NOT a refusal: the model is told which of the two happened, because
-    // "they said no" and "nobody was looking" call for different next moves.
-    let expired = false
-    const timer = setTimeout(() => {
-      expired = true
-      notify(`lark-channel: a file approval in ${binding.chatId} went undecided; ${file.fileName} was not sent`)
-      settleApproval(id, 'cancelled')
-    }, QUESTION_TIMEOUT_MS)
-    timer.unref?.()
+  ): Promise<string | undefined> => await askApproval({
+    chatId: binding.chatId,
+    chatType: binding.chatType,
+    toolName: SEND_FILE_TOOL,
+    card: id => fileApprovalCard(file, sending.byteLength, id),
+    paint: (outcome, decidedBy) => settledFileCard(file, outcome, decidedBy),
+    undecidedNotice: `lark-channel: a file approval in ${binding.chatId} went undecided; `
+      + `${file.fileName} was not sent`,
+    refusals: {
+      preCancelled: 'That turn was cancelled before this chat could be asked, so the file was not sent.',
+      undeliverable: 'The approval card could not be sent to this chat, so the file was not sent either.',
+      undecided: `Nobody in this chat approved sending that file within ${TIMEOUT_MINUTES} minutes, so it was `
+        + 'not sent. It was not refused — say what the file contains in your reply instead.',
+      rejected: 'Someone in this chat rejected sending that file, so it was not sent. '
+        + 'Do not offer it again unless they ask for it.',
+      withdrawn: 'The request to send that file was withdrawn before anyone decided, so it was not sent.',
+    },
+    ...signal === undefined ? {} : { signal },
+  })
 
-    // The same shape the tool escalations use, so the settle is the one that
-    // already guarantees a question closes once and its card stops offering
-    // buttons — this path adds no judgement of its own about that.
-    const onAbort = (): void => { settleApproval(id, 'cancelled') }
-    const pending: PendingApproval = {
-      chatId: binding.chatId,
-      chatType: binding.chatType,
-      toolName: SEND_FILE_TOOL,
-      paint: (outcome, decidedBy) => settledFileCard(file, outcome, decidedBy),
-      state: 'sending',
-      settle: resolveOutcome,
-      removeAbort: () => { signal?.removeEventListener('abort', onAbort) },
-    }
-    pendingApprovals.set(id, pending)
-    signal?.addEventListener('abort', onAbort, { once: true })
-
-    try {
-      if (!await sendApprovalCard(id, pending, fileApprovalCard(file, sending.byteLength, id))) {
-        settleApproval(id, 'cancelled')
-        pendingApprovals.delete(id)
-        return 'The approval card could not be sent to this chat, so the file was not sent either.'
-      }
-      const outcome = await settled
-      if (outcome === 'allowed-once') return undefined
-      if (expired) {
-        return `Nobody in this chat approved sending that file within ${TIMEOUT_MINUTES} minutes, so it was `
-          + 'not sent. It was not refused — say what the file contains in your reply instead.'
-      }
-      if (outcome === 'rejected') {
-        return 'Someone in this chat rejected sending that file, so it was not sent. '
-          + 'Do not offer it again unless they ask for it.'
-      }
-      return 'The request to send that file was withdrawn before anyone decided, so it was not sent.'
-    } finally {
-      clearTimeout(timer)
-    }
-  }
-
-  /** Ask a group before creating a document whose audience will be that group. */
+  /**
+   * Ask a group before creating a document whose audience will be that group.
+   * @param binding - the chat that would become the document's audience.
+   * @param title - the title the card shows and the document will carry.
+   * @param signal - the calling execution's cancellation.
+   * @returns undefined once it may be created, or the English reason it was not.
+   */
   const askDocumentPublish = async (
     binding: Pick<ChatBinding, 'chatId' | 'chatType'>,
     title: string,
     signal?: AbortSignal,
-  ): Promise<string | undefined> => {
-    if (signal?.aborted === true) {
-      return 'That turn was cancelled before this chat could approve publishing the document, so it was not created.'
-    }
-    const id = randomUUID()
-    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
-    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
-    let expired = false
-    const timer = setTimeout(() => {
-      expired = true
-      notify(`lark-channel: a document approval in ${binding.chatId} went undecided; ${title} was not created`)
-      settleApproval(id, 'cancelled')
-    }, QUESTION_TIMEOUT_MS)
-    timer.unref?.()
-    const onAbort = (): void => { settleApproval(id, 'cancelled') }
-    const pending: PendingApproval = {
-      chatId: binding.chatId,
-      chatType: binding.chatType,
-      toolName: SEND_DOC_TOOL,
-      paint: (outcome, decidedBy) => settledDocumentPublishCard(title, outcome, decidedBy),
-      state: 'sending',
-      settle: resolveOutcome,
-      removeAbort: () => { signal?.removeEventListener('abort', onAbort) },
-    }
-    pendingApprovals.set(id, pending)
-    signal?.addEventListener('abort', onAbort, { once: true })
-    try {
-      if (!await sendApprovalCard(id, pending, documentPublishApprovalCard(title, binding.chatId, id))) {
-        settleApproval(id, 'cancelled')
-        pendingApprovals.delete(id)
-        return 'The approval card could not be sent, so the document was not created.'
-      }
-      const outcome = await settled
-      if (outcome === 'allowed-once') return undefined
-      if (expired) {
-        return `Nobody in this chat approved publishing that document within ${TIMEOUT_MINUTES} minutes, so it was not created.`
-      }
-      if (outcome === 'rejected') {
-        return 'Someone in this chat rejected publishing that document, so it was not created. '
-          + 'Do not offer it again unless they ask for it.'
-      }
-      return 'The request to publish that document was withdrawn before anyone decided, so it was not created.'
-    } finally {
-      clearTimeout(timer)
-    }
-  }
+  ): Promise<string | undefined> => await askApproval({
+    chatId: binding.chatId,
+    chatType: binding.chatType,
+    toolName: SEND_DOC_TOOL,
+    card: id => documentPublishApprovalCard(title, binding.chatId, id),
+    paint: (outcome, decidedBy) => settledDocumentPublishCard(title, outcome, decidedBy),
+    undecidedNotice: `lark-channel: a document approval in ${binding.chatId} went undecided; `
+      + `${title} was not created`,
+    refusals: {
+      preCancelled: 'That turn was cancelled before this chat could approve publishing the document, '
+        + 'so it was not created.',
+      undeliverable: 'The approval card could not be sent, so the document was not created.',
+      undecided: `Nobody in this chat approved publishing that document within ${TIMEOUT_MINUTES} minutes, so it `
+        + 'was not created. It was not refused — put what you wanted to publish in your reply instead.',
+      rejected: 'Someone in this chat rejected publishing that document, so it was not created. '
+        + 'Do not offer it again unless they ask for it.',
+      withdrawn: 'The request to publish that document was withdrawn before anyone decided, '
+        + 'so it was not created.',
+    },
+    ...signal === undefined ? {} : { signal },
+  })
 
   /** Facts shared by a bound agent and the human-owned `/put` command. */
   interface DocumentChatTarget {
@@ -2327,32 +2378,42 @@ export function installBridge(
    * Create/append one frozen artifact, set the ADR 0008 audience, and report the
    * real result to the same chat. A permission-member failure is partial
    * success: the document already exists, so its link must survive.
+   *
+   * NO gate lives here, and none may be added: this is what the model's row and
+   * the human's row of the matrix genuinely share, and a `gateGroup: boolean`
+   * parameter is the shape {@link deliverFile} names as "exactly how it would
+   * drift" — a call site reading `false,` says nothing about whose intent it
+   * carries. The two rows are two functions instead: {@link deliverDocument}
+   * asks the room first, {@link publishDocumentForHuman} asks nobody.
    */
-  const publishDocumentToChat = async (
+  const writeDocumentToChat = async (
     binding: DocumentChatTarget,
     artifact: LarkDocumentArtifact,
     target: LarkDocumentTarget | undefined,
-    gateGroup: boolean,
     signal?: AbortSignal,
   ): Promise<PublishedLarkDocument> => {
     signal?.throwIfAborted()
-    if (target === undefined && gateGroup && binding.chatType !== 'p2p') {
-      const refused = await askDocumentPublish(binding, artifact.title, signal)
-      if (refused !== undefined) throw new Error(refused)
-      signal?.throwIfAborted()
-    }
-
     let written
     try {
       signal?.throwIfAborted()
+      // No cancellation check after this returns: the write has landed, and
+      // rethrowing here reported a real append as `failed: turn stopped`, which
+      // is the one message that makes a person send the same content twice.
       written = target === undefined
         ? await createLarkDocument(port, artifact.title, artifact.content, {
             brand: documentBrand,
             ...signal === undefined ? {} : { signal },
           })
         : await appendLarkDocument(port, target, artifact.title, artifact.content, signal)
-      signal?.throwIfAborted()
     } catch (error) {
+      if (signal?.aborted === true) {
+        // Cancelled with the request already on the wire: whether the platform
+        // applied it cannot be known from here, and a stop is not a tenant
+        // permission problem, so the capability table stays untouched.
+        notify(`lark-channel: writing document ${artifact.title} was cancelled in flight; whether the platform `
+          + 'applied it is unknown, so check the document before sending the same content again')
+        throw error
+      }
       await correctDocumentCapabilityFailure('write', error, binding.chatId).catch((correctionError: unknown) => {
         notify(`lark-channel: correcting document write capability failed: ${failureDetail(correctionError)}`)
       })
@@ -2368,26 +2429,51 @@ export function installBridge(
       try {
         signal?.throwIfAborted()
         await grantLarkDocumentReader(port, written.fileToken, member, signal)
-        signal?.throwIfAborted()
       } catch (error) {
-        // Cancellation is not a permission failure and must not continue to a
-        // misleading receipt after a document-side effect.
-        signal?.throwIfAborted()
-        await correctDocumentCapabilityFailure('write', error, binding.chatId).catch((correctionError: unknown) => {
-          notify(`lark-channel: correcting document write capability failed: ${failureDetail(correctionError)}`)
-        })
-        warning = `添加文档协作者失败（${describeLarkDocumentFailure(error)}）；只有机器人能打开，请手动共享。`
-        notify(`lark-channel: document ${written.url} exists but granting ${member.type} ${member.id} failed: `
-          + describeLarkDocumentFailure(error))
+        // The trace comes FIRST, before any decision about cancellation. What
+        // exists now is a real document holding a workspace artifact that only
+        // the bot can open, so this line is the only record of it anywhere —
+        // rethrowing the cancellation ahead of it (as this catch used to) left
+        // the orphan nameless on the platform and the console silent, against
+        // design §12. Naming the token is what lets an operator deal with it.
+        notify(`lark-channel: document ${written.fileToken} (${written.url}) exists but granting `
+          + `${member.type} ${member.id} failed: ${describeLarkDocumentFailure(error)}; only the bot can open it, `
+          + `so it cannot be shared by hand — the same content is still at ${artifact.file.pathInWorkspace} `
+          + `in workspace ${artifact.file.workspaceName}`)
+        // A stopped turn is not a tenant permission problem: correcting the
+        // capability table here would take a capability away over a local stop.
+        if (signal?.aborted !== true) {
+          await correctDocumentCapabilityFailure('write', error, binding.chatId).catch((correctionError: unknown) => {
+            notify(`lark-channel: correcting document write capability failed: ${failureDetail(correctionError)}`)
+          })
+        }
+        // Not "please share it by hand": measured against a real tenant, the
+        // page a person reaches is "no access, you may request it from DSH
+        // Agent", and the approver is the bot itself, so that request is never
+        // answered. Sharing requires opening the document first, which is
+        // exactly what nobody but the bot can do. Publishing again is the one
+        // instruction that can actually be carried out.
+        warning = `添加文档协作者失败（${describeLarkDocumentFailure(error)}）：这篇文档现在只有机器人能打开，`
+          + `你无法自行共享它（共享的前提是先能打开）。同样的内容仍在工作区 ${artifact.file.pathInWorkspace}，`
+          + `权限恢复后重新发布一次即可，无需从飞书里找回；这篇的 token ${written.fileToken} 已写入操作台。`
       }
     }
 
     const scope = written.appended
       ? '已追加到已有文档，原可见范围不变'
       : binding.chatType === 'p2p' ? '仅发起人可读' : '这个群可读'
+    // A cancellation arriving here no longer skips the receipt. The write has
+    // landed; the person who stopped the turn is the one who would otherwise
+    // send the same content again, and the operator console alone does not
+    // reach them. Silence here was how an append that worked got resent.
+    const stopped = signal?.aborted === true
+    if (stopped) {
+      notify(`lark-channel: this turn was cancelled after ${written.appended ? 'appending to' : 'creating'} `
+        + `document ${written.fileToken} (${written.url}); the write did land, so the same content must not be resent`)
+    }
     const message = `${written.appended ? '📄 已追加' : '📄 已发布'}《${artifact.title}》，${scope}：${written.url}`
+      + `${stopped ? '\n⏹ 这一轮已被取消，但上面这次写入已经生效，不要重发。' : ''}`
       + `${warning === undefined ? '' : `\n⚠️ ${warning}`}`
-    signal?.throwIfAborted()
     let receiptWarning: string | undefined
     await port.send(binding.chatId, { markdown: message }, replyOptions(binding.replyTarget)).catch((error: unknown) => {
       reportSendFailure(error)
@@ -2402,7 +2488,20 @@ export function installBridge(
     }
   }
 
-  /** Publish from a model only to the chat already bound to its session. */
+  /**
+   * Publish from a MODEL, only to the chat already bound to its session.
+   *
+   * This is the model's row, and the group gate is part of it rather than a flag
+   * handed to a shared function: creating a document in a group mints a NEW
+   * audience out of a turn the room did not type, which is the escalation ADR
+   * 0008 asks a human about. Appending is not gated here — that decision, and
+   * why, is recorded in ADR 0008's consequences.
+   * @param sessionId - the agent's session, which names the chat.
+   * @param artifact - the frozen workspace content to publish.
+   * @param target - an already-read document to append to, or undefined to create.
+   * @param signal - the calling execution's cancellation, which also takes down
+   * a group approval still waiting on a human.
+   */
   const deliverDocument = async (
     sessionId: string,
     artifact: LarkDocumentArtifact,
@@ -2411,13 +2510,38 @@ export function installBridge(
   ): Promise<PublishedLarkDocument> => {
     const binding = bySession.get(sessionId)
     if (binding === undefined) throw new Error('This session is no longer bound to a chat, so the document has nowhere to go.')
-    return publishDocumentToChat({
+    signal?.throwIfAborted()
+    if (target === undefined && binding.chatType !== 'p2p') {
+      const refused = await askDocumentPublish(binding, artifact.title, signal)
+      if (refused !== undefined) throw new Error(refused)
+    }
+    return await writeDocumentToChat({
       chatId: binding.chatId,
       chatType: binding.chatType,
       senderId: binding.senderId,
       replyTarget: aimBySession.get(sessionId),
-    }, artifact, target, true, signal)
+    }, artifact, target, signal)
   }
+
+  /**
+   * Publish for a HUMAN who typed `/put`, with no card.
+   *
+   * This is the human's row. A person who typed a path and a target has stated
+   * his intent, and making him approve his own command is theatre — the same
+   * reason `/get` does not run through {@link deliverFile}. Separate from
+   * {@link deliverDocument} so neither row can acquire the other's gate by
+   * having a boolean flipped at one call site.
+   * @param binding - the chat the command was typed in.
+   * @param artifact - the frozen workspace content to publish.
+   * @param target - an explicit `--into` document, or undefined to create.
+   * @param signal - the command's cancellation.
+   */
+  const publishDocumentForHuman = async (
+    binding: DocumentChatTarget,
+    artifact: LarkDocumentArtifact,
+    target: LarkDocumentTarget | undefined,
+    signal?: AbortSignal,
+  ): Promise<PublishedLarkDocument> => await writeDocumentToChat(binding, artifact, target, signal)
 
   /**
    * Claim one of a chat's outbound-content slots.
@@ -2449,8 +2573,7 @@ export function installBridge(
     if (binding === undefined) throw new Error('This session is no longer bound to a chat, so there is nowhere to publish.')
     if (binding.chatType === 'p2p') return operation()
     if (!holdOutboundSend(binding.chatId)) {
-      throw new Error(`This chat already has ${MAX_PENDING_OUTBOUND_SENDS} outbound artifacts waiting to finish, so this `
-        + 'one was not read. Wait until those are decided before publishing another artifact.')
+      throw new Error(OUTBOUND_SLOTS_FULL)
     }
     try {
       return await operation()
@@ -2567,8 +2690,7 @@ export function installBridge(
     if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
     if (binding.chatType === 'p2p') return offerFile(binding, sessionId, file, signal)
     if (!holdOutboundSend(binding.chatId)) {
-      return `This chat already has ${MAX_PENDING_OUTBOUND_SENDS} files waiting for someone to allow them, so this `
-        + 'one was not offered. Wait until those are decided before offering another file.'
+      return OUTBOUND_SLOTS_FULL
     }
     try {
       return await offerFile(binding, sessionId, file, signal)

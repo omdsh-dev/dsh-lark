@@ -405,7 +405,7 @@ describe('document comment protocol', () => {
     expect(stage.fake.documentRequests).toHaveLength(21)
   })
 
-  it('does not spend quota on pre-request cancellation or validation, but spends it once a deferred request starts', async () => {
+  it('spends quota only once a request starts, and never calls a landed comment a failure', async () => {
     const stage = directStage(1)
     stage.readDocuments.remember('session-a', 'doc_1')
     stage.quotas.beginTurn('session-a', 1)
@@ -435,7 +435,12 @@ describe('document comment protocol', () => {
     expect(sent.fake.documentRequests[0]!.signal).toBe(controller.signal)
     controller.abort(new Error('cancelled after comment request started'))
     response.resolve({ code: 0, data: { comment_id: 'too_late' } })
-    await expect(commenting).rejects.toThrow(/cancelled after comment request started/)
+    // The comment exists on the platform. Reporting a landed comment as failed
+    // sends the model back to write the same note, and the platform keeps both,
+    // so the stop is closed by naming what landed instead (design §12).
+    await expect(commenting).resolves.toMatchObject({ commented: true, comment_id: 'too_late' })
+    expect(sent.reports.some(line => line.includes('too_late') && line.includes('the comment did land'))).toBe(true)
+    expect(sent.reports.some(line => line.includes('failed'))).toBe(false)
     await expect(sentTool.execute(args, sent.exec)).rejects.toThrow(/quota is exhausted.*1\/1/s)
     expect(sent.fake.documentRequests).toHaveLength(1)
   })

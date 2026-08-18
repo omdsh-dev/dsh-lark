@@ -1062,7 +1062,7 @@ describe('dsh-lark-channel', () => {
 
       // The fourth is refused on the spot instead of pinning a fourth buffer,
       // and the room is not asked a fourth time.
-      expect(String(await offer())).toMatch(/already has 3 files waiting/)
+      expect(String(await offer())).toMatch(/already has 3 outbound artifacts/)
       expect(cardsSent(harness)).toHaveLength(3)
 
       // A decision hands the slot back: the ceiling is on files waiting, not on
