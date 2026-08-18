@@ -1715,7 +1715,18 @@ export function installBridge(
         const subject = subjectOf(msg)
         let reply: { markdown: string } | { card: object }
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
-          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
+          // /cd promises the next message continues in the new directory. An
+          // explicit /session override would otherwise keep routing to the
+          // bound session, which lives in the OLD directory, so a successful
+          // switch clears the binding first — symmetric to /new. The wrapper
+          // is only invoked when the switch actually changed the directory
+          // (runWorkspaceCommand calls onSwitched exactly then), so a no-op
+          // /cd and a plain /ws listing keep any binding intact.
+          const cdRelease = async (): Promise<void> => {
+            await chatSessionOverrides.set(key, undefined)
+            await release()
+          }
+          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, cdRelease) }
         } else if (channelCommand === NEW_COMMAND) {
           // /new promises a fresh context. An explicit /session override would
           // otherwise shadow the new epoch and resume the old session, so the

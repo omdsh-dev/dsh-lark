@@ -1490,6 +1490,28 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('clears a session override when /cd switches to another directory', async () => {
+      const fake = createFakeSettings()
+      const harness = await mountChannel(
+        {
+          cwd: '/workspace/运维',
+          workspaceRoots: ['/workspace'],
+          chatWorkspaces: { 'oc_chat_1': '/workspace/运维' },
+          chatSessions: { 'oc_chat_1': 'session-bound' },
+        },
+        { settings: fake.settings },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: '/cd /workspace/tools' }))
+      // A successful directory switch unbinds, or the next message would keep
+      // routing to the bound session that lives in the old directory.
+      await vi.waitFor(() => {
+        expect(fake.updates.some((patch) =>
+          (patch as { chatSessions?: Record<string, string> }).chatSessions?.['oc_chat_1'] === '__reset__',
+        )).toBe(true)
+      })
+      await harness.dispose()
+    })
+
     it('clears a session override when /new starts over, so the epoch is not shadowed', async () => {
       const fake = createFakeSettings()
       const harness = await mountChannel(

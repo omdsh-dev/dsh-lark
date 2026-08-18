@@ -124,5 +124,5 @@ export async function runNewCommand(
   const result = await epochs.startNew(baseId)
   await release()
   const durability = result.durable ? '' : '\n（本部署未组合 settings，重启后会回到上一个会话。）'
-  return '🤖 已开新会话，下一条消息从空白上下文开始。\n之前的记录仍在，工作区和模型设置不变。' + durability
+  return '🤖 已开新会话，下一条消息从空白上下文开始。\n已解除会话绑定，回到自动路由；之前的记录仍在，工作区和模型设置不变。' + durability
 }
