@@ -561,6 +561,19 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
  * @param sendFiles - how an artifact reaches this agent's chat, when it may.
  * @param self - the bot account this agent speaks as.
  */
+/**
+ * The agent a composition's scope was extended with.
+ *
+ * The host agent factory builds `agent.ctx = scope.ctx.extend({ agent })`
+ * (dsh-agent-loop), so the context a `setup` receives always names its agent
+ * on the `.agent` property. Cordis' `Context` type does not declare that
+ * property, which is why the cast crosses `unknown` — the runtime invariant is
+ * the host factory's own construction, not this channel's assumption.
+ */
+function agentOf(agentCtx: Context): HostAgent {
+  return (agentCtx as unknown as { agent: HostAgent }).agent
+}
+
 function composeChatAgent(
   agentCtx: Context,
   config: ResolvedConfig,
@@ -1044,7 +1057,7 @@ export function installBridge(
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
         // The agent is now fully composed; a later live reuse must not run
         // this again, or the shadow tools and prompt section double-register.
-        chatComposed.add((agentCtx as unknown as { agent: HostAgent }).agent)
+        chatComposed.add(agentOf(agentCtx))
       },
     }
   }
@@ -1073,11 +1086,26 @@ export function installBridge(
 
   /**
    * A chat reusing a live agent skips the create/resume setup that registers
-   * this channel's shadow tools — most visibly a session the Web UI created,
-   * which stays live and lets `ask_user_question` fall through to whichever
-   * surface claimed the single user-questions provider instead of becoming a
-   * chat card. Compose the chat-only parts on first reuse; the preset join is
-   * deliberately skipped because the live agent already has one.
+   * this channel's shadow tools — most visibly an agent another owner (such
+   * as the Web UI) keeps live. Without this, `ask_user_question` falls
+   * through to whichever surface claimed the single user-questions provider
+   * instead of becoming a chat card.
+   *
+   * Compose the chat-only parts on first reuse: the shadow tools, the denial
+   * guard, and the presence prompt section. The preset join is deliberately
+   * skipped: `presets.mount` is contracted to run from the agent factory's
+   * `setup` (see `HostAgentPresets.mount`), and this agent already joined its
+   * owner's preset — re-mounting this channel's roster over a composition the
+   * channel does not own is outside that contract.
+   *
+   * That ownership is also why the side effects stay additive and reversible:
+   * every registration lives on the agent's own scope and vanishes when its
+   * owner disposes the agent; nothing here takes the agent down, binds it to
+   * this chat, or changes who owns its lifecycle. An agent whose scope can
+   * shadow keeps its cards; one that cannot is denied the host GUI-only tool
+   * instead of being left to ask where nobody is watching — the same rule
+   * create/resume compose, applied to a reuse the ladder owns no more than
+   * the borrowed agent itself.
    * @param agent - the live agent being reused by a chat.
    */
   const ensureChatComposed = (agent: HostAgent): void => {
@@ -1098,7 +1126,8 @@ export function installBridge(
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
       // An agent another owner published is theirs to dispose, but it still
-      // runs for this chat, so its composition is completed here.
+      // runs for this chat, so the chat-only parts of its composition are
+      // completed here — once, and never at the cost of the message.
       if (agent !== undefined) ensureChatComposed(agent)
       return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
     },

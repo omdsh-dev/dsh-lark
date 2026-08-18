@@ -477,6 +477,51 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('composes a live agent another owner published, so questions stay cards', async () => {
+      const harness = await mountChannel()
+      const adopted = harness.agents.declareLiveWithScope('lark-oc_chat_1')
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(adopted.agent.followup).toHaveBeenCalledTimes(1) })
+      // The ladder reuses the live agent — no rung is walked, and its owner
+      // still owns its disposal…
+      expect(harness.agents.resumed).toEqual([])
+      expect(harness.agents.created).toHaveLength(0)
+      // …but the reuse completes the chat-only composition: the question tool
+      // is shadowed (a card, not the GUI), and the agent is told where it woke
+      // up, exactly as a created or resumed chat agent is.
+      expect(adopted.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
+      const presence = adopted.promptSections.find((s) => s.name === 'lark-channel:presence')
+      expect(presence?.text).toContain('Your reply IS the message')
+      await harness.dispose()
+    })
+
+    it('composes a reused live agent exactly once', async () => {
+      const harness = await mountChannel()
+      const adopted = harness.agents.declareLiveWithScope('lark-oc_chat_1')
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(adopted.agent.followup).toHaveBeenCalledTimes(1) })
+      const registered = adopted.registeredTools.length
+      expect(registered).toBeGreaterThan(0)
+      // A second message reuses the same live agent again; the composition is
+      // idempotent, so nothing double-registers.
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_in_2' }))
+      await vi.waitFor(() => { expect(adopted.agent.followup).toHaveBeenCalledTimes(2) })
+      expect(adopted.registeredTools.length).toBe(registered)
+      await harness.dispose()
+    })
+
+    it('a failed live-reuse composition does not drop the message', async () => {
+      const harness = await mountChannel()
+      const adopted = harness.agents.declareLiveWithScope('lark-oc_chat_1', { failRegister: true })
+      await harness.fake.emitMessage(fakeMessage())
+      // The registration throws inside the reuse composition; the fallback
+      // reports it to the operator and the message still reaches the borrowed
+      // agent — reuse never costs the conversation.
+      await vi.waitFor(() => { expect(adopted.agent.followup).toHaveBeenCalledTimes(1) })
+      expect(harness.notices.some((line) => line.includes('composing a reused live agent failed'))).toBe(true)
+      await harness.dispose()
+    })
+
     it('honours a configured deny list', async () => {
       const harness = await mountChannel({ denyTools: ['web_search'] })
       const created = await firstAgent(harness)

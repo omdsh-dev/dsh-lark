@@ -605,6 +605,54 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       live.set(sessionId, agent)
       return agent
     },
+    /**
+     * Declare one id already live under another owner, with a tools-capable
+     * scope that records what a live-reuse composition registers — the shape
+     * tests of the reuse fallback need. The bare {@link declareLive} agent
+     * carries no tools, which exercises the safe-degradation path; this one
+     * exercises the registration path.
+     * @param sessionId - the session id to declare live.
+     * @param failRegister - make the scope's tool registry reject every
+     * registration, to exercise the reuse-failure fallback.
+     */
+    declareLiveWithScope(
+      sessionId: string,
+      options: { failRegister?: boolean } = {},
+    ): {
+      agent: CreatedAgent['agent']
+      registeredTools: { name: string }[]
+      promptSections: { name: string; order: number; text: string }[]
+      denyReason: (name: string) => string | undefined
+    } {
+      const agent = makeAgent(sessionId)
+      const guards: ((execution: { name: string }) => string | undefined)[] = []
+      const sections: { name: string; order: number; text: string }[] = []
+      const registered: { name: string }[] = []
+      const ctx = new Context()
+      ctx.provide('tools', {
+        guard: (g: (e: { name: string }) => string | undefined) => {
+          guards.push(g)
+          return () => { guards.splice(guards.indexOf(g), 1) }
+        },
+        register: (definition: { name: string }) => {
+          if (options.failRegister === true) throw new Error('registry rejects (fake)')
+          registered.push(definition)
+          return () => { registered.splice(registered.indexOf(definition), 1) }
+        },
+      })
+      ctx.provide('systemPrompt', { section: (s: { name: string; order: number; text: string }) => {
+        sections.push(s)
+        return () => undefined
+      } })
+      agent.ctx = ctx
+      live.set(sessionId, agent)
+      return {
+        agent,
+        registeredTools: registered,
+        promptSections: sections,
+        denyReason: (name: string) => guards.map(g => g({ name })).find(r => r !== undefined),
+      }
+    },
   }
 }
 
