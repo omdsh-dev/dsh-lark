@@ -1490,6 +1490,24 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('clears a session override when /new starts over, so the epoch is not shadowed', async () => {
+      const fake = createFakeSettings()
+      const harness = await mountChannel(
+        { chatSessions: { 'oc_chat_1': 'session-bound' } },
+        { settings: fake.settings },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      // /new unbinds first: the override is cleared and persisted as the
+      // reset marker, or the next message would resume the bound session
+      // instead of the fresh epoch it promises.
+      await vi.waitFor(() => {
+        expect(fake.updates.some((patch) =>
+          (patch as { chatSessions?: Record<string, string> }).chatSessions?.['oc_chat_1'] === '__reset__',
+        )).toBe(true)
+      })
+      await harness.dispose()
+    })
+
     it('names an unknown command instead of feeding it to the model', async () => {
       const commands = createFakeCommands()
       const harness = await mountChannel({}, { commands: commands.service })

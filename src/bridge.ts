@@ -1717,6 +1717,11 @@ export function installBridge(
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
         } else if (channelCommand === NEW_COMMAND) {
+          // /new promises a fresh context. An explicit /session override would
+          // otherwise shadow the new epoch and resume the old session, so the
+          // binding is cleared first — /new on a bound chat means "unbind and
+          // start over", which is what the command's copy promises.
+          await chatSessionOverrides.set(key, undefined)
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
         } else if (channelCommand === SESSION_COMMAND) {
           const currentId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
