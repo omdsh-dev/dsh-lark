@@ -29,6 +29,8 @@ import type {
   HostUserMessage,
 } from '../src/host.ts'
 import type { RegisterAppPort } from '../src/onboarding.ts'
+import { LARK_DOC_SCOPE_REQUIREMENTS } from '../src/larkdocs.ts'
+import type { LarkScopeGrant, LarkScopeListResponse } from '../src/larkdocs.ts'
 
 /**
  * How many inbound subscriptions `installBridge` opens: `message`,
@@ -121,9 +123,39 @@ export function createFakePort() {
     failCotWrite: false,
     /** Reject roster reads, as an app without member-list permission would. */
     failChatMembers: false,
+    /** Reject the startup capability probe as a network failure. */
+    failScopeList: false,
+    scopeLists: 0,
     /** Reject repaints, as a message too old to edit does. */
     failCardUpdate: false,
   }
+  const scopeGrants: LarkScopeGrant[] = [...new Set(Object.values(LARK_DOC_SCOPE_REQUIREMENTS).flatMap(item => item.scopes))]
+    .map(scopeName => ({ scope_name: scopeName, grant_status: 1, scope_type: 'tenant' as const }))
+  const scopeList = {
+    run: async (): Promise<LarkScopeListResponse> => {
+      if (state.failScopeList) throw new Error('cannot list scopes (fake)')
+      return { code: 0, data: { scopes: scopeGrants } }
+    },
+  }
+  /** Untyped document protocol fixtures and exact calls made against them. */
+  const documentResponses = new Map<string, unknown>()
+  const documentWriteResponses = new Map<string, unknown>()
+  const documentRequests: {
+    method: string
+    url: string
+    data?: unknown
+    params?: unknown
+    signal?: AbortSignal
+  }[] = []
+  const permissionResponses = new Map<string, unknown>()
+  const permissionRequests: {
+    data: { member_type: 'openid' | 'openchat'; member_id: string; perm: 'view' }
+    params: { type: 'docx'; need_notification?: boolean }
+    path: { token: string }
+  }[] = []
+  /** Typed wiki-node fixtures and payloads, kept separate from docs_ai. */
+  const wikiResponses = new Map<string, unknown>()
+  const wikiRequests: { params: { token: string } }[] = []
   let counter = 0
 
   /**
@@ -155,6 +187,29 @@ export function createFakePort() {
   }
 
   const port: ChannelPort = {
+    rawClient: {
+      application: { v6: { scope: { list: async () => {
+        state.scopeLists += 1
+        return scopeList.run()
+      } } } },
+      wiki: { v2: { space: { getNode: async (payload) => {
+        wikiRequests.push(payload)
+        const response = wikiResponses.get(payload.params.token)
+        return (response ?? { code: 404, msg: `no such wiki node ${payload.params.token} (fake)` }) as never
+      } } } },
+      drive: { v1: { permissionMember: { create: async (payload) => {
+        permissionRequests.push(payload)
+        return (permissionResponses.get(payload.path.token) ?? { code: 0, msg: 'ok' }) as never
+      } } } },
+      request: async (request) => {
+        documentRequests.push(request)
+        const exact = documentWriteResponses.get(`${request.method} ${request.url}`)
+        if (exact !== undefined) return exact
+        const token = /\/documents\/([^/]+)\/fetch$/u.exec(request.url)?.[1]
+        const response = token === undefined ? undefined : documentResponses.get(decodeURIComponent(token))
+        return response ?? { code: 404, msg: `no document fixture for ${request.url} (fake)` }
+      },
+    },
     async connect() { state.connects += 1 },
     async disconnect() { state.disconnects += 1 },
     async getChatMembers(chatId) {
@@ -273,6 +328,15 @@ export function createFakePort() {
     downloads,
     cots,
     state,
+    scopeGrants,
+    scopeList,
+    documentResponses,
+    documentWriteResponses,
+    documentRequests,
+    permissionResponses,
+    permissionRequests,
+    wikiResponses,
+    wikiRequests,
     gates,
     /** Deliver one inbound chat message to every subscribed handler. */
     async emitMessage(msg: NormalizedMessage): Promise<void> {
@@ -642,6 +706,12 @@ export async function mountChannel(
     agentsCanRegisterTools?: boolean
     /** The `credentials` seam the app secret is stored behind. */
     credentials?: object
+    /** Tenant grants returned by the startup document-capability probe. */
+    scopeGrants?: readonly LarkScopeGrant[]
+    /** Override the startup/recheck scope endpoint, including deferred probes. */
+    scopeList?: () => Promise<LarkScopeListResponse>
+    /** Small capability deadline for timeout lifecycle tests. */
+    capabilityDeadlineMs?: number
   } = {},
 ) {
   const ctx = new Context()
@@ -678,11 +748,14 @@ export async function mountChannel(
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
+  if (services.scopeGrants !== undefined) fake.scopeGrants.splice(0, fake.scopeGrants.length, ...services.scopeGrants)
+  if (services.scopeList !== undefined) fake.scopeList.run = services.scopeList
   const portConfigs: ChannelConfig[] = []
   const notices: string[] = []
   const originalCreatePort = internals.createPort
   const originalRegisterApp = internals.registerApp
   const originalNotify = internals.notify
+  const originalCapabilityDeadlineMs = internals.capabilityDeadlineMs
   const portAuthorizations: {
     directSenders: string[]
     groups: string[]
@@ -702,6 +775,8 @@ export async function mountChannel(
   internals.notify = (line) => { notices.push(line) }
   // A re-issued QR code waits out the production floor, which a test must not.
   internals.reissueFloorMs = 0
+  if (services.capabilityDeadlineMs === undefined) delete internals.capabilityDeadlineMs
+  else internals.capabilityDeadlineMs = services.capabilityDeadlineMs
   const merged = {
     appId: 'cli_test',
     appSecret: 'test-secret',
@@ -715,6 +790,7 @@ export async function mountChannel(
   if (merged.appId !== undefined && merged.appSecret !== undefined && services.settings === undefined) {
     await vi.waitFor(() => {
       if (fake.state.subscriptions !== INBOUND_SUBSCRIPTIONS) throw new Error('bridge not subscribed yet')
+      if (fake.state.scopeLists !== 1) throw new Error('document capability probe not completed yet')
     })
   }
   return {
@@ -733,6 +809,8 @@ export async function mountChannel(
         internals.createPort = originalCreatePort
         internals.registerApp = originalRegisterApp
         internals.notify = originalNotify
+        if (originalCapabilityDeadlineMs === undefined) delete internals.capabilityDeadlineMs
+        else internals.capabilityDeadlineMs = originalCapabilityDeadlineMs
         delete internals.reissueFloorMs
       }
     },

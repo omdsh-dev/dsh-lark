@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
   approvalCard,
+  documentAuthorizationCard,
+  documentAuthorizationResultCard,
+  documentPublishApprovalCard,
   fileApprovalCard,
   modelCard,
   permissionCard,
   questionCard,
   settledApprovalCard,
   settledFileApprovalCard,
+  settledDocumentPublishApprovalCard,
   settledPermissionCard,
   settledQuestionCard,
   statusCard,
@@ -56,6 +60,20 @@ describe('approval card', () => {
     const named = cardTexts(card).filter((text) => text.content.includes(HOSTILE))
     expect(named).toHaveLength(1)
     expect(named[0]!.tag).toBe('plain_text')
+  })
+})
+
+describe('document authorization card', () => {
+  it('shows the exact scopes and opens the platform URL without a callback payload', () => {
+    const card = documentAuthorizationCard({
+      scopes: ['docx:document:readonly', 'wiki:node:read'],
+      url: 'https://accounts.example/authorize',
+      exposed: false,
+    })
+    expect(cardTexts(card).map(text => text.content)).toContain('docx:document:readonly\nwiki:node:read')
+    expect(JSON.stringify(card)).toContain('"type":"open_url"')
+    expect(JSON.stringify(card)).toContain('https://accounts.example/authorize')
+    expect(cardControls(card)).toHaveLength(0)
   })
 })
 
@@ -180,6 +198,24 @@ describe('file approval card', () => {
   })
 })
 
+describe('document publication approval card', () => {
+  it('shows the title and exact audience, with publish-specific decisions', () => {
+    const card = documentPublishApprovalCard({
+      title: 'Incident report',
+      visibleTo: '当前群（oc_group_1）',
+      allow: { decision: 'allow' },
+      reject: { decision: 'reject' },
+    })
+    const text = cardTexts(card).map(item => item.content)
+    expect(text).toContain('Incident report')
+    expect(text).toContain('当前群（oc_group_1）')
+    expect(cardControls(card).map(control => control.label)).toEqual(['允许发布', '拒绝'])
+    expect(cardControls(settledDocumentPublishApprovalCard({
+      title: 'Incident report', outcome: 'allowed-once', decidedBy: 'Alex',
+    }))).toHaveLength(0)
+  })
+})
+
 describe('question card', () => {
   it('lays bare labels out as buttons, and explained options as rows', () => {
     const bare = questionCard({
@@ -246,6 +282,22 @@ describe('localization', () => {
     fileApprovalCard({ path: 'x'.repeat(900), workspace: 'w', bytes: 0, allow: {}, reject: {} }),
     settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'allowed-once', decidedBy: 'Alex' }),
     settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'rejected' }),
+    documentPublishApprovalCard({ title: 'report', visibleTo: 'group-1', allow: {}, reject: {} }),
+    settledDocumentPublishApprovalCard({ title: 'report', outcome: 'allowed-once', decidedBy: 'Alex' }),
+    documentAuthorizationCard({ scopes: ['docx:document:readonly'], url: 'https://example.test', exposed: false }),
+    documentAuthorizationCard({ scopes: ['docx:document:readonly'], url: 'https://example.test', exposed: true }),
+    documentAuthorizationResultCard({
+      outcome: 'changed',
+      capabilities: { zh: '读 ✓', en: 'read ✓' },
+    }),
+    documentAuthorizationResultCard({
+      outcome: 'unchanged',
+      capabilities: { zh: '读 ✗', en: 'read ✗' },
+    }),
+    documentAuthorizationResultCard({
+      outcome: 'failed',
+      capabilities: { zh: '读 ✗', en: 'read ✗' },
+    }),
     questionCard({ question: 'go on?', options: [{ label: 'yes' }], valueFor: () => ({}) }),
     questionCard({ question: 'go on?', options: [], valueFor: () => ({}) }),
     settledQuestionCard({ question: 'go on?', answer: 'yes' }),
@@ -280,6 +332,7 @@ describe('localization', () => {
       activity: 'running',
       pendingApprovals: 2,
       version: '0.0.6',
+      documentCapabilities: { zh: '读 ✓　写 ✓　评论 ✓', en: 'read ✓  write ✓  comment ✓' },
       preset: { value: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
       context: { used: 1000, window: 128000 },
       usage: { input: 10, output: 5, cacheRead: 1, cacheWrite: 2 },
@@ -355,6 +408,10 @@ describe('card foundation', () => {
       settledApprovalCard({ toolName: 'bash', outcome: 'rejected' }),
       fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 4096, allow: {}, reject: {} }),
       settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'allowed-once', decidedBy: 'Alex' }),
+      documentPublishApprovalCard({ title: 'report', visibleTo: 'group-1', allow: {}, reject: {} }),
+      settledDocumentPublishApprovalCard({ title: 'report', outcome: 'rejected' }),
+      documentAuthorizationCard({ scopes: ['docx:document:readonly'], url: 'https://example.test', exposed: false }),
+      documentAuthorizationResultCard({ outcome: 'failed', capabilities: { zh: '读 ✗', en: 'read ✗' } }),
       questionCard({ question: '?', options: [{ label: 'a', description: 'b' }], valueFor: () => ({}) }),
       questionCard({ question: '?', multiSelect: true, submit: {}, options: [{ label: 'a' }], valueFor: () => ({}) }),
       settledQuestionCard({ question: '?', answer: 'a' }),
@@ -374,6 +431,7 @@ describe('card foundation', () => {
         activity: 'idle',
         pendingApprovals: 1,
         version: '0.0.6',
+        documentCapabilities: { zh: '读 ✓　写 ✓　评论 ✓', en: 'read ✓  write ✓  comment ✓' },
         preset: { value: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never' },
         context: { used: 1000, window: 128000 },
         usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },

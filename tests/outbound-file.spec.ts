@@ -1,5 +1,5 @@
-import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { constants, mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, sep } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -8,6 +8,7 @@ import {
   describeRefusalForChat,
   describeRefusalForModel,
   GET_COMMAND,
+  outboundReadOpenFlags,
   readOutboundFile,
   resolveOutboundFile,
   runGetCommand,
@@ -32,6 +33,13 @@ function createWorkspace(): string {
 }
 
 describe('resolveOutboundFile', () => {
+  it('adds O_NOFOLLOW when supported and falls back to O_RDONLY when it is zero', () => {
+    expect(outboundReadOpenFlags(0)).toBe(constants.O_RDONLY)
+    if (typeof constants.O_NOFOLLOW === 'number' && constants.O_NOFOLLOW !== 0) {
+      expect(outboundReadOpenFlags(constants.O_NOFOLLOW)).toBe(constants.O_RDONLY | constants.O_NOFOLLOW)
+    }
+  })
+
   it('resolves a relative path against the workspace, and an absolute one inside it', async () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'out'))
@@ -42,6 +50,7 @@ describe('resolveOutboundFile', () => {
       bytes: 4,
       pathInWorkspace: join('out', 'report.md'),
       workspaceName: basename(workspace),
+      identity: { device: expect.any(BigInt), inode: expect.any(BigInt) },
     }
 
     expect(resolveOutboundFile('out/report.md', workspace, 1024)).toEqual({ ok: true, file: cleared })
@@ -92,6 +101,7 @@ describe('resolveOutboundFile', () => {
       // caller typed, and everything a card shows has to come off what the
       // filesystem actually holds.
       workspaceName: basename(real),
+      identity: { device: expect.any(BigInt), inode: expect.any(BigInt) },
     }
 
     // macOS points `/tmp` at `/private/var/…`, so a workspace compared without
@@ -185,6 +195,7 @@ describe('resolveOutboundFile', () => {
         bytes: 1024,
         pathInWorkspace: 'exact.bin',
         workspaceName: basename(workspace),
+        identity: { device: expect.any(BigInt), inode: expect.any(BigInt) },
       },
     })
   })
@@ -209,6 +220,41 @@ describe('resolveOutboundFile', () => {
     await writeFile(join(workspace, 'growing.log'), 'x'.repeat(4096))
 
     await expect(readOutboundFile(verdict.file)).rejects.toThrow('growing.log changed size after it was cleared')
+  })
+
+  it('refuses a same-size outside symlink swapped in after resolve without reading its secret', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    const path = join(workspace, 'report.md')
+    await writeFile(path, 'safeBODY')
+    await writeFile(join(outside, 'secret.md'), 'SECRET!!')
+    const verdict = resolveOutboundFile('report.md', workspace, 1024)
+    if (!verdict.ok) throw new Error('the original file should have cleared')
+
+    await rm(path)
+    symlinkSync(join(outside, 'secret.md'), path)
+
+    // POSIX rejects the link at open. A Windows-style noFollow=0 fallback may
+    // open its target, but the handle identity check rejects before read.
+    await expect(readOutboundFile(verdict.file)).rejects.toThrow()
+    await expect(readOutboundFile(verdict.file, { noFollowFlag: 0 }))
+      .rejects.toThrow('report.md was replaced after it was cleared')
+    expect(await readFile(path, 'utf8')).toBe('SECRET!!')
+  })
+
+  it('refuses a same-size regular file replaced after resolve by stable identity', async () => {
+    const workspace = createWorkspace()
+    const path = join(workspace, 'report.md')
+    const replacement = join(workspace, 'replacement.md')
+    await writeFile(path, 'safeBODY')
+    await writeFile(replacement, 'EVILBODY')
+    const verdict = resolveOutboundFile('report.md', workspace, 1024)
+    if (!verdict.ok) throw new Error('the original file should have cleared')
+
+    await rename(replacement, path)
+
+    await expect(readOutboundFile(verdict.file)).rejects.toThrow('report.md was replaced after it was cleared')
+    expect(await readFile(path, 'utf8')).toBe('EVILBODY')
   })
 
   it('reports a read failure without the host prefix Node puts in it', async () => {
@@ -241,6 +287,7 @@ describe('resolveOutboundFile', () => {
       bytes: 1,
       pathInWorkspace: 'out.zip',
       workspaceName: basename(workspace),
+      identity: { device: 0n, inode: 0n },
     }
 
     expect(describeReadFailure(new Error('out.zip changed size after it was cleared'), file))
@@ -383,6 +430,7 @@ describe('send_file tool', () => {
         bytes: 4,
         pathInWorkspace: 'report.md',
         workspaceName: basename(workspace),
+        identity: { device: expect.any(BigInt), inode: expect.any(BigInt) },
       },
       signal: undefined,
     }])
@@ -523,6 +571,7 @@ describe('runGetCommand', () => {
       bytes: 8,
       pathInWorkspace: 'report.md',
       workspaceName: basename(workspace),
+      identity: { device: expect.any(BigInt), inode: expect.any(BigInt) },
     })
     expect(sent[0]!.bytes.toString('utf8')).toBe('# 报告')
   })

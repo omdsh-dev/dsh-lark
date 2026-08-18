@@ -202,6 +202,7 @@ describe('what the surfaces after a switch say', () => {
       activity: 'idle' as const,
       pendingApprovals: 0,
       version: '0.0.6',
+      documentCapabilities: { zh: '读 ✓　写 ✓　评论 ✓', en: 'read ✓  write ✓  comment ✓' },
       refresh: {},
     }
     const loud = statusCard({

@@ -50,6 +50,12 @@ export interface Config {
    * or the provider's own store, whichever is configured.
    */
   appSecretRef?: string
+  /**
+   * Managed state, not hand-written configuration: open id of the user who
+   * completed first-boot registration. On-demand document authorization sends
+   * its app-changing link to this person instead of exposing it in a group.
+   */
+  registeredBy?: string
   /** Open-platform domain: `https://open.feishu.cn` (default) or `https://open.larksuite.com`. */
   domain?: string
   /** Absolute workspace directory for chat-driven agents; defaults to the host process cwd. */
@@ -183,6 +189,34 @@ export interface Config {
    */
   maxSendFileBytes?: number
   /**
+   * Read Feishu/Lark document links from chat into immutable workspace
+   * snapshots. On by default; the snapshot is an inbound file and stays
+   * untrusted data rather than entering the prompt as instructions.
+   */
+  receiveDocs?: boolean
+  /**
+   * Let chat agents publish workspace artifacts as cloud documents. On by
+   * default. New documents grant exactly the receiving direct user or group;
+   * model-driven group creation waits for approval, while human `/put` does
+   * not. Agent-owned sends share the per-chat held-content ceiling with
+   * `send_file`; appending preserves the target document's existing audience.
+   */
+  sendDocs?: boolean
+  /**
+   * Let chat agents add anchored comments to documents this conversation has
+   * already read. On by default; each turn remains bounded by
+   * {@link maxDocCommentsPerTurn}.
+   */
+  commentDocs?: boolean
+  /** Maximum anchored document comments one agent turn may create. */
+  maxDocCommentsPerTurn?: number
+  /**
+   * Start the QR re-authorization flow when a real document call reports
+   * missing tenant scopes. Off leaves the failure visible without sending an
+   * app-configuration link.
+   */
+  docAuthorizeOnDemand?: boolean
+  /**
    * Let the platform drop the process once its run finishes, leaving only the
    * answer in the conversation. `cot` output only.
    */
@@ -255,6 +289,7 @@ export interface ResolvedConfig {
   appId?: string | undefined
   appSecret?: string | undefined
   appSecretRef?: string | undefined
+  registeredBy?: string | undefined
   domain?: string | undefined
   cwd?: string | undefined
   workspaceRoots: string[]
@@ -272,6 +307,11 @@ export interface ResolvedConfig {
   maxReceiveFileBytes: number
   sendFiles: boolean
   maxSendFileBytes: number
+  receiveDocs: boolean
+  sendDocs: boolean
+  commentDocs: boolean
+  maxDocCommentsPerTurn: number
+  docAuthorizeOnDemand: boolean
   hideProcessWhenDone: boolean
   syncSlashCommands: boolean
   denyTools: string[]
@@ -289,6 +329,7 @@ export const Config: z<Config> = z.object({
   appId: z.string(),
   appSecret: z.string().role('secret'),
   appSecretRef: z.string(),
+  registeredBy: z.string(),
   domain: z.string(),
   cwd: z.string(),
   workspaceRoots: z.array(String),
@@ -306,6 +347,11 @@ export const Config: z<Config> = z.object({
   maxReceiveFileBytes: z.number().default(20 * 1024 * 1024),
   sendFiles: z.boolean().default(true),
   maxSendFileBytes: z.number().default(20 * 1024 * 1024),
+  receiveDocs: z.boolean().default(true),
+  sendDocs: z.boolean().default(true),
+  commentDocs: z.boolean().default(true),
+  maxDocCommentsPerTurn: z.number().default(20),
+  docAuthorizeOnDemand: z.boolean().default(true),
   hideProcessWhenDone: z.boolean().default(false),
   syncSlashCommands: z.boolean().default(true),
   denyTools: z.array(String).default([...DEFAULT_DENY_TOOLS]),
@@ -337,6 +383,11 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxReceiveFileBytes: config.maxReceiveFileBytes ?? 20 * 1024 * 1024,
     sendFiles: config.sendFiles ?? true,
     maxSendFileBytes: config.maxSendFileBytes ?? 20 * 1024 * 1024,
+    receiveDocs: config.receiveDocs ?? true,
+    sendDocs: config.sendDocs ?? true,
+    commentDocs: config.commentDocs ?? true,
+    maxDocCommentsPerTurn: config.maxDocCommentsPerTurn ?? 20,
+    docAuthorizeOnDemand: config.docAuthorizeOnDemand ?? true,
     hideProcessWhenDone: config.hideProcessWhenDone ?? false,
     syncSlashCommands: config.syncSlashCommands ?? true,
     denyTools: config.denyTools ?? [...DEFAULT_DENY_TOOLS],

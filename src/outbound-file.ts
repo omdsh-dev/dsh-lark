@@ -21,8 +21,8 @@
  * @module dsh-lark-channel/outbound-file
  */
 
-import { statSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { constants, statSync } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { basename, relative, resolve } from 'node:path'
 import { canonicalPathOf, isWithinContainer } from './containment.ts'
 import { failureDetail, formatBytesForChat, formatBytesForModel } from './format.ts'
@@ -59,6 +59,11 @@ export interface OutboundFile {
    * the operator's home directory.
    */
   readonly workspaceName: string
+  /** Stable identity of the object cleared by the containment check. */
+  readonly identity: {
+    readonly device: bigint
+    readonly inode: bigint
+  }
 }
 
 /** What one path turned out to be: a file cleared to leave, or a refusal. */
@@ -82,10 +87,20 @@ function workspaceNameOf(container: string): string {
  * @param path - a canonical path.
  * @returns whether it is a regular file and how big, or undefined when it cannot be examined.
  */
-function inspectFile(path: string): { readonly isFile: boolean; readonly bytes: number } | undefined {
+function inspectFile(path: string): {
+  readonly isFile: boolean
+  readonly bytes: number
+  readonly device: bigint
+  readonly inode: bigint
+} | undefined {
   try {
-    const stats = statSync(path)
-    return { isFile: stats.isFile(), bytes: stats.size }
+    const stats = statSync(path, { bigint: true })
+    return {
+      isFile: stats.isFile(),
+      bytes: Number(stats.size),
+      device: stats.dev,
+      inode: stats.ino,
+    }
   } catch {
     return undefined
   }
@@ -134,8 +149,14 @@ export function resolveOutboundFile(input: string, workspace: string, maxBytes: 
       bytes: found.bytes,
       pathInWorkspace: relative(container, canonical),
       workspaceName: workspaceNameOf(container),
+      identity: { device: found.device, inode: found.inode },
     },
   }
+}
+
+/** Build the safest read-only open flags one platform can express. */
+export function outboundReadOpenFlags(noFollowFlag: number | undefined = constants.O_NOFOLLOW): number {
+  return constants.O_RDONLY | (typeof noFollowFlag === 'number' && noFollowFlag !== 0 ? noFollowFlag : 0)
 }
 
 /**
@@ -145,26 +166,42 @@ export function resolveOutboundFile(input: string, workspace: string, maxBytes: 
  * own input, so a link the check already followed cannot be followed a second
  * time to somewhere else.
  *
- * The size is checked again against the verdict, because `readFile` treats the
- * size it stats as a hint and reads to EOF regardless. A file still being
- * appended to when it was cleared — an agent's own background process writing
- * on — would otherwise come back BIGGER than the ceiling that just let it
- * through, and the ceiling is the whole reason this function exists.
- *
- * That check enforces the CEILING and closes no race: a rewrite to the same
- * length passes it unnoticed, and this function re-examines neither the
- * canonical path nor what it now points at. So it is not what makes a group's
- * approval mean anything — the caller's ORDER is. `deliverFile` reads the bytes
- * before it asks the room and sends the buffer it already holds, so the file the
- * card certified is the object that leaves.
+ * Where the platform exposes `O_NOFOLLOW`, opening includes it so a replaced
+ * symlink is rejected by the kernel. Windows exposes no usable flag; there the
+ * path may resolve during `open`, but no bytes are read until the resulting
+ * handle's device/inode, regular-file type and size match the verdict. A link
+ * to another object therefore fails closed at `fstat`, and reading from that
+ * same handle makes every later path replacement irrelevant.
  * @param file - a file {@link resolveOutboundFile} cleared.
+ * @param options - injectable platform flag used by deterministic fallback tests.
  * @returns its contents.
  * @throws {Error} when the file vanished after it was cleared, or is no longer the size it cleared at.
  */
-export async function readOutboundFile(file: OutboundFile): Promise<Buffer> {
-  const bytes = await readFile(file.path)
-  if (bytes.byteLength !== file.bytes) throw new Error(`${file.fileName} changed size after it was cleared`)
-  return bytes
+export async function readOutboundFile(
+  file: OutboundFile,
+  options: { readonly noFollowFlag?: number | undefined } = {},
+): Promise<Buffer> {
+  const flags = outboundReadOpenFlags(options.noFollowFlag ?? constants.O_NOFOLLOW)
+  const handle = await open(file.path, flags)
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile()) throw new Error(`${file.fileName} is no longer a regular file`)
+    if (before.dev !== file.identity.device || before.ino !== file.identity.inode) {
+      throw new Error(`${file.fileName} was replaced after it was cleared`)
+    }
+    if (before.size !== BigInt(file.bytes)) {
+      throw new Error(`${file.fileName} changed size after it was cleared`)
+    }
+    const bytes = await handle.readFile()
+    const after = await handle.stat({ bigint: true })
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size
+      || bytes.byteLength !== file.bytes) {
+      throw new Error(`${file.fileName} changed while it was being read`)
+    }
+    return bytes
+  } finally {
+    await handle.close()
+  }
 }
 
 /**
