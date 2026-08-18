@@ -19,6 +19,18 @@ export interface ReadLarkDocumentReference {
 export interface LarkDocumentFileIdentity {
   readonly device: bigint
   readonly inode: bigint
+  /** File generation marker that changes when a filesystem reuses an inode. */
+  readonly birthtimeNanoseconds: bigint
+}
+
+/** Whether two observations identify the same filesystem object generation. */
+export function isSameLarkDocumentFileIdentity(
+  left: LarkDocumentFileIdentity,
+  right: LarkDocumentFileIdentity,
+): boolean {
+  return left.device === right.device
+    && left.inode === right.inode
+    && left.birthtimeNanoseconds === right.birthtimeNanoseconds
 }
 
 /** Result of reserving the one anchors file a session/document pair may own. */
@@ -92,8 +104,7 @@ export class ReadLarkDocumentSessions {
     const reference = read?.get(fileToken)
     if (read === undefined || reference?.anchorsPath !== path) return false
     if (reference.anchorsIdentity !== undefined
-      && (reference.anchorsIdentity.device !== identity.device
-        || reference.anchorsIdentity.inode !== identity.inode)) return false
+      && !isSameLarkDocumentFileIdentity(reference.anchorsIdentity, identity)) return false
     read.set(fileToken, { ...reference, anchorsIdentity: identity })
     return true
   }

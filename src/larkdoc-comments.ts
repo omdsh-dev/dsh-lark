@@ -34,6 +34,7 @@ import type {
   ReadLarkDocumentReference,
   ReadLarkDocumentSessions,
 } from './larkdoc-session.ts'
+import { isSameLarkDocumentFileIdentity } from './larkdoc-session.ts'
 
 /** The model-facing tool that fetches comment-aware XML block anchors. */
 export const READ_DOC_ANCHORS_TOOL = 'read_doc_anchors'
@@ -133,14 +134,17 @@ async function resolveCommentToolTarget(
 /** O_NOFOLLOW where the host exposes it; identity checks remain authoritative without it. */
 const NO_FOLLOW = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
 
-/** Filesystem identity from one bigint stat result. */
-function anchorsIdentity(stats: { readonly dev: bigint; readonly ino: bigint }): LarkDocumentFileIdentity {
-  return { device: stats.dev, inode: stats.ino }
-}
-
-/** Whether two observations name the same inode. */
-function isSameAnchorsIdentity(left: LarkDocumentFileIdentity, right: LarkDocumentFileIdentity): boolean {
-  return left.device === right.device && left.inode === right.inode
+/** Filesystem identity from one bigint stat result, including its inode generation marker. */
+function anchorsIdentity(stats: {
+  readonly dev: bigint
+  readonly ino: bigint
+  readonly birthtimeNs: bigint
+}): LarkDocumentFileIdentity {
+  return {
+    device: stats.dev,
+    inode: stats.ino,
+    birthtimeNanoseconds: stats.birthtimeNs,
+  }
 }
 
 /**
@@ -160,7 +164,7 @@ async function validateAnchorsHandle(
   const handleStats = await handle.stat({ bigint: true })
   if (!handleStats.isFile()) throw new Error('The anchored XML path is not a regular file.')
   const identity = anchorsIdentity(handleStats)
-  if (expected !== undefined && !isSameAnchorsIdentity(identity, expected)) {
+  if (expected !== undefined && !isSameLarkDocumentFileIdentity(identity, expected)) {
     throw new Error('The anchored XML file was replaced since this conversation first created it; refusing to write.')
   }
 
@@ -170,7 +174,7 @@ async function validateAnchorsHandle(
     throw new Error('The anchored XML path no longer resolves inside this conversation workspace; refusing to write.')
   }
   const pathStats = await stat(path, { bigint: true })
-  if (!pathStats.isFile() || !isSameAnchorsIdentity(identity, anchorsIdentity(pathStats))) {
+  if (!pathStats.isFile() || !isSameLarkDocumentFileIdentity(identity, anchorsIdentity(pathStats))) {
     throw new Error('The anchored XML path changed after it was opened; refusing to write.')
   }
   return identity
@@ -183,7 +187,7 @@ async function unlinkCreatedAnchorsIfOwned(
 ): Promise<void> {
   try {
     const current = await stat(path, { bigint: true })
-    if (!isSameAnchorsIdentity(identity, anchorsIdentity(current))) return
+    if (!isSameLarkDocumentFileIdentity(identity, anchorsIdentity(current))) return
     await unlink(path)
   } catch {
     // Missing/replaced paths are not ours to delete.

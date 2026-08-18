@@ -19,7 +19,10 @@ import {
   readDocAnchorsTool,
 } from '../src/larkdoc-comments.ts'
 import type { CommentDocPorts } from '../src/larkdoc-comments.ts'
-import { ReadLarkDocumentSessions } from '../src/larkdoc-session.ts'
+import {
+  isSameLarkDocumentFileIdentity,
+  ReadLarkDocumentSessions,
+} from '../src/larkdoc-session.ts'
 import { createFakePort, fakeMessage, mountChannel } from './harness.ts'
 
 const workspaces: string[] = []
@@ -89,6 +92,14 @@ function registeredTool(
 }
 
 describe('document comment protocol', () => {
+  it('distinguishes an inode reused for a later file generation', () => {
+    const original = { device: 1n, inode: 2n, birthtimeNanoseconds: 3n }
+    const replacement = { ...original, birthtimeNanoseconds: 4n }
+
+    expect(isSameLarkDocumentFileIdentity(original, replacement)).toBe(false)
+    expect(isSameLarkDocumentFileIdentity(original, { ...original })).toBe(true)
+  })
+
   it('lands the comment-aware XML as a second file beside the original wiki snapshot', async () => {
     const stage = directStage()
     stage.fake.wikiResponses.set('wiki_1', {
