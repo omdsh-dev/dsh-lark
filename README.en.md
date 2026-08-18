@@ -89,7 +89,10 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | `/model reset` | Back to the deployment default |
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
-| `/new` | Start a fresh session in place; workspace and model stay |
+| `/session` | List switchable sessions in the current workspace (title + id) |
+| `/session <id or title>` | Switch to an existing session (by id or title; an ambiguous title lists candidates) |
+| `/session reset` | Clear the switch and return to automatic routing |
+| `/new` | Start a fresh session in place (session binding cleared); workspace and model stay |
 | `/stop` | Stop the running task |
 | `/help` | Everything this chat accepts, host commands included |
 

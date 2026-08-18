@@ -402,12 +402,8 @@ export interface CreatedAgent {
   registeredTools: { name: string }[]
   agent: {
     id: string
-<<<<<<< HEAD
     session: { id: string; events: { type: string; data: unknown }[] }
-=======
-    session: { id: string }
     ctx: Context
->>>>>>> 36725c7 (fix: compose shadow tools for a chat reusing a live agent)
     followup: ReturnType<typeof vi.fn<(m: HostUserMessage) => void>>
     cancel: ReturnType<typeof vi.fn<(cause: string) => void>>
     whenIdle: () => Promise<void>
