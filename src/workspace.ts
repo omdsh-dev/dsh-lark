@@ -451,6 +451,7 @@ export async function runSessionCommand(
   currentId: string,
   listSessions?: () => Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]>,
   currentPath?: string | undefined,
+  verifySession?: (id: string) => Promise<boolean>,
 ): Promise<SessionCommandResult> {
   const argument = line.trimStart().slice(1 + SESSION_COMMAND.length).trim()
   const lower = argument.toLowerCase()
@@ -513,6 +514,18 @@ export async function runSessionCommand(
   }
   if (!/^[A-Za-z0-9._-]+$/.test(argument)) {
     return { markdown: `⚠️ 会话 ID 格式不合法：\`${argument}\`。\n合法字符：字母、数字、\`\.\`、\`_\`、\`-\`。` }
+  }
+  // /session <id> means switch to an EXISTING session. Binding an id nobody
+  // has would bind fine and then silently CREATE an empty session on the next
+  // message (the ladder's resume-then-create fallback), so a non-existent id
+  // is refused up front instead of leaving the operator in a surprise shell.
+  if (verifySession !== undefined) {
+    const exists = await verifySession(argument)
+    if (!exists) {
+      return {
+        markdown: `⚠️ 会话 \`${argument}\` 不存在，无法切换。\n\`/session\` 可查看当前工作区的可切换会话；已归档或其他工作区的会话只要有 ID 也可切换。`,
+      }
+    }
   }
   const durable = await overrides.set(key, argument)
   const durability = durable ? '' : '\n（本部署未组合 settings，这次绑定在重启后会丢失。）'

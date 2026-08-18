@@ -24,6 +24,7 @@ import {
   createFakeCommands,
   createFakePermissionPresets,
   createFakePresets,
+  createFakeSessionQuery,
   createFakeSettings,
   createFakeTools,
   createFakeWorkspaces,
@@ -1487,6 +1488,26 @@ describe('dsh-lark-channel', () => {
       expect(listing).toContain('压缩上下文')
       expect(listing).toContain('/stop')
       expect(commands.executed).toEqual([])
+      await harness.dispose()
+    })
+
+    it('refuses to bind a session id that does not exist, instead of creating one', async () => {
+      const fake = createFakeSettings()
+      const query = createFakeSessionQuery([{ id: 'session-real', cwd: '/workspace/运维' }])
+      const harness = await mountChannel(
+        { chatSessions: { 'oc_chat_1': 'session-bound' } },
+        { settings: fake.settings, sessionQuery: query.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: '/session session-nope' }))
+      // Refused up front: binding a phantom id would resume-fail and then
+      // CREATE an empty session under that id on the next message.
+      await vi.waitFor(() => {
+        expect(harness.fake.sent.some((m) =>
+          'markdown' in m.input && m.input.markdown.includes('不存在，无法切换'),
+        )).toBe(true)
+      })
+      // The existing override is untouched — nothing was persisted.
+      expect(fake.updates).toEqual([])
       await harness.dispose()
     })
 

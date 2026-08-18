@@ -684,6 +684,8 @@ export async function mountChannel(
     tools?: object
     /** The `workspaceRegistry` chat sessions are accounted under. */
     workspaces?: object
+    /** The `sessionQuery` /session lists and verifies sessions through. */
+    sessionQuery?: object
     /** The `commands` runtime slash lines dispatch through. */
     commands?: object
     /** The `attachments` store chat images are committed to. */
@@ -728,6 +730,7 @@ export async function mountChannel(
   if (services.presets !== undefined) ctx.provide('agentPresets', services.presets)
   if (services.tools !== undefined) ctx.provide('tools', services.tools)
   if (services.workspaces !== undefined) ctx.provide('workspaceRegistry', services.workspaces)
+  if (services.sessionQuery !== undefined) ctx.provide('sessionQuery', services.sessionQuery)
   if (services.llm !== undefined) ctx.provide('llm', services.llm)
   if (services.planMode !== undefined) ctx.provide('planMode', services.planMode)
   if (services.sessionProjections !== undefined) ctx.provide('sessionProjections', services.sessionProjections)
@@ -849,6 +852,19 @@ export function createFakeWorkspaces(registered: Record<string, string> = {}) {
     },
   }
   return { service, created, attached, state }
+}
+
+/** An in-memory `sessionQuery` listing a fixed set of persisted sessions. */
+export function createFakeSessionQuery(sessions: Array<{ id: string; cwd?: string; createdAt?: number }> = []) {
+  const service = {
+    async listSessions() {
+      return sessions.map(session => ({ header: { id: session.id, cwd: session.cwd, createdAt: session.createdAt } }))
+    },
+    async readTitleSnapshots(ids: readonly string[]) {
+      return ids.map(sessionId => ({ sessionId, status: 'fulfilled', value: { session: { id: sessionId }, title: { title: undefined } } }))
+    },
+  }
+  return { service, sessions }
 }
 
 /** An in-memory `attachments` store recording every committed image. */

@@ -1736,6 +1736,26 @@ export function installBridge(
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
         } else if (channelCommand === SESSION_COMMAND) {
           const currentId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
+          // /session <id> binds to an EXISTING session; an id nobody has would
+          // otherwise bind fine and then silently CREATE an empty session on
+          // the next message (the ladder's resume-then-create fallback).
+          // Verify against the FULL persisted list — not the cwd/archived
+          // filtered listing — so cross-directory and archived sessions stay
+          // switchable, and only ids that are not sessions at all are refused.
+          const verifySession = async (id: string): Promise<boolean> => {
+            const query = ctx.get('sessionQuery') as {
+              listSessions?: (signal?: AbortSignal) => Promise<unknown>
+            } | undefined
+            if (query?.listSessions === undefined) return true
+            try {
+              const records = await query.listSessions() as Array<{ header?: { id?: string } }>
+              return records.some(record => record.header?.id === id)
+            } catch {
+              // A broken query must not block switching; degrade to trusting
+              // the id, the same way listSessions degrades to no listing.
+              return true
+            }
+          }
           const listSessions = async (): Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]> => {
             const query = ctx.get('sessionQuery') as {
               listSessions?: (signal?: AbortSignal) => Promise<unknown>
@@ -1781,7 +1801,7 @@ export function installBridge(
             }
           }
           {
-            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key))
+            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key), verifySession)
             reply = result.card === undefined
               ? { markdown: result.markdown }
               : { card: sessionCard({ rows: result.card.rows, workspace: result.card.workspace, canList: result.card.canList }) }
