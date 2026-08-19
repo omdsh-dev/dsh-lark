@@ -8,7 +8,20 @@
 
 import { statusCard } from './cards.ts'
 import { marked } from './clicks.ts'
-import type { HostContextPressure, HostSession, HostSessionProjections, HostTokenUsage } from './host.ts'
+import {
+  foldedTokenCount,
+  isCompactionEndEvent,
+  isCompactionStartEvent,
+  isCompactionSummaryEvent,
+} from './host.ts'
+import type {
+  CompactionEndData,
+  HostContextPressure,
+  HostSession,
+  HostSessionEvent,
+  HostSessionProjections,
+  HostTokenUsage,
+} from './host.ts'
 import type { PresetOption } from './permission.ts'
 import type { ConversationSubject } from './session.ts'
 
@@ -68,6 +81,94 @@ export function readMeters(
       : { context: { used: count(used), window: pressure?.contextWindow } },
     ...usage === undefined || (usage.input === 0 && usage.output === 0) ? {} : { usage },
   }
+}
+
+/** What one session's compaction history adds up to, in the shape the card takes. */
+export interface CompactionTally {
+  /** How many compactions actually landed on the conversation. */
+  readonly count: number
+  /** How many tokens of history those compactions replaced, in total. */
+  readonly foldedTokens: number
+}
+
+/**
+ * What one bracket ended up folding, now that its close is in.
+ *
+ * A `summary` having landed is NOT the verdict. When `end` carries an error the
+ * host deliberately leaves the conversation surface untouched and only the log
+ * remembers the attempt, so a tally that counted summaries on their own would
+ * report a memory loss that never happened — the kind of reading an operator
+ * acts on by re-explaining something the agent never forgot. Hence the pairing:
+ * a clean close AND a folded amount, or this bracket changed nothing worth
+ * stating.
+ * @param data - the closing bracket's payload.
+ * @param folded - the amount this bracket's summary reported, if it wrote one.
+ * @returns the amount to add to the tally, or undefined to leave it be.
+ */
+function landedFold(data: CompactionEndData, folded: number | undefined): number | undefined {
+  return data.error === undefined ? folded : undefined
+}
+
+/**
+ * Fold the session log into "how often, and how much".
+ *
+ * One forward pass with a single pending slot, because the host's own lock
+ * allows at most one open bracket per session: a `start` arriving while another
+ * is open means the previous one died unclosed, and overwriting the slot is
+ * what stops an orphan from lending its folded amount to the bracket after it.
+ * @param events - the whole session log, oldest first.
+ * @returns the totals, which may be zero.
+ */
+function tallyCompactions(events: readonly HostSessionEvent[]): CompactionTally {
+  let openId: string | undefined
+  let pendingFolded: number | undefined
+  let count = 0
+  let foldedTokens = 0
+  for (const event of events) {
+    if (isCompactionStartEvent(event)) {
+      openId = event.data.compactionId
+      pendingFolded = undefined
+      continue
+    }
+    if (isCompactionSummaryEvent(event)) {
+      if (openId === event.data.compactionId) pendingFolded = foldedTokenCount(event.data)
+      continue
+    }
+    if (!isCompactionEndEvent(event) || openId !== event.data.compactionId) continue
+    // The manual kind counts here, and `turn` is read nowhere in this loop.
+    // That asymmetry with the thinking-process line is deliberate, not an
+    // oversight to be tidied away: that line skips a manual `/compact` because
+    // the command reply already said so in the chat, while this row is the
+    // session's own running total — "how many times has this conversation been
+    // compacted, and how much did it forget" — an answer that does not depend
+    // on who asked for it.
+    const landed = landedFold(event.data, pendingFolded)
+    if (landed !== undefined) {
+      count += 1
+      foldedTokens += landed
+    }
+    openId = undefined
+    pendingFolded = undefined
+  }
+  return { count, foldedTokens }
+}
+
+/**
+ * Read how much of one live session's history has been folded away.
+ *
+ * Absent stays absent, for the same reason the meters above go missing rather
+ * than reading zero: a host too old to expose its session log cannot say, and a
+ * row saying `0` where nothing is known is a lie an operator acts on. A session
+ * nothing has compacted yet is the same case — there is no compaction to report,
+ * so the row does not appear at all.
+ * @param session - the live session; an unbound conversation has none.
+ * @returns the tally, or undefined when there is none to state.
+ */
+export function readCompactions(session: HostSession | undefined): CompactionTally | undefined {
+  const events = session?.events
+  if (events === undefined) return undefined
+  const tally = tallyCompactions(events)
+  return tally.count === 0 ? undefined : tally
 }
 
 /** Show this conversation's routing and activity. Channel-owned: needs no agent. */
@@ -141,6 +242,12 @@ export interface StatusFields {
     readonly cacheRead: number
     readonly cacheWrite: number
   } | undefined
+  /**
+   * How often this session's history has been folded into a summary, and by how
+   * much. Absent where the host is too old to expose its session log, and absent
+   * — rather than zero — until something has actually been compacted.
+   */
+  readonly compaction?: CompactionTally | undefined
 }
 
 /**
@@ -167,6 +274,7 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     ...fields.preset === undefined ? {} : { preset: fields.preset },
     ...fields.context === undefined ? {} : { context: fields.context },
     ...fields.usage === undefined ? {} : { usage: fields.usage },
+    ...fields.compaction === undefined ? {} : { compaction: fields.compaction },
     // Marked, because a status card stays in the chat and refreshing twice is
     // the most ordinary thing to do with it.
     refresh: marked({

@@ -800,6 +800,11 @@ const STATUS = {
     en: '%s in · %s out',
   },
   cached: { zh: '，缓存命中 %s', en: ', %s cached' },
+  compaction: { zh: '压缩', en: 'Compaction' },
+  compactionOf: {
+    zh: '已压缩 %s 次 · 累计折叠 %s',
+    en: 'Compacted %s× · %s folded',
+  },
   pendingCount: { zh: '%s 个审批卡片等待处理', en: '%s approval cards waiting' },
   isDefault: { zh: '部署默认', en: 'deployment default' },
   running: { zh: '正在跑一轮任务', en: 'Running a turn' },
@@ -909,6 +914,12 @@ export function statusCard(input: {
   readonly version: string
   /** The permission preset in force, as the deployment defines it. */
   readonly preset?: PresetRow | undefined
+  /**
+   * How much of this session's history has been folded into a summary. Absent
+   * where nothing has been, which is why the row disappears rather than
+   * reading zero.
+   */
+  readonly compaction?: { readonly count: number; readonly foldedTokens: number } | undefined
   readonly refresh: object
 }): object {
   return card('neutral', STATUS.summary, [
@@ -932,6 +943,14 @@ export function statusCard(input: {
       ...input.context === undefined
         ? []
         : field(STATUS.context, contextReading(input.context)),
+      // Right under the context reading, because the two answer halves of one
+      // question: what the next message carries, and what it no longer can.
+      ...input.compaction === undefined
+        ? []
+        : field(STATUS.compaction, fill(
+          fill(STATUS.compactionOf, String(input.compaction.count)),
+          formatTokenCount(input.compaction.foldedTokens),
+        )),
       ...input.usage === undefined
         ? []
         : field(STATUS.usage, join(

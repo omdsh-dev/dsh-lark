@@ -73,7 +73,7 @@ import {
   runModelCommand,
 } from './model.ts'
 import type { CatalogEntry, ModelActionValue } from './model.ts'
-import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
+import { readCompactions, readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
 import type { StatusFields } from './status.ts'
 import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue, shadowQuestionTool } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
@@ -1343,8 +1343,12 @@ export function installBridge(
     // load a log to report a zero.
     const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
     const meters = readMeters(projections(), live?.session)
+    // Folded from the same live session's log, for the same reason: a
+    // conversation with no agent built yet has had nothing compacted.
+    const compaction = readCompactions(live?.session)
     return {
       ...meters,
+      ...compaction === undefined ? {} : { compaction },
       workspace: chatWorkspaces.pathFor(subject.key),
       workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
       route,

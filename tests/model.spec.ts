@@ -8,7 +8,7 @@ import {
   runModelCommand,
 } from '../src/model.ts'
 import type { CatalogEntry } from '../src/model.ts'
-import { readMeters, renderStatusCard, STATUS_ACTION } from '../src/status.ts'
+import { readCompactions, readMeters, renderStatusCard, STATUS_ACTION } from '../src/status.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 const catalog: CatalogEntry[] = [
@@ -237,6 +237,104 @@ describe('readMeters', () => {
   })
 })
 
+describe('readCompactions', () => {
+  /** The three events one compaction bracket writes, in the order the log takes them. */
+  const start = (compactionId: string, turn: number | null = 4) =>
+    ({ type: 'compaction/start', data: { compactionId, turn } })
+  const summary = (compactionId: string, shadowedTokenCount: unknown) =>
+    ({ type: 'compaction/summary', data: { compactionId, shadowedTokenCount } })
+  const end = (compactionId: string, error?: string) =>
+    ({ type: 'compaction/end', data: { compactionId, turn: 4, ...error === undefined ? {} : { error } } })
+  /** A live session whose log is exactly these events. */
+  const sessionOf = (events: readonly { type: string; data: unknown }[]) => ({ id: 's1', events })
+
+  it('counts brackets that closed clean, and adds up what they folded', () => {
+    expect(readCompactions(sessionOf([
+      start('c1'),
+      summary('c1', 30_000),
+      end('c1'),
+      { type: 'turn/end', data: { turn: 4 } },
+      start('c2'),
+      summary('c2', 18_200),
+      end('c2'),
+    ]))).toEqual({ count: 2, foldedTokens: 48_200 })
+  })
+
+  it('drops a bracket whose close failed, even though its summary landed', () => {
+    // The regression this pins: counting summaries instead of pairs. A failed
+    // close leaves the conversation surface exactly as it was, so counting it
+    // would report a memory loss that never happened.
+    expect(readCompactions(sessionOf([
+      start('c1'),
+      summary('c1', 30_000),
+      end('c1', 'the provider refused'),
+    ]))).toBeUndefined()
+    expect(readCompactions(sessionOf([
+      start('c1'),
+      summary('c1', 30_000),
+      end('c1', 'the provider refused'),
+      start('c2'),
+      summary('c2', 12_000),
+      end('c2'),
+    ]))).toEqual({ count: 1, foldedTokens: 12_000 })
+  })
+
+  it('counts a manual /compact, unlike the thinking-process line', () => {
+    // Deliberately asymmetric with the process note, which skips `turn: null`
+    // because the command reply already reported it. This row is the session's
+    // running total, so who triggered the compaction does not enter into it —
+    // "make it consistent with the note" would silently lose compactions here.
+    expect(readCompactions(sessionOf([
+      start('c1', null),
+      summary('c1', 21_000),
+      end('c1'),
+    ]))).toEqual({ count: 1, foldedTokens: 21_000 })
+  })
+
+  it('leaves out a bracket with no usable folded amount', () => {
+    // A prune-only bracket writes no summary at all, and a broken one writes a
+    // count nobody can act on. Both fold an amount this row cannot state.
+    for (const events of [
+      [start('c1'), end('c1')],
+      [start('c1'), summary('c1', undefined), end('c1')],
+      [start('c1'), summary('c1', -1), end('c1')],
+      [start('c1'), summary('c1', Number.NaN), end('c1')],
+      [start('c1'), summary('c1', '30000'), end('c1')],
+    ]) {
+      expect(readCompactions(sessionOf(events))).toBeUndefined()
+    }
+  })
+
+  it('lets an orphan bracket die instead of lending its amount to the next one', () => {
+    // The host leaves a blocking orphan on purpose when a close fails, so a
+    // `start` on top of an open bracket is a real shape. Carrying the pending
+    // amount across would credit the next compaction with history it never
+    // folded, and pairing on the id alone would count the orphan twice.
+    expect(readCompactions(sessionOf([
+      start('c1'),
+      summary('c1', 30_000),
+      start('c2'),
+      end('c2'),
+    ]))).toBeUndefined()
+    expect(readCompactions(sessionOf([
+      start('c1'),
+      summary('c1', 30_000),
+      start('c2'),
+      summary('c2', 9_000),
+      end('c2'),
+      end('c1'),
+    ]))).toEqual({ count: 1, foldedTokens: 9_000 })
+  })
+
+  it('says nothing where nothing was compacted, and where the log cannot be read', () => {
+    // Absent, not zero: a host too old to expose its log has no answer, and a
+    // row reading `0` would be an answer.
+    expect(readCompactions(sessionOf([{ type: 'turn/end', data: { turn: 1 } }]))).toBeUndefined()
+    expect(readCompactions({ id: 's1' })).toBeUndefined()
+    expect(readCompactions(undefined)).toBeUndefined()
+  })
+})
+
 describe('renderStatusCard', () => {
   /** Every string one status card renders. */
   const shown = (card: object): string[] => cardTexts(card).map((text) => text.content)
@@ -291,5 +389,28 @@ describe('renderStatusCard', () => {
     expect(shown(fresh).some((text) => text.includes('尚未创建'))).toBe(true)
     // An unknown version hides the row rather than printing an empty claim.
     expect(shown(fresh)).not.toContain('版本')
+  })
+
+  it('states how often history was folded, and drops the row when it never was', () => {
+    const base = {
+      workspace: '/srv/work',
+      workspaceIsDefault: true,
+      route: 'deepseek/deepseek-chat',
+      routeIsDefault: true,
+      sessionId: 'lark-oc_1',
+      bound: true,
+      running: false,
+      pendingApprovals: 0,
+      version: '0.0.6',
+    }
+    const compacted = renderStatusCard({ ...base, compaction: { count: 2, foldedTokens: 48_200 } }, SUBJECT)
+    expect(shown(compacted)).toContain('压缩')
+    // The same short form the context and usage rows read in, so one number
+    // does not appear in two spellings on one card.
+    expect(shown(compacted)).toContain('已压缩 2 次 · 累计折叠 48.2k')
+
+    // Nothing folded means no row at all: a `压缩 0 次` would be read as "the
+    // agent has all of it", which is the one thing this row exists to settle.
+    expect(shown(renderStatusCard(base, SUBJECT)).some((text) => text.includes('压缩'))).toBe(false)
   })
 })
