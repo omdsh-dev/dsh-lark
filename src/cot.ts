@@ -10,10 +10,15 @@
  * @module dsh-lark-channel/cot
  */
 
+import { formatTokenCount } from './format.ts'
 import {
   assistantText,
+  foldedTokenCount,
   isAssistantChunkEvent,
   isAssistantMessageEvent,
+  isCompactionEndEvent,
+  isCompactionStartEvent,
+  isCompactionSummaryEvent,
   isStepStartEvent,
   isToolCallEvent,
   isToolResultEvent,
@@ -132,6 +137,52 @@ interface LiveRun {
   finished: boolean
 }
 
+/** One compaction the host has opened and not yet closed. */
+interface OpenBracket {
+  readonly id: string
+  /**
+   * The owner named by this bracket's own `start`: a number for the automatic
+   * kind, `null` for a manual `/compact`. Read from the `start` rather than the
+   * `end` that closes it, even though both carry the field, because ownership is
+   * what the host took its lock under — and if the two ever disagreed, the line
+   * belongs in the turn that was open while history was being folded, not in
+   * whatever turn happens to be open when the close lands.
+   */
+  readonly turn: number | null
+  /** What the `summary` folded away, when the bracket summarized at all. */
+  folded?: number | undefined
+}
+
+/** Whether a compaction is the automatic kind — the only kind with no other trace. */
+function isAutomaticCompaction(turn: number | null): turn is number {
+  return turn !== null
+}
+
+/**
+ * What one closed compaction leaves in the process, or nothing when it has
+ * nothing to say.
+ *
+ * The failure line deliberately carries no detail. `error` is the host's own
+ * internal wording about its own transaction: a reader of the chat can neither
+ * act on it nor place it, and it is a path for text nobody vetted to reach a
+ * conversation. What the reader needs is the one bit that changes what they do
+ * next — history was not folded, so the agent still remembers everything.
+ * @param folded - the amount the bracket's summary reported, if any.
+ * @param error - the failure the bracket's close reported, if any.
+ * @returns the line, or `undefined` when the bracket stays silent.
+ */
+function compactionLine(folded: number | undefined, error: string | undefined): string | undefined {
+  if (error !== undefined) return '上下文压缩失败'
+  // No amount worth stating means nothing worth saying. Either the bracket
+  // wrote no summary at all — it pruned its way back under safe pressure and
+  // the conversation reads the same as before — or it wrote one whose count
+  // `foldedTokenCount` will not vouch for, zero included. Saying "compacted"
+  // in either case would answer a question the reader never asked with a claim
+  // this bracket does not support.
+  if (folded === undefined) return undefined
+  return `上下文已压缩 · 折叠 ${formatTokenCount(folded)}`
+}
+
 /**
  * Renderer that shows the process as a native CoT message and leaves the answer
  * to `answer`. Falling back is the caller's job: when {@link CotPort.createCot}
@@ -158,6 +209,14 @@ export function createCotRenderer(
    * renderer, not on a run: the answer does not depend on a process existing.
    */
   let held: { turn: number; event: HostSessionEvent } | undefined
+  /**
+   * The compaction bracket currently open, if one is. One slot rather than a
+   * map: this renderer is per session, and a live unmatched `compaction/start`
+   * IS the host's durable lock, so a session has at most one open bracket. The
+   * slot needs no cleanup — a bracket whose `end` never arrives dies with the
+   * renderer.
+   */
+  let bracket: OpenBracket | undefined
   const closing = new Set<Promise<void>>()
 
   /** Drain one run's queue, respecting the API's per-call event bound. */
@@ -309,6 +368,73 @@ export function createCotRenderer(
           content: { type: 'code', code: boundResult(text) },
           ...event.data.error === undefined ? {} : { error: event.data.error.code },
         }))
+        return
+      }
+      if (isCompactionStartEvent(event)) {
+        // With the process off there is nowhere to say this, so the bracket is
+        // never opened and its `summary` and `end` find nothing to close.
+        if (!showProcess) return
+        // Assignment, not a guard against one already being open: the host can
+        // deliberately leave a blocking orphan when a close fails, and the next
+        // `start` is exactly where that orphan stops mattering.
+        bracket = { id: event.data.compactionId, turn: event.data.turn }
+        return
+      }
+      if (isCompactionSummaryEvent(event)) {
+        if (bracket === undefined || bracket.id !== event.data.compactionId) return
+        // Held rather than shown: the folded amount is reported here and the
+        // verdict only on `end`, and a summary that landed before a failed
+        // close changed nothing about the conversation.
+        bracket.folded = foldedTokenCount(event.data)
+        return
+      }
+      if (isCompactionEndEvent(event)) {
+        if (bracket === undefined || bracket.id !== event.data.compactionId) return
+        const { turn, folded } = bracket
+        bracket = undefined
+        // A manual `/compact` says nothing here: its command reply already
+        // reported what it replaced, and that reply is in the chat.
+        if (!isAutomaticCompaction(turn)) return
+        const line = compactionLine(folded, event.data.error)
+        if (line === undefined) return
+        // The process opens here rather than waiting for `step/start`, because
+        // compaction is appended in the pre-step waterfall and a first-step
+        // compaction arrives before any step does. Opening at `step/start` was
+        // only ever about overlapping the create round trip with the model's
+        // time to first token; opening earlier overlaps more of it.
+        //
+        // STEP_STARTED because a compaction is what AG-UI calls a step: a phase
+        // of a run that is neither a message nor a tool call. The neighbouring
+        // vocabularies would both lie — TOOL_CALL_* claims the agent called a
+        // tool it never called, and TEXT_MESSAGE_* already means "narration a
+        // later commit replaced", so the agent would appear to have said this.
+        //
+        // Closed in the same breath, under the same `stepName`. A step is a
+        // bracket like every other one this renderer opens, and this one is
+        // over before the line is even written: the phase being reported ended
+        // with the `compaction/end` in hand. Leaving it open would be a run
+        // that reaches RUN_FINISHED with a step still active — invalid AG-UI
+        // whatever any single client makes of it, and the two ways clients do
+        // make something of it are both worse than a pair: a strict validator
+        // rejects the write that carries RUN_FINISHED, taking the whole
+        // process's closure down with it on exactly the turns that compacted,
+        // and a lenient one renders a phase that never completes. `closeRun`
+        // already goes out of its way to close a dangling reasoning message;
+        // this is the same rule, paid for at the site that opens the bracket
+        // rather than in the cleanup.
+        //
+        // Chinese alone. Everything outside a card is hard-coded Chinese here
+        // (`failureLine`, `IDLE_TURN_NOTE`); only the status card is bilingual.
+        // Two surfaces with two rules, not one surface being inconsistent.
+        //
+        // Accepted side effect: a compaction inside a turn that a pre-step gate
+        // then rejects leaves a thinking process whose only content is this
+        // line. `turn/end` still closes it, and the line is true.
+        enqueue(
+          ensure(turn),
+          cotEvent('STEP_STARTED', { stepName: line }),
+          cotEvent('STEP_FINISHED', { stepName: line }),
+        )
         return
       }
       if (isTurnEndEvent(event)) {

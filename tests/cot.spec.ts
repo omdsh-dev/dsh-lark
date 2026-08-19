@@ -35,8 +35,11 @@ describe('thinking process (CoT)', () => {
     // The process belongs to the message that asked for it.
     expect(cot.replyTo).toBe('om_in_1')
     await vi.waitFor(() => { expect(events(harness).map((e) => e.type)).toContain('RUN_STARTED') })
-    // A step is one iteration of the agent's loop; numbering it above the work
-    // tells a reader nothing the reasoning and tool calls do not.
+    // No STEP event for a plain step: a step is one iteration of the agent's
+    // loop, and "step 1 … step 8" listed above the work tells a reader nothing
+    // the reasoning and tool calls do not. The rule bans the NUMBERING, not the
+    // event — meaningful phases do get one, which is how a compaction says it
+    // happened (ADR 0014). This turn has no such phase, so it has no STEP.
     expect(events(harness).map((e) => e.type)).not.toContain('STEP_STARTED')
     await harness.dispose()
   })
@@ -229,6 +232,184 @@ describe('thinking process (CoT)', () => {
       expect(harness.fake.sent.some((m) => 'markdown' in m.input && m.input.markdown === '答案')).toBe(true)
     })
     expect(harness.fake.cots).toEqual([])
+    await harness.dispose()
+  })
+
+  it('says a compaction happened, and how much history it folded away', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // Without this line the replacement of a session's history by a summary
+    // leaves no trace anywhere in the chat, and "it forgot what we agreed on"
+    // is indistinguishable from "it got dumber" — which is the whole point.
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: 48200 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1 })
+
+    await vi.waitFor(() => { expect(contentOf(harness, 'STEP_STARTED')).toBeDefined() })
+    // The amount is held from the `summary` until the `end` says it counted:
+    // it is reported on one event and the verdict only on the other.
+    expect(contentOf(harness, 'STEP_STARTED')).toMatchObject({ stepName: '上下文已压缩 · 折叠 48.2k' })
+    // Closed under the same name, in the same write. The phase is over by the
+    // time the line exists, and a step left open is a run that finishes with
+    // one still active — which a strict reader of the protocol rejects,
+    // costing the whole process its closure and not just this line.
+    expect(contentOf(harness, 'STEP_FINISHED')).toMatchObject({ stepName: '上下文已压缩 · 折叠 48.2k' })
+    await harness.dispose()
+  })
+
+  it('leaves no step open behind it, through the order a real turn arrives in', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // Replayed in the order the host actually publishes (see cot-replay), not
+    // the tidier one: compaction lands in the pre-step waterfall, so it comes
+    // after `turn/start` and before any `step/start`, and the turn goes on to
+    // do real work after it.
+    emit('turn/start', { turn: 55 })
+    emit('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [] })
+    emit('compaction/start', { compactionId: 'k1', turn: 55 })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: 48200 })
+    emit('compaction/end', { compactionId: 'k1', turn: 55 })
+    emit('step/start', { turn: 55, step: 1 })
+    emit('assistant/chunk', { turn: 55, step: 1, chunk: { type: 'reasoning-delta', text: '接着想' } })
+    emit('step/end', { turn: 55, step: 1 })
+    emit('turn/end', { turn: 55, reason: { kind: 'completed' } })
+
+    await vi.waitFor(() => {
+      expect(events(harness).map((e) => e.type)).toContain('RUN_FINISHED')
+    })
+    const types = events(harness).map((e) => e.type)
+    // Every step opened is a step closed, and both of them land before the run
+    // is finished. The count is asserted rather than mere presence: a second
+    // compaction in one turn opens a second bracket, and each one owes a close.
+    expect(types.filter((t) => t === 'STEP_STARTED')).toHaveLength(1)
+    expect(types.filter((t) => t === 'STEP_FINISHED')).toHaveLength(1)
+    expect(types.lastIndexOf('STEP_FINISHED')).toBeLessThan(types.indexOf('RUN_FINISHED'))
+    // The compaction opened the process, and the step that followed reused it:
+    // one turn is one thinking process, whatever opened it.
+    expect(harness.fake.cots).toHaveLength(1)
+    await harness.dispose()
+  })
+
+  it('reports a failed compaction without repeating the host error', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1, error: 'summarizer HTTP 502 at provider/xyz' })
+
+    await vi.waitFor(() => { expect(contentOf(harness, 'STEP_STARTED')).toBeDefined() })
+    const { stepName } = contentOf(harness, 'STEP_STARTED') as { stepName: string }
+    // Saying it failed is what changes the reader's next move — nothing was
+    // folded, so the agent still remembers everything.
+    expect(stepName).toBe('上下文压缩失败')
+    // The host's own wording about its own transaction is not for this chat:
+    // unreadable to whoever is in it, and a path for unvetted text to land in a
+    // conversation.
+    expect(stepName).not.toContain('502')
+    expect(stepName).not.toContain('provider/xyz')
+    // A failure closes its own bracket too: nothing about the phase is still
+    // running once the close is in hand.
+    expect(contentOf(harness, 'STEP_FINISHED')).toMatchObject({ stepName: '上下文压缩失败' })
+    await harness.dispose()
+  })
+
+  it('stays quiet about a manual compaction, which already reported itself', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // A `null` turn is a standalone `compactNow()` — a manual `/compact`, whose
+    // command reply is already in the chat saying what it replaced. Saying it
+    // twice in two voices reads as two compactions.
+    emit('compaction/start', { compactionId: 'k1', turn: null })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: 48200 })
+    emit('compaction/end', { compactionId: 'k1', turn: null })
+    emit('step/start', { turn: 1, step: 1 })
+
+    // Asserted against a process that does exist, so the absence is a decision
+    // and not just an empty transcript.
+    await vi.waitFor(() => { expect(events(harness).map((e) => e.type)).toContain('RUN_STARTED') })
+    expect(events(harness).map((e) => e.type)).not.toContain('STEP_STARTED')
+    await harness.dispose()
+  })
+
+  it('stays quiet when a compaction only pruned and never summarized', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // Pruning back under safe pressure closes the bracket with no `summary`:
+    // no history was folded, so "已压缩" would be a claim about this bracket
+    // that is not true of it. The prune event itself must pass through without
+    // being mistaken for one.
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/prune', { shadowedRange: [1, 4], shadowedSeqs: [1, 2], shadowedTokenCount: 900 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1 })
+    emit('step/start', { turn: 1, step: 1 })
+
+    await vi.waitFor(() => { expect(events(harness).map((e) => e.type)).toContain('RUN_STARTED') })
+    expect(events(harness).map((e) => e.type)).not.toContain('STEP_STARTED')
+    // An unknown shape reaching the renderer must not throw: the bridge would
+    // report it and the turn would carry a process that goes silent.
+    expect(harness.notices.some((line) => line.includes('rendering'))).toBe(false)
+    await harness.dispose()
+  })
+
+  it('treats an unusable folded amount as no amount at all', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // A negative or non-finite count is a number nobody can act on, and a line
+    // reading `折叠 0` is the kind of lie an operator acts on anyway — so an
+    // exact zero is on that list too, not passed through as a real amount.
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: -1 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1 })
+    emit('compaction/start', { compactionId: 'k2', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k2', shadowedTokenCount: Number.NaN })
+    emit('compaction/end', { compactionId: 'k2', turn: 1 })
+    emit('compaction/start', { compactionId: 'k3', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k3', shadowedTokenCount: 0 })
+    emit('compaction/end', { compactionId: 'k3', turn: 1 })
+    emit('step/start', { turn: 1, step: 1 })
+
+    await vi.waitFor(() => { expect(events(harness).map((e) => e.type)).toContain('RUN_STARTED') })
+    expect(events(harness).map((e) => e.type)).not.toContain('STEP_STARTED')
+    await harness.dispose()
+  })
+
+  it('opens no process at all for a compaction when the process is switched off', async () => {
+    const harness = await mountChannel({ showProcess: false })
+    const emit = await chat(harness)
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: 48200 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1 })
+    emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: '答案' }] } })
+    emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+    // "I only want the answer" is a statement about the whole surface: a
+    // process holding one compaction line is still a process nobody asked for.
+    await vi.waitFor(() => {
+      expect(harness.fake.sent.some((m) => 'markdown' in m.input && m.input.markdown === '答案')).toBe(true)
+    })
+    expect(harness.fake.cots).toEqual([])
+    await harness.dispose()
+  })
+
+  it('opens the process for a compaction that arrives before the first step', async () => {
+    const harness = await mountChannel()
+    const emit = await chat(harness)
+    // Compaction is appended in the pre-step waterfall, so a first-step
+    // compaction lands before any `step/start`. The line has to open the
+    // process itself — and the step that follows must reuse that same run,
+    // or one turn would show up as two thinking processes.
+    emit('compaction/start', { compactionId: 'k1', turn: 1 })
+    emit('compaction/summary', { compactionId: 'k1', shadowedTokenCount: 12000 })
+    emit('compaction/end', { compactionId: 'k1', turn: 1 })
+
+    await vi.waitFor(() => { expect(contentOf(harness, 'STEP_STARTED')).toBeDefined() })
+    emit('step/start', { turn: 1, step: 1 })
+    emit('assistant/chunk', { turn: 1, chunk: { type: 'reasoning-delta', text: '继续想' } })
+
+    await vi.waitFor(() => {
+      expect(events(harness).map((e) => e.type)).toContain('REASONING_MESSAGE_CONTENT')
+    })
+    expect(harness.fake.cots).toHaveLength(1)
+    expect(events(harness).filter((e) => e.type === 'RUN_STARTED')).toHaveLength(1)
     await harness.dispose()
   })
 })

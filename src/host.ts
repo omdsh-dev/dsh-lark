@@ -566,6 +566,62 @@ export interface ToolCallData {
 }
 
 /**
+ * The `compaction/start` payload: the opening bracket of one compaction. The
+ * event is itself the host's durable lock, so at most one bracket is open per
+ * session and a bare id is enough to pair the three of them.
+ */
+export interface CompactionStartData {
+  /** Ties this bracket's `summary` and `end` back to the `start` that opened it. */
+  readonly compactionId: string
+  /**
+   * Who owns the transaction, and the only thing that separates the two kinds
+   * of compaction. A number means the bracket is strictly enclosed by that open
+   * turn — the automatic kind, which nobody asked for and which therefore has no
+   * other trace in the chat. `null` means a standalone `compactNow()`
+   * transaction, i.e. a manual `/compact`, whose command reply has already said
+   * what it did.
+   */
+  readonly turn: number | null
+}
+
+/**
+ * The `compaction/summary` payload, written only when the transaction actually
+ * summarized. A bracket that pruned its way back under safe pressure closes
+ * without one, and a failed bracket never reaches one — so the absence of this
+ * event is not an error, it is the difference between history having been
+ * folded and nothing having been.
+ */
+export interface CompactionSummaryData {
+  readonly compactionId: string
+  /**
+   * How many tokens the summary replaced. The folded amount is reported here
+   * and nowhere else — `end` carries the verdict but never the size — so a
+   * reader that wants both has to hold this until the bracket closes. Read it
+   * through {@link foldedTokenCount} rather than directly.
+   */
+  readonly shadowedTokenCount?: number
+}
+
+/**
+ * The `compaction/end` payload: the closing bracket, and the only place the
+ * transaction's verdict appears.
+ *
+ * A `summary` that already landed does NOT mean the session was changed: when
+ * `error` is set the host deliberately leaves the conversation surface
+ * untouched and only the log remembers the attempt. Anything counting real
+ * compactions therefore has to pair a `summary` with a clean `end`, never count
+ * summaries on their own. The close can also fail outright and leave a blocking
+ * orphan on purpose, so this event may simply never arrive.
+ */
+export interface CompactionEndData {
+  readonly compactionId: string
+  /** The same ownership contract as {@link CompactionStartData.turn}. */
+  readonly turn: number | null
+  /** The failure, when the transaction failed; absent on success. */
+  readonly error?: string
+}
+
+/**
  * Narrow a session event to the assembled assistant message for one step.
  * @param event - any session event.
  * @returns whether `event.data` carries {@link AssistantMessageData}.
@@ -665,6 +721,62 @@ export function isToolCallEvent(
   event: HostSessionEvent,
 ): event is HostSessionEvent & { readonly data: ToolCallData } {
   return event.type === 'tool/call'
+}
+
+/**
+ * Narrow a session event to the opening of one compaction.
+ * @param event - any session event.
+ * @returns whether `event.data` carries {@link CompactionStartData}.
+ */
+export function isCompactionStartEvent(
+  event: HostSessionEvent,
+): event is HostSessionEvent & { readonly data: CompactionStartData } {
+  return event.type === 'compaction/start'
+}
+
+/**
+ * Narrow a session event to the summary one compaction wrote.
+ * @param event - any session event.
+ * @returns whether `event.data` carries {@link CompactionSummaryData}.
+ */
+export function isCompactionSummaryEvent(
+  event: HostSessionEvent,
+): event is HostSessionEvent & { readonly data: CompactionSummaryData } {
+  return event.type === 'compaction/summary'
+}
+
+/**
+ * Narrow a session event to the close of one compaction.
+ * @param event - any session event.
+ * @returns whether `event.data` carries {@link CompactionEndData}.
+ */
+export function isCompactionEndEvent(
+  event: HostSessionEvent,
+): event is HostSessionEvent & { readonly data: CompactionEndData } {
+  return event.type === 'compaction/end'
+}
+
+/**
+ * The folded amount of one compaction, when there is an amount worth showing.
+ *
+ * Every surface reading this number has to keep "no value" and "zero" apart, so
+ * the test lives here once instead of in each of them. A bracket whose count is
+ * missing, non-finite, negative OR zero folded an amount nobody can act on, and
+ * a row reading `0 folded` is the kind of lie an operator acts on anyway — the
+ * same reason the status card drops a row rather than printing a zero into it.
+ *
+ * Zero belongs on that list rather than being passed through as a real amount:
+ * a summary reporting that it replaced nothing is indistinguishable, to every
+ * reader downstream, from a counter that simply did not work — and "compacted,
+ * folded 0" invites exactly the re-explaining this whole surface exists to
+ * spare people. Treating it as no value costs at most a line about a
+ * compaction that took nothing away.
+ * @param data - the summary payload of one compaction bracket.
+ * @returns the folded token count, or `undefined` when there is none to show.
+ */
+export function foldedTokenCount(data: CompactionSummaryData): number | undefined {
+  const folded = data.shadowedTokenCount
+  return typeof folded === 'number' && Number.isFinite(folded) && folded > 0 ? folded : undefined
 }
 
 /**

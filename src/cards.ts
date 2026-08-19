@@ -25,7 +25,7 @@
  * @module dsh-lark-channel/cards
  */
 
-import { formatByteSize } from './format.ts'
+import { formatByteSize, formatTokenCount } from './format.ts'
 
 /**
  * One string this module authored, in the languages a card can carry.
@@ -416,31 +416,19 @@ function multipleChoice(
 }
 
 /**
- * A token count at a glance: thousands past a thousand, whole below it. An
- * exact 127,431 is a number to parse; 127.4k is a number to read.
- * @param tokens - the count.
- * @returns the short form.
- */
-function compactCount(tokens: number): string {
-  if (tokens < 1000) return String(tokens)
-  const thousands = tokens / 1000
-  return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`
-}
-
-/**
  * How full the context is: what the next request carries, and — when the
  * provider says how big the window is — the share of it that leaves.
  * @param context - the used tokens and the window they sit in.
  * @returns the reading, localized.
  */
 function contextReading(context: { readonly used: number; readonly window?: number | undefined }): Copy {
-  const used = compactCount(context.used)
+  const used = formatTokenCount(context.used)
   const window = context.window
   if (window === undefined || window <= 0) return { zh: used, en: used }
   const share = Math.round((context.used / window) * 100)
   return {
-    zh: `${used} / ${compactCount(window)}（${share}%）`,
-    en: `${used} / ${compactCount(window)} (${share}%)`,
+    zh: `${used} / ${formatTokenCount(window)}（${share}%）`,
+    en: `${used} / ${formatTokenCount(window)} (${share}%)`,
   }
 }
 
@@ -812,6 +800,11 @@ const STATUS = {
     en: '%s in · %s out',
   },
   cached: { zh: '，缓存命中 %s', en: ', %s cached' },
+  compaction: { zh: '压缩', en: 'Compaction' },
+  compactionOf: {
+    zh: '已压缩 %s 次 · 累计折叠 %s',
+    en: 'Compacted %s× · %s folded',
+  },
   pendingCount: { zh: '%s 个审批卡片等待处理', en: '%s approval cards waiting' },
   isDefault: { zh: '部署默认', en: 'deployment default' },
   running: { zh: '正在跑一轮任务', en: 'Running a turn' },
@@ -922,6 +915,12 @@ export function statusCard(input: {
   readonly version: string
   /** The permission preset in force, as the deployment defines it. */
   readonly preset?: PresetRow | undefined
+  /**
+   * How much of this session's history has been folded into a summary. Absent
+   * where nothing has been, which is why the row disappears rather than
+   * reading zero.
+   */
+  readonly compaction?: { readonly count: number; readonly foldedTokens: number } | undefined
   readonly refresh: object
 }): object {
   return card('neutral', STATUS.summary, [
@@ -945,12 +944,20 @@ export function statusCard(input: {
       ...input.context === undefined
         ? []
         : field(STATUS.context, contextReading(input.context)),
+      // Right under the context reading, because the two answer halves of one
+      // question: what the next message carries, and what it no longer can.
+      ...input.compaction === undefined
+        ? []
+        : field(STATUS.compaction, fill(
+          fill(STATUS.compactionOf, String(input.compaction.count)),
+          formatTokenCount(input.compaction.foldedTokens),
+        )),
       ...input.usage === undefined
         ? []
         : field(STATUS.usage, join(
-          fill(fill(STATUS.usageOf, compactCount(input.usage.input)), compactCount(input.usage.output)),
-          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
-          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
+          fill(fill(STATUS.usageOf, formatTokenCount(input.usage.input)), formatTokenCount(input.usage.output)),
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, formatTokenCount(input.usage.cacheRead)).zh,
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, formatTokenCount(input.usage.cacheRead)).en,
         )),
       ...field(STATUS.session, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
