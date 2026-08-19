@@ -173,10 +173,12 @@ function isAutomaticCompaction(turn: number | null): turn is number {
  */
 function compactionLine(folded: number | undefined, error: string | undefined): string | undefined {
   if (error !== undefined) return '上下文压缩失败'
-  // No summary means nothing was folded: the transaction pruned its way back
-  // under safe pressure and the conversation reads the same as before. Saying
-  // "compacted" here would answer a question the reader never asked with a
-  // claim that is not true of this bracket.
+  // No amount worth stating means nothing worth saying. Either the bracket
+  // wrote no summary at all — it pruned its way back under safe pressure and
+  // the conversation reads the same as before — or it wrote one whose count
+  // `foldedTokenCount` will not vouch for, zero included. Saying "compacted"
+  // in either case would answer a question the reader never asked with a claim
+  // this bracket does not support.
   if (folded === undefined) return undefined
   return `上下文已压缩 · 折叠 ${formatTokenCount(folded)}`
 }
@@ -407,6 +409,20 @@ export function createCotRenderer(
         // tool it never called, and TEXT_MESSAGE_* already means "narration a
         // later commit replaced", so the agent would appear to have said this.
         //
+        // Closed in the same breath, under the same `stepName`. A step is a
+        // bracket like every other one this renderer opens, and this one is
+        // over before the line is even written: the phase being reported ended
+        // with the `compaction/end` in hand. Leaving it open would be a run
+        // that reaches RUN_FINISHED with a step still active — invalid AG-UI
+        // whatever any single client makes of it, and the two ways clients do
+        // make something of it are both worse than a pair: a strict validator
+        // rejects the write that carries RUN_FINISHED, taking the whole
+        // process's closure down with it on exactly the turns that compacted,
+        // and a lenient one renders a phase that never completes. `closeRun`
+        // already goes out of its way to close a dangling reasoning message;
+        // this is the same rule, paid for at the site that opens the bracket
+        // rather than in the cleanup.
+        //
         // Chinese alone. Everything outside a card is hard-coded Chinese here
         // (`failureLine`, `IDLE_TURN_NOTE`); only the status card is bilingual.
         // Two surfaces with two rules, not one surface being inconsistent.
@@ -414,7 +430,11 @@ export function createCotRenderer(
         // Accepted side effect: a compaction inside a turn that a pre-step gate
         // then rejects leaves a thinking process whose only content is this
         // line. `turn/end` still closes it, and the line is true.
-        enqueue(ensure(turn), cotEvent('STEP_STARTED', { stepName: line }))
+        enqueue(
+          ensure(turn),
+          cotEvent('STEP_STARTED', { stepName: line }),
+          cotEvent('STEP_FINISHED', { stepName: line }),
+        )
         return
       }
       if (isTurnEndEvent(event)) {

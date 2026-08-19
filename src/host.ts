@@ -670,15 +670,22 @@ export function isCompactionEndEvent(
  *
  * Every surface reading this number has to keep "no value" and "zero" apart, so
  * the test lives here once instead of in each of them. A bracket whose count is
- * missing, negative or non-finite folded an amount nobody can act on, and a row
- * reading `0 folded` is the kind of lie an operator acts on anyway — the same
- * reason the status card drops a row rather than printing a zero into it.
+ * missing, non-finite, negative OR zero folded an amount nobody can act on, and
+ * a row reading `0 folded` is the kind of lie an operator acts on anyway — the
+ * same reason the status card drops a row rather than printing a zero into it.
+ *
+ * Zero belongs on that list rather than being passed through as a real amount:
+ * a summary reporting that it replaced nothing is indistinguishable, to every
+ * reader downstream, from a counter that simply did not work — and "compacted,
+ * folded 0" invites exactly the re-explaining this whole surface exists to
+ * spare people. Treating it as no value costs at most a line about a
+ * compaction that took nothing away.
  * @param data - the summary payload of one compaction bracket.
  * @returns the folded token count, or `undefined` when there is none to show.
  */
 export function foldedTokenCount(data: CompactionSummaryData): number | undefined {
   const folded = data.shadowedTokenCount
-  return typeof folded === 'number' && Number.isFinite(folded) && folded >= 0 ? folded : undefined
+  return typeof folded === 'number' && Number.isFinite(folded) && folded > 0 ? folded : undefined
 }
 
 /**

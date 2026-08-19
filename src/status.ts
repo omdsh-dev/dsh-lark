@@ -85,7 +85,14 @@ export function readMeters(
 
 /** What one session's compaction history adds up to, in the shape the card takes. */
 export interface CompactionTally {
-  /** How many compactions actually landed on the conversation. */
+  /**
+   * How many compactions landed on the conversation AND folded an amount worth
+   * stating. A bracket that failed its close changed nothing; one that only
+   * pruned, or reported a count `foldedTokenCount` will not vouch for, folded
+   * nothing this row can put a number on. Neither is counted here, so this is
+   * the number of entries behind `foldedTokens` rather than every compaction
+   * the log remembers.
+   */
   readonly count: number
   /** How many tokens of history those compactions replaced, in total. */
   readonly foldedTokens: number

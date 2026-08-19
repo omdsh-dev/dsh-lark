@@ -293,11 +293,15 @@ describe('readCompactions', () => {
 
   it('leaves out a bracket with no usable folded amount', () => {
     // A prune-only bracket writes no summary at all, and a broken one writes a
-    // count nobody can act on. Both fold an amount this row cannot state.
+    // count nobody can act on. Both fold an amount this row cannot state — and
+    // an exact zero is the same case: `已压缩 1 次 · 累计折叠 0` reads as a
+    // broken counter to everyone downstream, which is the reading this row
+    // drops out rather than prints.
     for (const events of [
       [start('c1'), end('c1')],
       [start('c1'), summary('c1', undefined), end('c1')],
       [start('c1'), summary('c1', -1), end('c1')],
+      [start('c1'), summary('c1', 0), end('c1')],
       [start('c1'), summary('c1', Number.NaN), end('c1')],
       [start('c1'), summary('c1', '30000'), end('c1')],
     ]) {
