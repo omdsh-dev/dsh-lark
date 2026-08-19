@@ -70,7 +70,8 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |
 | Permission presets | `/permission` opens a picker saying what each preset may touch and whether it still asks; loosening the sandbox needs an approver, tightening it does not |
-| Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them — and refreshes in place |
+| Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them, and how often this session has been compacted and how much it folded away — and refreshes in place |
+| Visible compaction | When the context no longer fits, the oldest stretch of history is folded away; the channel does not start that, it only says it happened — one line in the run view each time, and a running total in `/status`, so "it forgot" is not read as "it got dumber" |
 | Session scope | One agent per chat, per topic thread, or per person in a shared chat |
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
 | Slash commands | Host commands (`/plan`, `/compact`, …) run straight through the DSH command runtime |
@@ -80,7 +81,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 
 | Command | What it does |
 |---|---|
-| `/status` | Show and refresh workspace, model, and session; context and tokens where available |
+| `/status` | Show and refresh workspace, model, and session; context, tokens, and compaction totals where available |
 | `/ws` | List the workspaces this channel can reach |
 | `/cd <name or path>` | Switch this conversation's workspace |
 | `/get <path>` | Send a workspace file to the chat |
