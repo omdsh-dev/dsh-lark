@@ -11,10 +11,12 @@
 
 import type { HostAgent, HostCommands } from './host.ts'
 import { GET_COMMAND } from './outbound-file.ts'
+import { PUT_COMMAND } from './larkdoc-publish.ts'
 import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
 import { NEW_COMMAND } from './epoch.ts'
+import { DOC_COMMAND } from './larkdoc-comment-surface.ts'
 
 /** Cancel the running turn. Not a host command: cancellation is an agent method. */
 export const STOP_COMMAND = 'stop'
@@ -61,14 +63,17 @@ export interface CommandOutcome {
  * @param agent - the agent whose scope decides what is available.
  * @returns the markdown listing.
  */
-export function helpText(commands: HostCommands | undefined, agent: HostAgent): string {
+export function helpText(commands: HostCommands | undefined, agent: HostAgent, sendDocs = true): string {
   const own = [
     `\`/${STOP_COMMAND}\` — 停止当前任务`,
     `\`/${CD_COMMAND} <路径>\` — 切换本会话的工作区目录`,
     `\`/${WS_COMMAND}\` — 查看可用工作区`,
     `\`/${GET_COMMAND} <路径>\` — 把工作区里的文件发到聊天`,
+    ...sendDocs ? [`\`/${PUT_COMMAND} <路径> [--into <文档链接>]\` — 把工作区产物写成飞书文档`] : [],
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
+    `\`/${DOC_COMMAND} list\` — 应用注册者在私聊中查看当前文档评论会话`,
+    `\`/${DOC_COMMAND} reset <文档链接>\` — 应用注册者在私聊中重置指定文档的评论上下文`,
     `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]
@@ -95,6 +100,7 @@ export async function runCommandLine(
   agent: HostAgent,
   commands: HostCommands | undefined,
   signal: AbortSignal,
+  sendDocs = true,
 ): Promise<CommandOutcome> {
   const trimmed = line.trimStart()
   const name = commandName(trimmed) ?? ''
@@ -103,14 +109,14 @@ export async function runCommandLine(
     return { reply: '⏹ 已停止当前任务。', resolved: true }
   }
   if (name === HELP_COMMAND) {
-    return { reply: helpText(commands, agent), resolved: true }
+    return { reply: helpText(commands, agent, sendDocs), resolved: true }
   }
   if (commands === undefined) {
     return { reply: `⚠️ 本部署没有组合命令运行时，\`/${name}\` 无法执行。`, resolved: false }
   }
   const execution = await commands.execute(agent, trimmed, signal)
   if (execution === undefined) {
-    return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent)}`, resolved: false }
+    return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent, sendDocs)}`, resolved: false }
   }
   const { result } = execution
   if (result.kind === 'error') return { reply: `⚠️ \`/${name}\` 执行失败：${result.text}`, resolved: true }

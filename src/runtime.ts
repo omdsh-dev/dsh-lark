@@ -163,6 +163,8 @@ export const internals: {
   reissueFloorMs?: number
   /** Reconnect-watchdog deadline override; absent keeps the bridge default. */
   reconnectDeadlineMs?: number
+  /** Document capability probe/recheck deadline override for deterministic tests. */
+  capabilityDeadlineMs?: number
   /** How an onboarded secret is stored; substituted in tests. */
   storeSecret: typeof storeAppSecret
 } = {
@@ -202,14 +204,23 @@ export function apply(ctx: Context, config: Config): void {
     started = true
     const authorization = resolveAuthorization(resolved)
     internals.notify(describeAuthorization(authorization))
+    const liveness = internals.reconnectDeadlineMs === undefined && internals.capabilityDeadlineMs === undefined
+      ? undefined
+      : {
+          ...internals.reconnectDeadlineMs === undefined ? {} : { deadlineMs: internals.reconnectDeadlineMs },
+          ...internals.capabilityDeadlineMs === undefined
+            ? {}
+            : { capabilityDeadlineMs: internals.capabilityDeadlineMs },
+        }
     installBridge(
       ctx,
       resolved,
       internals.createPort(resolved, authorization),
       internals.notify,
       authorization,
+      internals.registerApp,
       persistState,
-      internals.reconnectDeadlineMs === undefined ? undefined : { deadlineMs: internals.reconnectDeadlineMs },
+      liveness,
     )
   }
 

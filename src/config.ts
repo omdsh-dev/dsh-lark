@@ -50,6 +50,12 @@ export interface Config {
    * or the provider's own store, whichever is configured.
    */
   appSecretRef?: string
+  /**
+   * Managed state, not hand-written configuration: open id of the user who
+   * completed first-boot registration. On-demand document authorization sends
+   * its app-changing link to this person instead of exposing it in a group.
+   */
+  registeredBy?: string
   /** Open-platform domain: `https://open.feishu.cn` (default) or `https://open.larksuite.com`. */
   domain?: string
   /** Absolute workspace directory for chat-driven agents; defaults to the host process cwd. */
@@ -81,6 +87,12 @@ export interface Config {
    * zero. Absent is the first session, whose id is unchanged.
    */
   chatEpochs?: Record<string, string>
+  /**
+   * Managed state, not configuration: how many times each canonical document
+   * conversation has been reset with `/doc reset`, keyed by `doc:<fileToken>`.
+   * Absent is the original durable session id.
+   */
+  documentGenerations?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -183,6 +195,28 @@ export interface Config {
    */
   maxSendFileBytes?: number
   /**
+   * Let chat agents publish workspace artifacts as cloud documents. On by
+   * default. New documents grant exactly the receiving direct user or group;
+   * model-driven group creation waits for approval, while human `/put` does
+   * not. The model tool creates only; human `/put --into` may append to its
+   * explicit target. Agent-owned sends share the per-chat held-content ceiling
+   * with `send_file`.
+   */
+  sendDocs?: boolean
+  /**
+   * Enable document-comment events as an agent conversation surface. One
+   * durable session is derived per document; only explicit non-self mentions
+   * open turns, and terminal replies return to the triggering comment thread.
+   */
+  commentDocs?: boolean
+  /**
+   * Start the QR re-authorization flow when a real document call reports
+   * missing tenant scopes. The same additive request includes the document
+   * comment event subscription. Off leaves the failure visible without sending
+   * an app-configuration link.
+   */
+  docAuthorizeOnDemand?: boolean
+  /**
    * Let the platform drop the process once its run finishes, leaving only the
    * answer in the conversation. `cot` output only.
    */
@@ -255,12 +289,14 @@ export interface ResolvedConfig {
   appId?: string | undefined
   appSecret?: string | undefined
   appSecretRef?: string | undefined
+  registeredBy?: string | undefined
   domain?: string | undefined
   cwd?: string | undefined
   workspaceRoots: string[]
   chatWorkspaces: Record<string, string>
   chatModels: Record<string, string>
   chatEpochs: Record<string, string>
+  documentGenerations: Record<string, string>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -272,6 +308,9 @@ export interface ResolvedConfig {
   maxReceiveFileBytes: number
   sendFiles: boolean
   maxSendFileBytes: number
+  sendDocs: boolean
+  commentDocs: boolean
+  docAuthorizeOnDemand: boolean
   hideProcessWhenDone: boolean
   syncSlashCommands: boolean
   denyTools: string[]
@@ -289,12 +328,14 @@ export const Config: z<Config> = z.object({
   appId: z.string(),
   appSecret: z.string().role('secret'),
   appSecretRef: z.string(),
+  registeredBy: z.string(),
   domain: z.string(),
   cwd: z.string(),
   workspaceRoots: z.array(String),
   chatWorkspaces: z.dict(String).default({}),
   chatModels: z.dict(String).default({}),
   chatEpochs: z.dict(String).default({}),
+  documentGenerations: z.dict(String).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -306,6 +347,9 @@ export const Config: z<Config> = z.object({
   maxReceiveFileBytes: z.number().default(20 * 1024 * 1024),
   sendFiles: z.boolean().default(true),
   maxSendFileBytes: z.number().default(20 * 1024 * 1024),
+  sendDocs: z.boolean().default(true),
+  commentDocs: z.boolean().default(true),
+  docAuthorizeOnDemand: z.boolean().default(true),
   hideProcessWhenDone: z.boolean().default(false),
   syncSlashCommands: z.boolean().default(true),
   denyTools: z.array(String).default([...DEFAULT_DENY_TOOLS]),
@@ -329,6 +373,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     chatWorkspaces: config.chatWorkspaces ?? {},
     chatModels: config.chatModels ?? {},
     chatEpochs: config.chatEpochs ?? {},
+    documentGenerations: config.documentGenerations ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,
@@ -337,6 +382,9 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxReceiveFileBytes: config.maxReceiveFileBytes ?? 20 * 1024 * 1024,
     sendFiles: config.sendFiles ?? true,
     maxSendFileBytes: config.maxSendFileBytes ?? 20 * 1024 * 1024,
+    sendDocs: config.sendDocs ?? true,
+    commentDocs: config.commentDocs ?? true,
+    docAuthorizeOnDemand: config.docAuthorizeOnDemand ?? true,
     hideProcessWhenDone: config.hideProcessWhenDone ?? false,
     syncSlashCommands: config.syncSlashCommands ?? true,
     denyTools: config.denyTools ?? [...DEFAULT_DENY_TOOLS],

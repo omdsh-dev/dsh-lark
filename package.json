@@ -1,7 +1,7 @@
 {
   "name": "dsh-lark-channel",
   "description": "Lark/Feishu IM bot channel for DeepSeek Harness: chats drive agents, replies and approvals return as messages and cards",
-  "version": "0.0.6",
+  "version": "0.0.7-lark-docs.2",
   "type": "module",
   "keywords": [
     "dsh",

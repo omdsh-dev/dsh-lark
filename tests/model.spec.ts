@@ -9,6 +9,7 @@ import {
 } from '../src/model.ts'
 import type { CatalogEntry } from '../src/model.ts'
 import { readMeters, renderStatusCard, STATUS_ACTION } from '../src/status.ts'
+import type { LarkDocCapabilitySnapshot } from '../src/capability.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 const catalog: CatalogEntry[] = [
@@ -17,6 +18,10 @@ const catalog: CatalogEntry[] = [
   { provider: 'pi', id: 'org/shared-model', name: 'Shared A' },
   { provider: 'qi', id: 'org/shared-model', name: 'Shared B' },
 ]
+
+const DOCUMENT_CAPABILITIES: LarkDocCapabilitySnapshot = {
+  write: { enabled: true, missingScopes: [], scopeMapVerified: true, source: 'scope-list' },
+}
 
 /** A store recording persisted patches. */
 function createStore(options: { entries?: Record<string, string>; persisted?: boolean } = {}) {
@@ -252,12 +257,15 @@ describe('renderStatusCard', () => {
       running: false,
       pendingApprovals: 0,
       version: '0.0.3',
+      documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(idle)).toContain('/srv/work')
     // Meters are absent here, so the card claims no numbers at all.
     expect(shown(idle).some((text) => text.includes('上下文'))).toBe(false)
     expect(shown(idle)).toContain('0.0.3')
     expect(shown(idle)).toContain('空闲')
+    expect(shown(idle)).toContain('写 ✓')
     expect(shown(idle)).not.toContain('待审批')
     // The refresh button re-reads the same conversation it was built for.
     expect(cardControls(idle).map((control) => control.value))
@@ -273,6 +281,8 @@ describe('renderStatusCard', () => {
       running: true,
       pendingApprovals: 2,
       version: '0.0.3',
+      documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(busy)).toContain('正在跑一轮任务')
     expect(shown(busy)).toContain('2 个审批卡片等待处理')
@@ -287,6 +297,8 @@ describe('renderStatusCard', () => {
       running: false,
       pendingApprovals: 0,
       version: '',
+      documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(fresh).some((text) => text.includes('尚未创建'))).toBe(true)
     // An unknown version hides the row rather than printing an empty claim.

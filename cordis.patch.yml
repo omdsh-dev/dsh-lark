@@ -19,6 +19,8 @@
         # workspaceRoots: []   # directory prefixes /cd may enter; empty = any
         # chatWorkspaces: {}   # managed by /cd via the settings service; not hand-edited
         # chatModels: {}       # managed by /model via the settings service; not hand-edited
+        # chatEpochs: {}       # managed by /new via the settings service; not hand-edited
+        # documentGenerations: {} # managed by /doc reset; not hand-edited
         # provider: deepseek                    # default is the host agentDefaultModel
         # model: deepseek-chat
         # Output. `cot` shows the process as a native thinking-process message
@@ -30,8 +32,11 @@
         # receiveFiles: true         # inbound files land in .dsh-lark/inbox/
         # maxReceiveFileBytes: 20971520
         # sendFiles: true            # groups still gate every send behind a card,
-        #                            # at most three of them undecided at a time
+        #                            # shares three held outbound slots with send_doc
         # maxSendFileBytes: 20971520
+        # sendDocs: true             # send_doc creates a document; /put may also append to an explicit target
+        # commentDocs: true          # @mentions in document comments open document-scoped conversations
+        # docAuthorizeOnDemand: true # missing scopes + comment event trigger registrar-targeted QR authorization
         # hideProcessWhenDone: false # let the platform drop a finished process
         # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
         # syncSlashCommands: true    # publish commands to the bot's `/` panel

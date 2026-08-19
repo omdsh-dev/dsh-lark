@@ -270,6 +270,31 @@ function actions(buttons: readonly CardButton[], compact = false): object {
   }
 }
 
+/** One URL button. The URL itself is platform-produced and never a callback payload. */
+function linkAction(label: Copy, url: string): object {
+  return {
+    tag: 'column_set',
+    flex_mode: 'stretch',
+    background_style: 'default',
+    horizontal_spacing: '8px',
+    horizontal_align: 'left',
+    margin: '16px 20px 0px 20px',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      vertical_align: 'top',
+      elements: [{
+        tag: 'button',
+        text: textNode(label, SIZE.body, undefined, 'center'),
+        type: 'primary_filled',
+        width: 'fill',
+        behaviors: [{ type: 'open_url', default_url: url }],
+      }],
+    }],
+  }
+}
+
 /**
  * One option rendered as a full-width clickable row: label above, the reason
  * to pick it below.
@@ -699,6 +724,147 @@ export function settledFileApprovalCard(input: {
   ])
 }
 
+/** Copy for publishing an agent artifact as a group-readable document (ADR 0008). */
+const DOC_SEND = {
+  title: { zh: '需要你的授权', en: 'Approval needed' },
+  context: {
+    zh: 'Agent 想把一份产物写成飞书文档并让这个群可读',
+    en: 'The agent wants to publish a document readable by this group',
+  },
+  name: { zh: '文档', en: 'Document' },
+  scope: { zh: '可见范围', en: 'Visible to' },
+  allow: { zh: '允许发布', en: 'Publish it' },
+  reject: { zh: '拒绝', en: 'Reject' },
+  foot: {
+    zh: '群里所有人都能打开它，包括之后退群的人。确认内容可以公开后再允许。',
+    en: 'Everyone in this group can open it, including members who later leave. Allow only if the content can be shared.',
+  },
+}
+
+/** Ask a group before a document is created and shared to that group. */
+export function documentPublishApprovalCard(input: {
+  readonly title: string
+  readonly visibleTo: string
+  readonly allow: object
+  readonly reject: object
+}): object {
+  const title = clip(input.title, COMMAND_MAX_CHARS)
+  const visibleTo = clip(input.visibleTo, COMMAND_MAX_CHARS)
+  return card('warning', join(DOC_SEND.title, `：${title.shown}`, `: ${title.shown}`), [
+    ...heading('warning', DOC_SEND.title, DOC_SEND.context),
+    quoted(DOC_SEND.name, title.shown, 'grey-50', title.hidden),
+    quoted(DOC_SEND.scope, visibleTo.shown, 'grey-50', visibleTo.hidden),
+    actions([
+      { label: DOC_SEND.allow, value: input.allow, kind: 'primary' },
+      { label: DOC_SEND.reject, value: input.reject, kind: 'danger' },
+    ]),
+    ...footer(DOC_SEND.foot),
+  ])
+}
+
+/** How one document publication approval ended. */
+const DOC_SEND_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+  'allowed-once': { state: 'success', title: { zh: '已允许发布', en: 'Publication allowed' } },
+  rejected: { state: 'danger', title: { zh: '已拒绝发布', en: 'Publication rejected' } },
+  cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
+  unavailable: { state: 'neutral', title: { zh: '无法发布', en: 'Could not be published' } },
+}
+
+/** Static record replacing a decided document approval card. */
+export function settledDocumentPublishApprovalCard(input: {
+  readonly title: string
+  readonly outcome: string
+  readonly decidedBy?: string | undefined
+}): object {
+  const settled = DOC_SEND_OUTCOME[input.outcome] ?? DOC_SEND_OUTCOME.cancelled!
+  const title = clip(input.title, COMMAND_MAX_CHARS)
+  const context = input.decidedBy === undefined || input.decidedBy === ''
+    ? title.shown
+    : join(fill(APPROVAL.decidedBy, title.shown), input.decidedBy)
+  return card(settled.state, join(settled.title, `：${title.shown}`, `: ${title.shown}`), [
+    ...heading(settled.state, settled.title, context),
+    ...footer(APPROVAL.closed),
+  ])
+}
+
+/** Copy for the single authorization path required by ADR 0007. */
+const DOC_AUTHORIZATION = {
+  title: { zh: '需要补充文档权限', en: 'Document access is needed' },
+  context: { zh: '当前应用需要补充下面的文档配置', en: 'This app needs the document configuration below' },
+  scopes: { zh: '待授权 scope', en: 'Scopes to authorize' },
+  events: { zh: '待订阅事件', en: 'Event to subscribe' },
+  authorize: { zh: '点此授权', en: 'Authorize' },
+  foot: {
+    zh: '扫码确认后渠道会重新检查 scope；事件订阅无查询接口，以 /status 是否收到事件为准。',
+    en: 'After confirmation the channel rechecks scopes. Event subscription has no query API; /status event arrival is the evidence.',
+  },
+  exposedFoot: {
+    zh: '这个链接可以修改应用配置。当前没有已记录的注册者，只能发到原聊天；请勿转发。扫码后渠道会重新检查权限。',
+    en: 'This link can change the app configuration. No registered owner is recorded, so it had to be sent here; do not forward it. The channel rechecks scopes after scanning.',
+  },
+  summary: { zh: '需要补充文档权限', en: 'Document access is needed' },
+  checked: { zh: '权限复核完成', en: 'Permission recheck completed' },
+  checkFailed: { zh: '权限复核失败', en: 'Permission recheck failed' },
+  changed: { zh: '权限状态有变化，以当前能力表为准', en: 'Scope state changed; the current capability table is authoritative' },
+  unchanged: { zh: '权限未变化；可能仍在审批，或 addons 灰度尚未生效', en: 'Scopes did not change; approval may still be pending, or the addons rollout may not apply' },
+  unconfirmed: {
+    zh: '复核失败，状态未确认；权限按上次确认结果保持不变',
+    en: 'The recheck failed, so the state is unconfirmed; permissions remain at the last confirmed result',
+  },
+  capabilities: { zh: '文档能力', en: 'Document capabilities' },
+  grantedScopes: { zh: '本次新增 scope', en: 'Scopes granted in this recheck' },
+  eventUnverified: {
+    zh: '事件订阅没有查询接口，是否生效仍以 /status 实际收到事件为准。',
+    en: 'Event subscriptions have no query API; actual event arrival in /status remains the evidence.',
+  },
+}
+
+/** On-demand QR authorization link, identical for every grant status (ADR 0007). */
+export function documentAuthorizationCard(input: {
+  readonly scopes: readonly string[]
+  readonly events?: readonly string[]
+  readonly url: string
+  /** True when no registered owner exists and the app-changing URL falls back to the source chat. */
+  readonly exposed: boolean
+}): object {
+  return card('warning', DOC_AUTHORIZATION.summary, [
+    ...heading('warning', DOC_AUTHORIZATION.title, DOC_AUTHORIZATION.context),
+    quoted(DOC_AUTHORIZATION.scopes, input.scopes.join('\n'), 'grey-50'),
+    ...input.events === undefined || input.events.length === 0
+      ? []
+      : [quoted(DOC_AUTHORIZATION.events, input.events.join('\n'), 'grey-50')],
+    linkAction(DOC_AUTHORIZATION.authorize, input.url),
+    ...footer(input.exposed ? DOC_AUTHORIZATION.exposedFoot : DOC_AUTHORIZATION.foot),
+  ])
+}
+
+/** Post-scan result. It states only what the follow-up `scope.list` proved. */
+export function documentAuthorizationResultCard(input: {
+  readonly outcome: 'changed' | 'unchanged' | 'failed'
+  readonly capabilities: Copy
+  readonly grantedScopes?: readonly string[] | undefined
+}): object {
+  const failed = input.outcome === 'failed'
+  const changed = input.outcome === 'changed'
+  const title = failed ? DOC_AUTHORIZATION.checkFailed : DOC_AUTHORIZATION.checked
+  return card(changed ? 'info' : 'warning', title, [
+    ...heading(
+      changed ? 'info' : 'warning',
+      title,
+      failed ? DOC_AUTHORIZATION.unconfirmed : changed ? DOC_AUTHORIZATION.changed : DOC_AUTHORIZATION.unchanged,
+    ),
+    // A failed recheck confirms no current capability value. Showing the last
+    // table here with checkmarks would visually promote stale state to proof.
+    ...failed ? [] : [
+      panel(field(DOC_AUTHORIZATION.capabilities, input.capabilities, undefined, true)),
+      ...input.grantedScopes === undefined || input.grantedScopes.length === 0
+        ? []
+        : [quoted(DOC_AUTHORIZATION.grantedScopes, input.grantedScopes.join('\n'), 'grey-50')],
+    ],
+    ...footer(DOC_AUTHORIZATION.eventUnverified),
+  ])
+}
+
 /**
  * The card that carries one model question into the chat.
  * @param input - the question, its options, and each option's click payload.
@@ -805,6 +971,8 @@ const STATUS = {
   preset: { zh: '权限', en: 'Permissions' },
   presetOpen: { zh: '不沙箱，且不再弹审批卡', en: 'no sandbox, and no approval cards' },
   pending: { zh: '待审批', en: 'Awaiting approval' },
+  documents: { zh: '文档能力', en: 'Document capabilities' },
+  commentSurface: { zh: '评论面', en: 'Comment surface' },
   context: { zh: '上下文', en: 'Context' },
   usage: { zh: '本会话用量', en: 'Tokens this session' },
   usageOf: {
@@ -919,6 +1087,8 @@ export function statusCard(input: {
   readonly activity: 'running' | 'idle' | 'unbound'
   readonly pendingApprovals: number
   readonly version: string
+  readonly documentCapabilities: Copy
+  readonly commentSurface: Copy
   /** The permission preset in force, as the deployment defines it. */
   readonly preset?: PresetRow | undefined
   readonly refresh: object
@@ -929,6 +1099,8 @@ export function statusCard(input: {
       ...field(STATUS.workspace, input.workspace, input.workspaceIsDefault ? STATUS.isDefault : undefined, true),
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
       ...field(STATUS.activity, STATUS[input.activity]),
+      ...field(STATUS.documents, input.documentCapabilities),
+      ...field(STATUS.commentSurface, input.commentSurface),
       ...input.preset === undefined
         ? []
         // Named where someone looks for it: a session that stopped asking

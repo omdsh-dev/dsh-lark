@@ -189,7 +189,7 @@ export function sanitizeFileName(name: string | undefined): string {
  * @param name - the sanitized name.
  * @returns the name to write: `app.log`, then `app-2.log`.
  */
-function claimFileName(taken: Set<string>, name: string): string {
+export function claimFileName(taken: Set<string>, name: string): string {
   const extension = extname(name)
   const stem = name.slice(0, name.length - extension.length)
   let candidate = name
@@ -213,11 +213,37 @@ function claimFileName(taken: Set<string>, name: string): string {
  * @param workspace - the conversation's workspace directory.
  * @returns the absolute directory path.
  */
-function inboxDirectoryFor(msg: NormalizedMessage, workspace: string): string {
+export function inboxDirectoryFor(msg: NormalizedMessage, workspace: string): string {
   const sentAt = Number.isFinite(msg.createTime) && msg.createTime > 0 ? msg.createTime : Date.now()
   const stamp = new Date(sentAt).toISOString().slice(0, 19).replace(/:/g, '')
   const digest = createHash('sha256').update(msg.messageId).digest('hex').slice(0, 8)
   return resolve(workspace, CHANNEL_DIRECTORY, INBOX_DIRECTORY, `${stamp}-${digest}`)
+}
+
+/**
+ * Create and prove the one inbox directory shared by every inbound file in a
+ * message.
+ * @param msg - the inbound message whose items are being landed.
+ * @param workspace - the conversation workspace.
+ * @returns the canonical absolute directory that may be written to.
+ */
+export async function prepareInboundMessageDirectory(
+  msg: NormalizedMessage,
+  workspace: string,
+): Promise<string> {
+  const requested = inboxDirectoryFor(msg, workspace)
+  try {
+    await mkdir(requested, { recursive: true })
+    const landing = realpathSync(requested)
+    const container = canonicalPathOf(workspace) ?? resolve(workspace)
+    if (!isWithinContainer(landing, container)) {
+      throw new Error('the inbox directory does not resolve inside the workspace')
+    }
+    return landing
+  } catch (error) {
+    await discardEmptyInboundMessageDirectory(requested)
+    throw error
+  }
 }
 
 /**
@@ -246,7 +272,7 @@ async function discardFile(path: string, report: (line: string) => void): Promis
  * nothing anyone was told.
  * @param path - the message directory.
  */
-async function discardDirectory(path: string): Promise<void> {
+export async function discardEmptyInboundMessageDirectory(path: string): Promise<void> {
   await rmdir(path).catch(() => {})
 }
 
@@ -298,34 +324,12 @@ export async function collectInboundFiles(
   // and a proof taken on one of them says nothing about the other.
   let directory: string
   try {
-    // The transport streams into an existing directory; it does not make one.
-    await mkdir(requested, { recursive: true })
-    // And the directory it just made has to be PROVEN inside the workspace
-    // rather than merely spelled that way. The sanitizer cannot see a symlink —
-    // it judges one name, while `resolve` and `join` fold `..` and then answer
-    // "inside the workspace" for a path whose own components lead anywhere at
-    // all: a `.dsh-lark/inbox` pointing elsewhere takes `mkdir` with it, and
-    // the sender's next file lands in the link's target under a name the sender
-    // chose. So containment is asked of the filesystem and not of the string,
-    // the same way outbound refuses to trust a path it has not canonicalized
-    // (ADR 0004) — and a write earns that question at least as much as a read.
-    //
-    // The canonical form is then KEPT and joined onto, because a proof is only
-    // worth anything on the path the bytes actually travel: writing through
-    // `requested` after canonicalizing it would leave the same link free to be
-    // swapped in between the check and the download, and the check would have
-    // been about a directory nothing was written to.
-    const landing = realpathSync(requested)
-    const container = canonicalPathOf(options.workspace) ?? resolve(options.workspace)
-    if (!isWithinContainer(landing, container)) {
-      throw new Error('the inbox directory does not resolve inside the workspace')
-    }
-    directory = landing
+    directory = await prepareInboundMessageDirectory(msg, options.workspace)
   } catch (error) {
     const detail = failureDetail(error)
     // Nothing was downloaded, so whatever this attempt did create is an empty
     // directory nobody was promised — including one made through a link.
-    await discardDirectory(requested)
+    await discardEmptyInboundMessageDirectory(requested)
     options.report(`lark-channel: could not create the inbox directory ${requested}: ${detail}`)
     return {
       landed: [],
@@ -390,7 +394,7 @@ export async function collectInboundFiles(
   // A message whose every file was refused would otherwise leave its directory
   // behind, one empty `<stamp>-<digest>/` per rejected message, accumulating in
   // exactly the directory the `.gitignore` hint sends people to look at.
-  if (landed.length === 0) await discardDirectory(directory)
+  if (landed.length === 0) await discardEmptyInboundMessageDirectory(directory)
 
   return {
     landed,

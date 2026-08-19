@@ -7,6 +7,8 @@
  */
 
 import { statusCard } from './cards.ts'
+import type { Copy } from './cards.ts'
+import type { LarkDocCapabilitySnapshot } from './capability.ts'
 import { marked } from './clicks.ts'
 import type { HostContextPressure, HostSession, HostSessionProjections, HostTokenUsage } from './host.ts'
 import type { PresetOption } from './permission.ts'
@@ -122,6 +124,10 @@ export interface StatusFields {
   readonly pendingApprovals: number
   /** The running plugin's version; empty hides the row rather than lying. */
   readonly version: string
+  /** Cloud-document features available to the next agent created in this bridge. */
+  readonly documentCapabilities: LarkDocCapabilitySnapshot
+  /** Bridge-wide document-comment event observation and live-session count. */
+  readonly commentSurface: Copy
   /**
    * The permission preset in force, as the deployment defines it — the knobs
    * travel with the name so the row describes what the session can actually
@@ -141,6 +147,23 @@ export interface StatusFields {
     readonly cacheRead: number
     readonly cacheWrite: number
   } | undefined
+}
+
+/** Render one capability table without hiding exact missing scope names. */
+export function documentCapabilityCopy(snapshot: LarkDocCapabilitySnapshot): Copy {
+  const state = snapshot.write
+  const mark = state.enabled ? '✓' : '✗'
+  const missing = state.enabled || state.missingScopes.length === 0
+    ? { zh: '', en: '' }
+    : {
+        zh: `（缺 ${state.missingScopes.join('、')}）`,
+        en: ` (missing ${state.missingScopes.join(', ')})`,
+      }
+  const unverified = Object.values(snapshot).some(state => !state.scopeMapVerified)
+  return {
+    zh: `写 ${mark}${missing.zh}${unverified ? '；scope 名单待实测' : ''}`,
+    en: `write ${mark}${missing.en}${unverified ? '; scope map awaiting live verification' : ''}`,
+  }
 }
 
 /**
@@ -164,6 +187,8 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     activity: fields.running ? 'running' : fields.bound ? 'idle' : 'unbound',
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
+    documentCapabilities: documentCapabilityCopy(fields.documentCapabilities),
+    commentSurface: fields.commentSurface,
     ...fields.preset === undefined ? {} : { preset: fields.preset },
     ...fields.context === undefined ? {} : { context: fields.context },
     ...fields.usage === undefined ? {} : { usage: fields.usage },
