@@ -1,0 +1,17 @@
+packages:
+  - .
+
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  # protobufjs's postinstall only prints a version-compatibility notice; the
+  # runtime works without it, so builds stay disabled for reproducibility.
+  protobufjs: false
+
+# Keep the default 24h quarantine for the ecosystem at large, but not for the
+# host's own packages: DSH ships release candidates daily, and a CI that
+# refuses every fresh @deepseek-ai release goes red for a day per bump.
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'

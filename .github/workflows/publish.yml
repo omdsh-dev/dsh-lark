@@ -1,0 +1,63 @@
+name: Publish
+
+# Tag-driven release. `npm publish` reads `publishConfig` from package.json,
+# so access and provenance are declared with the package, not here.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub release for the tag
+  id-token: write # provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # Installs devDependencies and runs `prepare`, which emits lib/.
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # A tag that disagrees with the manifest would publish a version nobody
+      # asked for, and npm versions are immutable once taken.
+      - name: Check tag against package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $tag does not match package.json version $manifest" >&2
+            exit 1
+          fi
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # A tag is not a release: the tag drives publishing, and this is what
+      # puts the same version on the repository's releases page, with the
+      # changelog section it was written for as its body.
+      - name: Publish the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          node scripts/release-notes.mjs "$version" > /tmp/release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md

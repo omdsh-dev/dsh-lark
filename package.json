@@ -1,0 +1,91 @@
+{
+  "name": "dsh-lark-channel",
+  "description": "Lark/Feishu IM bot channel for DeepSeek Harness: chats drive agents, replies and approvals return as messages and cards",
+  "version": "0.0.7",
+  "type": "module",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "lark",
+    "feishu",
+    "larksuite",
+    "channel",
+    "chatbot",
+    "im-bot",
+    "cordis",
+    "ai-agent"
+  ],
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b && tsdown",
+    "test": "vitest run",
+    "typecheck": "tsc -b --pretty false && tsc -p tsconfig.vitest.json --pretty false",
+    "register-app": "node scripts/register-lark-app.mjs",
+    "prepare": "node scripts/prepare.mjs",
+    "prepack": "node scripts/prepare.mjs"
+  },
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "bin": {
+    "dsh-lark-channel": "lib/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./invariant": {
+      "types": "./lib/types/invariant.d.ts",
+      "default": "./lib/invariant.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "README.en.md",
+    "cordis.patch.yml",
+    "lib",
+    "src"
+  ],
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omdsh-dev/dsh-lark.git"
+  },
+  "bugs": {
+    "url": "https://github.com/omdsh-dev/dsh-lark/issues"
+  },
+  "homepage": "https://github.com/omdsh-dev/dsh-lark#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@larksuite/channel": "^0.4.1",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@types/node": "^22.20.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3",
+    "unrun": "^0.3.1",
+    "vitest": "^4.1.8"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+# Bundle patch applied over the selected DSH profile when this package is listed
+# in `dsh.profile.bundles`. The row id is deployment-local; the package name
+# must match package.json.
+# Package installation policy (the profile's pnpm build-script settings) is
+# prepared by the provisioning CLI before this runtime patch is loaded.
+
+- insert:
+    - id: lark-channel
+      name: 'dsh-lark-channel'
+      config:
+        # Credentials layer as: these entry values (env via `!!js`, never
+        # `!js`) → the user settings document. With neither set, first boot
+        # logs a QR URL; scanning it creates the app and the credentials
+        # persist through the host `settings` service.
+        appId: !!js process.env.LARK_APP_ID
+        appSecret: !!js process.env.LARK_APP_SECRET
+        # domain: https://open.larksuite.com   # default is Feishu
+        # cwd: an absolute workspace directory  # default is the host process cwd
+        # workspaceRoots: []   # directory prefixes /cd may enter; empty = any
+        # chatWorkspaces: {}   # managed by /cd via the settings service; not hand-edited
+        # chatModels: {}       # managed by /model via the settings service; not hand-edited
+        # provider: deepseek                    # default is the host agentDefaultModel
+        # model: deepseek-chat
+        # Output. `cot` shows the process as a native thinking-process message
+        # and sends the answer as an ordinary one; `stream` keeps the whole turn
+        # in one typewriter card, for clients older than that surface.
+        # output: cot
+        # showProcess: true          # off sends the answer alone
+        # attachImages: false        # only for a route that accepts images
+        # receiveFiles: true         # inbound files land in .dsh-lark/inbox/
+        # maxReceiveFileBytes: 20971520
+        # sendFiles: true            # groups still gate every send behind a card,
+        #                            # at most three of them undecided at a time
+        # maxSendFileBytes: 20971520
+        # hideProcessWhenDone: false # let the platform drop a finished process
+        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
+        # syncSlashCommands: true    # publish commands to the bot's `/` panel
+        # sessionScope: chat         # chat-thread / chat-sender split it finer
+        requireMention: true
+        # Authorization narrows; it does not gate. Who can reach the bot at all
+        # is the app's visibility scope in the developer console. Unconfigured,
+        # this serves any room it is added to (when @-mentioned) and anyone the
+        # app is visible to.
+        # senderAllowlist: []   # empty serves anyone who can DM the app
+        # groupAllowlist: []    # empty serves any group
+        # approvers: []         # empty lets whoever drives a chat approve;
+        #                       # settled cards best-effort name the decider, else show open_id
+
+    # The invariant companion stays out of the default patch: the shipped
+    # dsh-base/web profiles compose no `invariants` service (it comes from the
+    # host's runtime-diagnostics composition), and a row waiting on the absent
+    # service fails the whole tree at boot. Diagnostic compositions add:
+    #   - id: lark-channel-invariant
+    #     name: 'dsh-lark-channel/invariant'
