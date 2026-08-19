@@ -25,7 +25,7 @@
  * @module dsh-lark-channel/cards
  */
 
-import { formatByteSize } from './format.ts'
+import { formatByteSize, formatTokenCount } from './format.ts'
 
 /**
  * One string this module authored, in the languages a card can carry.
@@ -416,31 +416,19 @@ function multipleChoice(
 }
 
 /**
- * A token count at a glance: thousands past a thousand, whole below it. An
- * exact 127,431 is a number to parse; 127.4k is a number to read.
- * @param tokens - the count.
- * @returns the short form.
- */
-function compactCount(tokens: number): string {
-  if (tokens < 1000) return String(tokens)
-  const thousands = tokens / 1000
-  return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`
-}
-
-/**
  * How full the context is: what the next request carries, and — when the
  * provider says how big the window is — the share of it that leaves.
  * @param context - the used tokens and the window they sit in.
  * @returns the reading, localized.
  */
 function contextReading(context: { readonly used: number; readonly window?: number | undefined }): Copy {
-  const used = compactCount(context.used)
+  const used = formatTokenCount(context.used)
   const window = context.window
   if (window === undefined || window <= 0) return { zh: used, en: used }
   const share = Math.round((context.used / window) * 100)
   return {
-    zh: `${used} / ${compactCount(window)}（${share}%）`,
-    en: `${used} / ${compactCount(window)} (${share}%)`,
+    zh: `${used} / ${formatTokenCount(window)}（${share}%）`,
+    en: `${used} / ${formatTokenCount(window)} (${share}%)`,
   }
 }
 
@@ -947,9 +935,9 @@ export function statusCard(input: {
       ...input.usage === undefined
         ? []
         : field(STATUS.usage, join(
-          fill(fill(STATUS.usageOf, compactCount(input.usage.input)), compactCount(input.usage.output)),
-          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
-          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
+          fill(fill(STATUS.usageOf, formatTokenCount(input.usage.input)), formatTokenCount(input.usage.output)),
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, formatTokenCount(input.usage.cacheRead)).zh,
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, formatTokenCount(input.usage.cacheRead)).en,
         )),
       ...field(STATUS.session, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
