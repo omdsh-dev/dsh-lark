@@ -790,12 +790,13 @@ export function settledDocumentPublishApprovalCard(input: {
 /** Copy for the single authorization path required by ADR 0007. */
 const DOC_AUTHORIZATION = {
   title: { zh: '需要补充文档权限', en: 'Document access is needed' },
-  context: { zh: '当前应用缺少下面的权限', en: 'This app is missing the scopes below' },
+  context: { zh: '当前应用需要补充下面的文档配置', en: 'This app needs the document configuration below' },
   scopes: { zh: '待授权 scope', en: 'Scopes to authorize' },
+  events: { zh: '待订阅事件', en: 'Event to subscribe' },
   authorize: { zh: '点此授权', en: 'Authorize' },
   foot: {
-    zh: '扫码确认后渠道会重新检查权限，并按复核结果报告；不会仅凭扫码声称已经生效。',
-    en: 'After confirmation the channel rechecks scopes and reports that result; scanning alone is never treated as proof.',
+    zh: '扫码确认后渠道会重新检查 scope；事件订阅无查询接口，以 /status 是否收到事件为准。',
+    en: 'After confirmation the channel rechecks scopes. Event subscription has no query API; /status event arrival is the evidence.',
   },
   exposedFoot: {
     zh: '这个链接可以修改应用配置。当前没有已记录的注册者，只能发到原聊天；请勿转发。扫码后渠道会重新检查权限。',
@@ -811,11 +812,17 @@ const DOC_AUTHORIZATION = {
     en: 'The recheck failed, so the state is unconfirmed; permissions remain at the last confirmed result',
   },
   capabilities: { zh: '文档能力', en: 'Document capabilities' },
+  grantedScopes: { zh: '本次新增 scope', en: 'Scopes granted in this recheck' },
+  eventUnverified: {
+    zh: '事件订阅没有查询接口，是否生效仍以 /status 实际收到事件为准。',
+    en: 'Event subscriptions have no query API; actual event arrival in /status remains the evidence.',
+  },
 }
 
 /** On-demand QR authorization link, identical for every grant status (ADR 0007). */
 export function documentAuthorizationCard(input: {
   readonly scopes: readonly string[]
+  readonly events?: readonly string[]
   readonly url: string
   /** True when no registered owner exists and the app-changing URL falls back to the source chat. */
   readonly exposed: boolean
@@ -823,6 +830,9 @@ export function documentAuthorizationCard(input: {
   return card('warning', DOC_AUTHORIZATION.summary, [
     ...heading('warning', DOC_AUTHORIZATION.title, DOC_AUTHORIZATION.context),
     quoted(DOC_AUTHORIZATION.scopes, input.scopes.join('\n'), 'grey-50'),
+    ...input.events === undefined || input.events.length === 0
+      ? []
+      : [quoted(DOC_AUTHORIZATION.events, input.events.join('\n'), 'grey-50')],
     linkAction(DOC_AUTHORIZATION.authorize, input.url),
     ...footer(input.exposed ? DOC_AUTHORIZATION.exposedFoot : DOC_AUTHORIZATION.foot),
   ])
@@ -832,6 +842,7 @@ export function documentAuthorizationCard(input: {
 export function documentAuthorizationResultCard(input: {
   readonly outcome: 'changed' | 'unchanged' | 'failed'
   readonly capabilities: Copy
+  readonly grantedScopes?: readonly string[] | undefined
 }): object {
   const failed = input.outcome === 'failed'
   const changed = input.outcome === 'changed'
@@ -844,7 +855,13 @@ export function documentAuthorizationResultCard(input: {
     ),
     // A failed recheck confirms no current capability value. Showing the last
     // table here with checkmarks would visually promote stale state to proof.
-    ...failed ? [] : [panel(field(DOC_AUTHORIZATION.capabilities, input.capabilities, undefined, true))],
+    ...failed ? [] : [
+      panel(field(DOC_AUTHORIZATION.capabilities, input.capabilities, undefined, true)),
+      ...input.grantedScopes === undefined || input.grantedScopes.length === 0
+        ? []
+        : [quoted(DOC_AUTHORIZATION.grantedScopes, input.grantedScopes.join('\n'), 'grey-50')],
+    ],
+    ...footer(DOC_AUTHORIZATION.eventUnverified),
   ])
 }
 
@@ -955,6 +972,7 @@ const STATUS = {
   presetOpen: { zh: '不沙箱，且不再弹审批卡', en: 'no sandbox, and no approval cards' },
   pending: { zh: '待审批', en: 'Awaiting approval' },
   documents: { zh: '文档能力', en: 'Document capabilities' },
+  commentSurface: { zh: '评论面', en: 'Comment surface' },
   context: { zh: '上下文', en: 'Context' },
   usage: { zh: '本会话用量', en: 'Tokens this session' },
   usageOf: {
@@ -1070,6 +1088,7 @@ export function statusCard(input: {
   readonly pendingApprovals: number
   readonly version: string
   readonly documentCapabilities: Copy
+  readonly commentSurface: Copy
   /** The permission preset in force, as the deployment defines it. */
   readonly preset?: PresetRow | undefined
   readonly refresh: object
@@ -1081,6 +1100,7 @@ export function statusCard(input: {
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
       ...field(STATUS.activity, STATUS[input.activity]),
       ...field(STATUS.documents, input.documentCapabilities),
+      ...field(STATUS.commentSurface, input.commentSurface),
       ...input.preset === undefined
         ? []
         // Named where someone looks for it: a session that stopped asking

@@ -20,9 +20,7 @@ const catalog: CatalogEntry[] = [
 ]
 
 const DOCUMENT_CAPABILITIES: LarkDocCapabilitySnapshot = {
-  read: { enabled: true, missingScopes: [], scopeMapVerified: true, source: 'scope-list' },
   write: { enabled: true, missingScopes: [], scopeMapVerified: true, source: 'scope-list' },
-  comment: { enabled: false, missingScopes: ['docs:document.comment:create'], scopeMapVerified: true, source: 'scope-list' },
 }
 
 /** A store recording persisted patches. */
@@ -260,13 +258,14 @@ describe('renderStatusCard', () => {
       pendingApprovals: 0,
       version: '0.0.3',
       documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(idle)).toContain('/srv/work')
     // Meters are absent here, so the card claims no numbers at all.
     expect(shown(idle).some((text) => text.includes('上下文'))).toBe(false)
     expect(shown(idle)).toContain('0.0.3')
     expect(shown(idle)).toContain('空闲')
-    expect(shown(idle)).toContain('读 ✓　写 ✓　评论 ✗（缺 docs:document.comment:create）')
+    expect(shown(idle)).toContain('写 ✓')
     expect(shown(idle)).not.toContain('待审批')
     // The refresh button re-reads the same conversation it was built for.
     expect(cardControls(idle).map((control) => control.value))
@@ -283,6 +282,7 @@ describe('renderStatusCard', () => {
       pendingApprovals: 2,
       version: '0.0.3',
       documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(busy)).toContain('正在跑一轮任务')
     expect(shown(busy)).toContain('2 个审批卡片等待处理')
@@ -298,6 +298,7 @@ describe('renderStatusCard', () => {
       pendingApprovals: 0,
       version: '',
       documentCapabilities: DOCUMENT_CAPABILITIES,
+      commentSurface: { zh: '已启用', en: 'Enabled' },
     }, SUBJECT)
     expect(shown(fresh).some((text) => text.includes('尚未创建'))).toBe(true)
     // An unknown version hides the row rather than printing an empty claim.

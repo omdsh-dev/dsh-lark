@@ -16,6 +16,7 @@ import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
 import { NEW_COMMAND } from './epoch.ts'
+import { DOC_COMMAND } from './larkdoc-comment-surface.ts'
 
 /** Cancel the running turn. Not a host command: cancellation is an agent method. */
 export const STOP_COMMAND = 'stop'
@@ -71,6 +72,8 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent, s
     ...sendDocs ? [`\`/${PUT_COMMAND} <路径> [--into <文档链接>]\` — 把工作区产物写成飞书文档`] : [],
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
+    `\`/${DOC_COMMAND} list\` — 应用注册者在私聊中查看当前文档评论会话`,
+    `\`/${DOC_COMMAND} reset <文档链接>\` — 应用注册者在私聊中重置指定文档的评论上下文`,
     `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]

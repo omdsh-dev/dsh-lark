@@ -126,6 +126,8 @@ export interface StatusFields {
   readonly version: string
   /** Cloud-document features available to the next agent created in this bridge. */
   readonly documentCapabilities: LarkDocCapabilitySnapshot
+  /** Bridge-wide document-comment event observation and live-session count. */
+  readonly commentSurface: Copy
   /**
    * The permission preset in force, as the deployment defines it — the knobs
    * travel with the name so the row describes what the session can actually
@@ -149,29 +151,18 @@ export interface StatusFields {
 
 /** Render one capability table without hiding exact missing scope names. */
 export function documentCapabilityCopy(snapshot: LarkDocCapabilitySnapshot): Copy {
-  const labels = {
-    read: { zh: '读', en: 'read' },
-    write: { zh: '写', en: 'write' },
-    comment: { zh: '评论', en: 'comment' },
-  } as const
-  const rows = (['read', 'write', 'comment'] as const).map((capability) => {
-    const state = snapshot[capability]
-    const mark = state.enabled ? '✓' : '✗'
-    const missing = state.enabled || state.missingScopes.length === 0
-      ? { zh: '', en: '' }
-      : {
-          zh: `（缺 ${state.missingScopes.join('、')}）`,
-          en: ` (missing ${state.missingScopes.join(', ')})`,
-        }
-    return {
-      zh: `${labels[capability].zh} ${mark}${missing.zh}`,
-      en: `${labels[capability].en} ${mark}${missing.en}`,
-    }
-  })
+  const state = snapshot.write
+  const mark = state.enabled ? '✓' : '✗'
+  const missing = state.enabled || state.missingScopes.length === 0
+    ? { zh: '', en: '' }
+    : {
+        zh: `（缺 ${state.missingScopes.join('、')}）`,
+        en: ` (missing ${state.missingScopes.join(', ')})`,
+      }
   const unverified = Object.values(snapshot).some(state => !state.scopeMapVerified)
   return {
-    zh: `${rows.map(row => row.zh).join('　')}${unverified ? '；scope 名单待实测' : ''}`,
-    en: `${rows.map(row => row.en).join('  ')}${unverified ? '; scope map awaiting live verification' : ''}`,
+    zh: `写 ${mark}${missing.zh}${unverified ? '；scope 名单待实测' : ''}`,
+    en: `write ${mark}${missing.en}${unverified ? '; scope map awaiting live verification' : ''}`,
   }
 }
 
@@ -197,6 +188,7 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
     documentCapabilities: documentCapabilityCopy(fields.documentCapabilities),
+    commentSurface: fields.commentSurface,
     ...fields.preset === undefined ? {} : { preset: fields.preset },
     ...fields.context === undefined ? {} : { context: fields.context },
     ...fields.usage === undefined ? {} : { usage: fields.usage },

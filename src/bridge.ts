@@ -11,6 +11,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {
   CardActionEvent,
   CardActionResponse,
+  CommentEvent,
+  CommentSurface,
+  CommentTarget,
   LarkChannelError,
   NormalizedMessage,
   RejectEvent,
@@ -53,18 +56,28 @@ import type {
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
-import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
+import {
+  assistantText,
+  isAssistantMessageEvent,
+  isStepStartEvent,
+  isToolCallEvent,
+  isTurnEndEvent,
+  isTurnStartEvent,
+  isUserMessageEvent,
+  turnErrorDetail,
+} from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
-import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
+import { createMessageRenderer, createStreamRenderer, replyOptions, stripToolCallMarkup } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 import { refuseApprovalClick, refuseMessage } from './authorization.ts'
 import { marked } from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
-import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, workspaceSessionId, WS_COMMAND } from './workspace.ts'
 import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
+import { DocumentGenerations } from './document-generation.ts'
 import {
   ChatModels,
   formatRoute,
@@ -103,23 +116,31 @@ import { ConversationSessions, conversationKey } from './session.ts'
 import type { ConversationSubject, SessionLadder } from './session.ts'
 import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
 import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strangerNotice } from './botchat.ts'
-import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
+import {
+  batonNote,
+  DOCUMENT_COMMENT_PRESENCE_SECTION,
+  documentCommentPresenceSection,
+  PRESENCE_ORDER,
+  PRESENCE_SECTION,
+  presenceSection,
+} from './presence.ts'
 import type { BotSelf } from './presence.ts'
 import { instanceIdentity } from './instance.ts'
 import {
   createDocumentAuthorizationCoordinator,
   DEFAULT_CAPABILITY_PROBE_DEADLINE_MS,
   LarkDocCapabilities,
-  missingScopesFor,
   registerLarkDocTools,
   refreshLarkDocCapabilitiesWithDeadline,
 } from './capability.ts'
 import type { CapabilityCorrection, CapabilityProbeResult } from './capability.ts'
 import {
   appendLarkDocument,
+  classifyLarkDocumentUrl,
   createLarkDocument,
   describeLarkDocumentFailure,
   grantLarkDocumentReader,
+  larkDocsErrorDetails,
   resolveLarkDocumentTarget,
 } from './larkdocs.ts'
 import type {
@@ -128,7 +149,6 @@ import type {
   LarkDocumentBrand,
   LarkDocumentTarget,
 } from './larkdocs.ts'
-import { collectLarkDocumentSnapshots, extractLarkDocumentLinks } from './larkdoc-inbound.ts'
 import {
   PUT_COMMAND,
   runPutCommand,
@@ -140,14 +160,14 @@ import type {
   PublishedLarkDocument,
   SendDocPorts,
 } from './larkdoc-publish.ts'
-import {
-  commentOnDocTool,
-  LarkDocumentCommentQuotas,
-  readDocAnchorsTool,
-} from './larkdoc-comments.ts'
-import type { CommentDocPorts } from './larkdoc-comments.ts'
-import { ReadLarkDocumentSessions } from './larkdoc-session.ts'
 import type { RegisterAppPort } from './onboarding.ts'
+import {
+  buildLarkDocCommentInbound,
+  DOC_COMMAND,
+  isLarkDocCommentAccepted,
+  larkDocCommentReplyText,
+  truncateLarkDocComment,
+} from './larkdoc-comment-surface.ts'
 import {
   isUnconfined,
   loosensSandbox,
@@ -165,6 +185,8 @@ import {
  * `@larksuite/channel` satisfies it structurally; tests substitute a fake.
  */
 export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, InboundFilePort, CotPort, LarkDocsProtocolPort {
+  /** Normalized cloud-document comment protocol supplied by the channel package. */
+  readonly comments: CommentSurface
   /** Open the transport (WebSocket long connection by default). */
   connect(): Promise<void>
   /** Close the transport and release its resources. */
@@ -177,6 +199,7 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, In
   getConnectionStatus?(): { readonly state?: string } | undefined
   /** Subscribe one normalized inbound event; returns the unsubscriber. */
   on(name: 'message', handler: (msg: NormalizedMessage) => void | Promise<void>): () => void
+  on(name: 'comment', handler: (evt: CommentEvent) => void | Promise<void>): () => void
   on(
     name: 'cardAction',
     handler: (evt: CardActionEvent) => void | CardActionResponse | Promise<void | CardActionResponse>,
@@ -365,6 +388,38 @@ interface ApprovalRefusals {
 
 /** Marker distinguishing this plugin's approval buttons from other card actions. */
 const APPROVAL_ACTION = 'dsh-lark-channel/approval'
+
+/** Defensive ceiling for simultaneously live document conversation agents. */
+export const MAX_DOCUMENT_COMMENT_SESSIONS = 100
+
+/** Cosmetic contact names must not grow with every commenter the app can see. */
+export const MAX_DOCUMENT_OPERATOR_NAMES = 256
+
+/** Raw wiki/document aliases are hints, so keep only a bounded hot working set. */
+export const MAX_DOCUMENT_CANONICAL_ALIASES = 512
+
+/** One live document conversation as exposed by `/doc list`. */
+interface DocumentConversation {
+  readonly key: string
+  readonly sessionId: string
+  readonly target: CommentTarget
+  readonly title: string
+  readonly url: string
+  lastActivity: number
+}
+
+/** One comment event waiting for the terminal result of the turn it opened. */
+interface PendingDocumentComment {
+  readonly key: string
+  readonly sessionId: string
+  readonly target: CommentTarget
+  readonly commentId: string
+  readonly isWhole: boolean
+  readonly operatorOpenId: string
+  readonly replyId?: string | undefined
+  answer: string
+  settle(result: { readonly answer?: string; readonly error?: string }): void
+}
 
 /** Card-button payload carried by an approval decision. */
 interface ApprovalActionValue {
@@ -668,7 +723,6 @@ function composeChatAgent(
   planReview: PlanReviewPorts | undefined,
   sendFiles: SendFilePorts | undefined,
   sendDocs: SendDocPorts | undefined,
-  commentDocs: CommentDocPorts | undefined,
   documentCapabilities: LarkDocCapabilities,
   report: (line: string) => void,
   self: BotSelf,
@@ -729,13 +783,9 @@ function composeChatAgent(
     tools,
     denied,
     snapshot: documentCapabilities.snapshot(),
-    switches: { sendDocs: config.sendDocs, commentDocs: config.commentDocs },
+    switches: { sendDocs: config.sendDocs },
     definitions: {
       ...sendDocs === undefined ? {} : { send_doc: sendDocTool(sendDocs) },
-      ...commentDocs === undefined ? {} : {
-        read_doc_anchors: readDocAnchorsTool(commentDocs),
-        comment_on_doc: commentOnDocTool(commentDocs),
-      },
     },
     report,
   })
@@ -746,7 +796,7 @@ function composeChatAgent(
   prompt?.section({
     name: PRESENCE_SECTION,
     order: PRESENCE_ORDER,
-    text: presenceSection(self, [...denied], config.receiveFiles || config.receiveDocs),
+    text: presenceSection(self, [...denied], config.receiveFiles),
   })
 
   if (denied.size === 0) return
@@ -757,6 +807,32 @@ function composeChatAgent(
   tools?.guard(execution =>
     denied.has(execution.name) ? denialReason(execution.name) : undefined,
   )
+}
+
+/** Compose a document-comment agent without chat-only interaction or transfer tools. */
+function composeDocumentCommentAgent(agentCtx: Context, config: ResolvedConfig): void {
+  const tools = agentCtx.get('tools') as HostTools | undefined
+  const denied = new Set<string>([
+    ...config.denyTools,
+    QUESTION_TOOL,
+    PLAN_TOOL,
+    SEND_FILE_TOOL,
+    SEND_DOC_TOOL,
+  ])
+  const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
+  prompt?.section({
+    name: DOCUMENT_COMMENT_PRESENCE_SECTION,
+    order: PRESENCE_ORDER,
+    text: documentCommentPresenceSection(),
+  })
+  // Preset tools live in an inherited scope, and the current host registry has
+  // no supported hide/remove operation for that outer layer. This monotonic,
+  // agent-scoped guard is therefore the enforceable boundary: chat-dependent
+  // tools remain visible on older hosts but deterministically cannot execute
+  // or enter an interactive wait on a document-comment turn.
+  tools?.guard(execution => denied.has(execution.name)
+    ? `${execution.name} is unavailable on the document-comment surface. Put the complete result in your reply.`
+    : undefined)
 }
 
 /**
@@ -880,13 +956,35 @@ export function installBridge(
    */
   const hintedWorkspaces = new Set<string>()
   const defaultCwd = resolve(config.cwd ?? process.cwd())
+  const documentConversations = new Map<string, DocumentConversation>()
+  const pendingDocumentComments = new Map<string, PendingDocumentComment>()
+  const activeDocumentComments = new Map<string, PendingDocumentComment>()
+  /** Canonical turns from fetch through terminal reply cleanup, by document. */
+  const busyDocumentTurns = new Map<string, number>()
+  /** Raw events are busy before target resolution, closing reset's resolve race. */
+  const busyRawDocumentTurns = new Map<string, number>()
+  /** Raw aliases learned from successful resolution, for reset safety. */
+  const canonicalByRawDocument = new Map<string, string>()
+  /** Handlers include pre-canonical network waits that the per-document tails cannot see. */
+  const documentIngressTails = new Set<Promise<void>>()
+  /** The bridge's canonical second-stage queue; SDK file-token queues are not alias-safe. */
+  const documentTurnTails = new Map<string, Promise<void>>()
+  /** Management operations share the canonical queue and reject duplicate resets. */
+  const resettingDocumentKeys = new Set<string>()
+  /** Live and reserved canonical keys; this is the hard 100-session admission count. */
+  const admittedDocumentKeys = new Set<string>()
+  /** Victims remain admitted until their asynchronous release has completed. */
+  const retiringDocumentKeys = new Set<string>()
+  /** Admission is a small serialized critical section spanning victim release and reservation. */
+  let documentAdmissionTail: Promise<void> = Promise.resolve()
+  const createdDocumentSessions = new Set<string>()
+  const documentSessionIds = new Set<string>()
+  const operatorNames = new Map<string, string>()
+  let documentCommentsClosed = false
+  let lastDocumentCommentAt: number | undefined
 
   /** One mutable table per plugin row; every newly created agent reads it fresh. */
   const documentCapabilities = new LarkDocCapabilities()
-  /** Successful snapshots, isolated by agent session for later append/comment constraints. */
-  const readDocuments = new ReadLarkDocumentSessions()
-  /** Comment writes reset on explicit host turn boundaries, never on process/session lifetime. */
-  const documentCommentQuotas = new LarkDocumentCommentQuotas(config.maxDocCommentsPerTurn)
   const documentAuthorizationLifetime = new AbortController()
   const capabilityDeadlineMs = liveness?.capabilityDeadlineMs ?? DEFAULT_CAPABILITY_PROBE_DEADLINE_MS
   const probeDocumentCapabilities = (): Promise<CapabilityProbeResult> =>
@@ -951,6 +1049,72 @@ export function installBridge(
   const documentBrand: LarkDocumentBrand = config.domain?.toLowerCase().includes('larksuite') === true
     ? 'lark'
     : 'feishu'
+  const documentHost = documentBrand === 'lark' ? 'https://www.larksuite.com' : 'https://www.feishu.cn'
+
+  /** Metadata enriches model input and observability, but never gates a comment turn. */
+  const describeDocument = async (target: CommentTarget): Promise<{ title: string; url: string }> => {
+    const fallbackType = target.fileType === 'sheet' ? 'sheets' : target.fileType
+    const fallback = { title: target.fileToken, url: `${documentHost}/${fallbackType}/${target.fileToken}` }
+    try {
+      const response = await port.rawClient.drive?.v1.meta?.batchQuery({
+        data: {
+          request_docs: [{ doc_token: target.fileToken, doc_type: target.fileType }],
+          with_url: true,
+        },
+        params: { user_id_type: 'open_id' },
+      })
+      const meta = response?.data?.metas?.[0]
+      return {
+        title: meta?.title?.trim() || fallback.title,
+        url: meta?.url?.trim() || fallback.url,
+      }
+    } catch {
+      return fallback
+    }
+  }
+
+  /** Contact lookup is cosmetic; an open id is always a truthful fallback. */
+  const operatorName = async (openId: string): Promise<string> => {
+    const cached = operatorNames.get(openId)
+    if (cached !== undefined) {
+      // Map insertion order is the LRU list; a hit moves to the hot end.
+      operatorNames.delete(openId)
+      operatorNames.set(openId, cached)
+      return cached
+    }
+    let name = openId
+    try {
+      name = (await port.rawClient.contact?.v3.user.get({
+        params: { user_id_type: 'open_id' },
+        path: { user_id: openId },
+      }))?.data?.user?.name?.trim() || openId
+    } catch {
+      // The id is sufficient to attribute the question without another scope.
+    }
+    if (operatorNames.size >= MAX_DOCUMENT_OPERATOR_NAMES) {
+      const oldest = operatorNames.keys().next().value as string | undefined
+      if (oldest !== undefined) operatorNames.delete(oldest)
+    }
+    operatorNames.set(openId, name)
+    return name
+  }
+
+  /** One posture reminder for a newly created document conversation. */
+  const isDocumentVisibleOutsideTenant = async (target: CommentTarget): Promise<boolean> => {
+    try {
+      const permission = (await port.rawClient.drive?.v2?.permissionPublic.get({
+        params: { type: target.fileType },
+        path: { token: target.fileToken },
+      }))?.data?.permission_public
+      return permission?.external_access === true
+        || permission?.external_access_entity === 'open'
+        || permission?.external_access_entity === 'allow_share_partner_tenant'
+        || permission?.link_share_entity === 'anyone_readable'
+        || permission?.link_share_entity === 'anyone_editable'
+    } catch {
+      return false
+    }
+  }
   /** Resolve write targets and feed only platform scope violations into Task #0. */
   const resolveWritableDocumentTarget = async (
     originChatId: string,
@@ -969,29 +1133,18 @@ export function installBridge(
       throw error
     }
   }
-  const requestConfiguredDocumentAuthorization = (originChatId: string): void => {
-    if (documentAuthorization === undefined) return
-    const snapshot = documentCapabilities.snapshot()
-    // Only a capability that is actually OFF has something to authorize. An
-    // enabled one may still report missing scopes — an optimistic table knows
-    // of no grant at all — and asking then would push a link that can
-    // reconfigure the app at a deployment where nothing is wrong.
-    const configured: LarkDocCapability[] = [
-      ...config.receiveDocs ? ['read' as const] : [],
-      ...config.sendDocs ? ['write' as const] : [],
-      ...config.commentDocs ? ['comment' as const] : [],
-    ].filter(capability => !snapshot[capability].enabled)
-    const scopes = missingScopesFor(snapshot, configured)
-    if (scopes.length === 0) return
-    void documentAuthorization.request({ originChatId, scopes })
-  }
-
   /** Which directory each conversation runs in, and the session id that pair owns. */
   const chatEpochs = new ChatEpochs({
     entries: config.chatEpochs,
     persist: persistState,
     report: notify,
   })
+  const documentGenerations = new DocumentGenerations({
+    entries: config.documentGenerations,
+    persist: persistState,
+    report: notify,
+  })
+  const channelSessionPrefix = instanceIdentity(config.instance).sessionPrefix
 
   const chatWorkspaces = new ChatWorkspaces({
     defaultPath: defaultCwd,
@@ -1001,7 +1154,7 @@ export function installBridge(
     report: notify,
     // Every session id this row derives carries its own prefix, so two bots
     // invited to one group drive two agents rather than fighting over one.
-    sessionPrefix: instanceIdentity(config.instance).sessionPrefix,
+    sessionPrefix: channelSessionPrefix,
     // A conversation that started over derives a further id; one that never
     // did derives exactly what it always did.
     epochOf: baseId => chatEpochs.epochOf(baseId),
@@ -1034,13 +1187,41 @@ export function installBridge(
    */
   const pathBySession = new Map<string, string>()
   const routeBySession = new Map<string, HostAgentOptions>()
+  const documentSessionIdForKey = (key: string): string => {
+    const base = workspaceSessionId(key, undefined, channelSessionPrefix)
+    const generation = documentGenerations.generationOf(key)
+    return generation === 0 ? base : `${base}--reset-${String(generation)}`
+  }
   const sessionIdForKey = (key: string): string => {
+    const document = key.startsWith('doc:')
+    // Document derivation must be side-effect free. A fetch/acquire failure
+    // should not leave an unbounded trail of path, route, composition or
+    // document-session markers for file tokens that never bound a session.
+    if (document) return documentSessionIdForKey(key)
     const id = chatWorkspaces.sessionIdFor(key)
     pathBySession.set(id, chatWorkspaces.pathFor(key))
     const route = chatModels.routeFor(key)
     if (route === undefined) routeBySession.delete(id)
     else routeBySession.set(id, route)
     return id
+  }
+
+  /** Publish only the metadata required while one document acquisition runs. */
+  const prepareDocumentSession = (key: string): string => {
+    const sessionId = documentSessionIdForKey(key)
+    documentSessionIds.add(sessionId)
+    pathBySession.set(sessionId, defaultCwd)
+    routeBySession.delete(sessionId)
+    return sessionId
+  }
+
+  /** Clear bridge-local derivation state after a document binding is gone. */
+  const forgetDocumentSession = (sessionId: string): void => {
+    createdDocumentSessions.delete(sessionId)
+    documentSessionIds.delete(sessionId)
+    compositions.delete(sessionId)
+    pathBySession.delete(sessionId)
+    routeBySession.delete(sessionId)
   }
 
   /**
@@ -1231,41 +1412,14 @@ export function installBridge(
   /** Agent-scoped document publication, present only when the deployment enables it. */
   const sendDocPorts: SendDocPorts | undefined = config.sendDocs
     ? {
-        readDocuments,
         maxBytes: config.maxSendFileBytes,
         report: notify,
-        resolveTarget: (sessionId, value, signal) => {
-          const binding = bySession.get(sessionId)
-          if (binding === undefined) throw new Error('This session is no longer bound to a chat.')
-          return resolveWritableDocumentTarget(binding.chatId, value, signal)
-        },
         withOutboundSlot: (sessionId, operation) => withOutboundSlot(sessionId, operation),
-        publish: (sessionId, artifact, target, signal) =>
-          deliverDocument(sessionId, artifact, target, signal),
+        publish: (sessionId, artifact, signal) =>
+          deliverDocument(sessionId, artifact, signal),
         workspaceOf: (sessionId) => {
           const key = sessions.keyOf(sessionId)
           return key === undefined ? undefined : chatWorkspaces.pathFor(key)
-        },
-      }
-    : undefined
-
-  /** Agent-scoped anchored reads/comments, present only when the deployment enables them. */
-  const commentDocPorts: CommentDocPorts | undefined = config.commentDocs
-    ? {
-        protocol: port,
-        readDocuments,
-        quotas: documentCommentQuotas,
-        maxFileBytes: config.maxReceiveFileBytes,
-        report: notify,
-        chatIdOf: sessionId => bySession.get(sessionId)?.chatId,
-        workspaceOf: (sessionId) => {
-          const key = sessions.keyOf(sessionId)
-          return key === undefined ? undefined : chatWorkspaces.pathFor(key)
-        },
-        correctFailure: async (sessionId, error) => {
-          const binding = bySession.get(sessionId)
-          if (binding === undefined) return
-          await correctDocumentCapabilityFailure('comment', error, binding.chatId)
         },
       }
     : undefined
@@ -1288,7 +1442,7 @@ export function installBridge(
    * @returns the composition every rung of one session's ladder applies.
    * @throws when the roster supplies no such preset.
    */
-  const composeAgent = async (): Promise<AgentComposition> => {
+  const composeAgent = async (sessionId: string): Promise<AgentComposition> => {
     // Loader siblings mount concurrently; await the complete application so a
     // first message arriving during boot never sees a half-composed agent world.
     await (ctx.get('loader') as HostLoader | undefined)?.await()
@@ -1304,18 +1458,20 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(
-          agentCtx,
-          config,
-          askQuestions,
-          planReview,
-          sendFilePorts,
-          sendDocPorts,
-          commentDocPorts,
-          documentCapabilities,
-          notify,
-          botSelf(),
-        )
+        if (documentSessionIds.has(sessionId)) composeDocumentCommentAgent(agentCtx, config)
+        else {
+          composeChatAgent(
+            agentCtx,
+            config,
+            askQuestions,
+            planReview,
+            sendFilePorts,
+            sendDocPorts,
+            documentCapabilities,
+            notify,
+            botSelf(),
+          )
+        }
       },
     }
   }
@@ -1330,7 +1486,7 @@ export function installBridge(
   const compositionFor = (sessionId: string): Promise<AgentComposition> => {
     let pending = compositions.get(sessionId)
     if (pending === undefined) {
-      pending = composeAgent()
+      pending = composeAgent(sessionId)
       compositions.set(sessionId, pending)
       // A rejected composition is not replayed: the next message may arrive
       // after the roster it named was fixed.
@@ -1359,7 +1515,7 @@ export function installBridge(
       // the panel at whatever this channel offered the day that session began:
       // every command added afterwards existed, worked when typed, and was
       // invisible to everyone who reached for `/`.
-      publishSlashPanel(handle.agent)
+      if (!documentSessionIds.has(sessionId)) publishSlashPanel(handle.agent)
       return handle
     },
     create: async (sessionId) => {
@@ -1377,6 +1533,7 @@ export function installBridge(
         agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
         setup: composition.setup,
       })
+      if (documentSessionIds.has(sessionId)) createdDocumentSessions.add(sessionId)
       if (workspace !== undefined) {
         await workspace.attachSession(sessionId).catch((error: unknown) => {
           notify(`lark-channel: session ${sessionId} stays ungrouped: ${String(error)}`)
@@ -1384,7 +1541,7 @@ export function installBridge(
       }
       // The panel is app-wide, and the command list is only knowable from an
       // agent's scope, so the first chat to exist is what can publish it.
-      publishSlashPanel(handle.agent)
+      if (!documentSessionIds.has(sessionId)) publishSlashPanel(handle.agent)
       return handle
     },
     // A rejected resume is the registry's only existence probe, and an
@@ -1394,6 +1551,206 @@ export function installBridge(
   }
 
   const sessions = new ConversationSessions(config.sessionScope, ladder, sessionIdForKey)
+
+  type DocumentReleaseResult = 'missing' | 'busy' | 'released'
+
+  const rawDocumentKey = (fileToken: string): string => `raw:${fileToken}`
+  const knownCanonicalDocumentKey = (fileToken: string): string | undefined => {
+    const raw = rawDocumentKey(fileToken)
+    const canonical = canonicalByRawDocument.get(raw)
+    if (canonical !== undefined) {
+      // Map insertion order is the LRU list; every accepted hit stays hot.
+      canonicalByRawDocument.delete(raw)
+      canonicalByRawDocument.set(raw, canonical)
+    }
+    return canonical
+  }
+  const rememberCanonicalDocumentKey = (fileToken: string, canonical: string): void => {
+    const raw = rawDocumentKey(fileToken)
+    canonicalByRawDocument.delete(raw)
+    canonicalByRawDocument.set(raw, canonical)
+    while (canonicalByRawDocument.size > MAX_DOCUMENT_CANONICAL_ALIASES) {
+      const oldest = canonicalByRawDocument.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      canonicalByRawDocument.delete(oldest)
+    }
+  }
+  const isDocumentBusy = (key: string): boolean => (busyDocumentTurns.get(key) ?? 0) > 0
+  const isRawDocumentBusy = (fileToken: string): boolean =>
+    (busyRawDocumentTurns.get(rawDocumentKey(fileToken)) ?? 0) > 0
+  const beginDocumentTurn = (key: string): void => {
+    busyDocumentTurns.set(key, (busyDocumentTurns.get(key) ?? 0) + 1)
+  }
+  const endDocumentTurn = (key: string): void => {
+    const remaining = (busyDocumentTurns.get(key) ?? 1) - 1
+    if (remaining <= 0) busyDocumentTurns.delete(key)
+    else busyDocumentTurns.set(key, remaining)
+  }
+  const beginRawDocumentTurn = (fileToken: string): void => {
+    const raw = rawDocumentKey(fileToken)
+    busyRawDocumentTurns.set(raw, (busyRawDocumentTurns.get(raw) ?? 0) + 1)
+  }
+  const endRawDocumentTurn = (fileToken: string): void => {
+    const raw = rawDocumentKey(fileToken)
+    const remaining = (busyRawDocumentTurns.get(raw) ?? 1) - 1
+    if (remaining <= 0) busyRawDocumentTurns.delete(raw)
+    else busyRawDocumentTurns.set(raw, remaining)
+  }
+
+  /** Serialize the capacity decision through the asynchronous victim release. */
+  const withDocumentAdmission = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+    const previous = documentAdmissionTail
+    let unlock!: () => void
+    documentAdmissionTail = new Promise<void>((resolveUnlock) => { unlock = resolveUnlock })
+    await previous
+    try {
+      return await operation()
+    } finally {
+      unlock()
+    }
+  }
+
+  /** Drop one idle binding while it still occupies capacity until disposal completes. */
+  const releaseDocumentConversationLocked = async (key: string): Promise<DocumentReleaseResult> => {
+    if (isDocumentBusy(key) || retiringDocumentKeys.has(key)) return 'busy'
+    const entry = documentConversations.get(key)
+    if (entry === undefined) return 'missing'
+    retiringDocumentKeys.add(key)
+    try {
+      await sessions.release(key)
+      documentConversations.delete(key)
+      admittedDocumentKeys.delete(key)
+      forgetDocumentSession(entry.sessionId)
+      return 'released'
+    } finally {
+      retiringDocumentKeys.delete(key)
+    }
+  }
+
+  /** Drop one idle document binding and every bridge-local record that points at it. */
+  const releaseDocumentConversation = (key: string): Promise<DocumentReleaseResult> =>
+    withDocumentAdmission(() => releaseDocumentConversationLocked(key))
+
+  /** Reserve one distinct document before agent acquisition, evicting only idle LRU entries. */
+  const admitDocumentConversation = (key: string): Promise<boolean> => withDocumentAdmission(async () => {
+    if (documentCommentsClosed) return false
+    if (admittedDocumentKeys.has(key)) return true
+    while (admittedDocumentKeys.size >= MAX_DOCUMENT_COMMENT_SESSIONS) {
+      const oldest = [...documentConversations.keys()]
+        .find(candidate => !isDocumentBusy(candidate) && !retiringDocumentKeys.has(candidate))
+      if (oldest === undefined) return false
+      await releaseDocumentConversationLocked(oldest)
+    }
+    if (documentCommentsClosed) return false
+    admittedDocumentKeys.add(key)
+    return true
+  })
+
+  /** Remove a failed or closing acquisition's capacity reservation. */
+  const forgetDocumentReservation = (key: string): Promise<void> => withDocumentAdmission(() => {
+    if (documentConversations.get(key) === undefined) admittedDocumentKeys.delete(key)
+  })
+
+  /** Touch one entry in insertion order; admission already enforces the hard ceiling. */
+  const rememberDocumentConversation = (entry: DocumentConversation): void => {
+    documentConversations.delete(entry.key)
+    documentConversations.set(entry.key, entry)
+  }
+
+  /** Resolve the link form accepted by `/doc reset` through CommentSurface. */
+  const documentTargetFromLink = async (value: string): Promise<CommentTarget | null> => {
+    const link = classifyLarkDocumentUrl(value.trim())
+    if (link.kind === 'docx') return port.comments.resolveTarget(link.token, 'docx')
+    if (link.kind === 'wiki') return port.comments.resolveTarget(link.token, 'docx')
+    if (link.kind !== 'unsupported' || link.token === undefined) return null
+    const type = link.type === 'docs' ? 'doc' : link.type === 'sheets' ? 'sheet' : link.type
+    if (type !== 'doc' && type !== 'sheet' && type !== 'file') return null
+    return port.comments.resolveTarget(link.token, type)
+  }
+
+  /** Run the IM-only document-session management command. */
+  const runDocumentCommand = async (line: string): Promise<string> => {
+    if (documentCommentsClosed) return '⚠️ 文档评论通道正在关闭，当前不能执行此命令。'
+    const argument = line.trimStart().replace(/^\/doc\b/u, '').trim()
+    if (argument === '' || argument === 'list') {
+      if (documentConversations.size === 0) return '当前没有打开的文档评论会话。'
+      const rows = [...documentConversations.values()].map((entry) => {
+        const active = sessions.keyOf(entry.sessionId) === undefined ? '已释放' : '活跃'
+        const at = new Date(entry.lastActivity).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/u, ' UTC')
+        return `- 《${entry.title}》 · ${at} · ${active}\n  ${entry.url}`
+      })
+      return `**文档评论会话（${String(rows.length)}）**\n${rows.join('\n')}`
+    }
+    if (!argument.startsWith('reset ')) {
+      return '用法：`/doc list` 或 `/doc reset <文档链接>`'
+    }
+    const resetValue = argument.slice('reset '.length).trim()
+    const resetLink = classifyLarkDocumentUrl(resetValue)
+    let learnedCanonical: string | undefined
+    if ('token' in resetLink && resetLink.token !== undefined) {
+      learnedCanonical = knownCanonicalDocumentKey(resetLink.token)
+      if (isRawDocumentBusy(resetLink.token)
+        || (learnedCanonical !== undefined
+          && (isDocumentBusy(learnedCanonical) || resettingDocumentKeys.has(learnedCanonical)))) {
+        return '⚠️ 这篇文档正在处理评论，当前不能重置；请等本轮回帖完成后重试。'
+      }
+    }
+    let key: string
+    let displayToken: string
+    if (learnedCanonical !== undefined) {
+      key = learnedCanonical
+      displayToken = learnedCanonical.slice('doc:'.length)
+    } else {
+      let target: CommentTarget | null
+      try {
+        target = await documentTargetFromLink(resetValue)
+      } catch (error) {
+        notify(`lark-channel: resolving document reset target failed: ${failureDetail(error)}`)
+        return '⚠️ 无法解析这篇文档的真实目标，未执行重置；请稍后重试。'
+      }
+      if (documentCommentsClosed) return '⚠️ 文档评论通道正在关闭，当前不能执行此命令。'
+      if (target === null) return '⚠️ 请提供完整的飞书/Lark 文档链接。'
+      // A wiki token is an alias, not a durable document identity. Some older
+      // surfaces pass an unresolved token through unchanged; treating that as
+      // canonical would advance a generation no real comment session reads.
+      if (resetLink.kind === 'wiki' && target.fileToken === resetLink.token) {
+        return '⚠️ 无法解析这篇知识库文档的真实目标，未执行重置；请稍后重试。'
+      }
+      key = `doc:${target.fileToken}`
+      displayToken = target.fileToken
+      if ('token' in resetLink && resetLink.token !== undefined) {
+        rememberCanonicalDocumentKey(resetLink.token, key)
+      }
+    }
+    if (isDocumentBusy(key) || resettingDocumentKeys.has(key)) {
+      return '⚠️ 这篇文档正在处理评论，当前不能重置；请等本轮回帖完成后重试。'
+    }
+    if (documentCommentsClosed) return '⚠️ 文档评论通道正在关闭，当前不能执行此命令。'
+    resettingDocumentKeys.add(key)
+    const resetState: {
+      released: DocumentReleaseResult
+      generation?: { readonly durable: boolean } | undefined
+    } = { released: 'missing' }
+    try {
+      await enqueueCanonicalDocumentTurn(key, async () => {
+        resetState.released = await releaseDocumentConversation(key)
+        if (documentCommentsClosed) return
+        // Advancing only after the old binding is quiescent is load-bearing:
+        // the next canonical event waits on this same queue and therefore
+        // cannot acquire the pre-reset id while settings persistence is in flight.
+        resetState.generation = await documentGenerations.startNew(key)
+      }, false)
+    } finally {
+      resettingDocumentKeys.delete(key)
+    }
+    if (resetState.released === 'busy' || resetState.generation === undefined) {
+      return '⚠️ 这篇文档正在处理评论，当前不能重置；请等本轮回帖完成后重试。'
+    }
+    const durability = resetState.generation.durable ? '' : '（本部署未组合 settings，重启后会恢复旧上下文。）'
+    return (resetState.released === 'released'
+      ? `已重置《${displayToken}》的评论会话；下一条评论会使用新的干净上下文。`
+      : '已重置这篇文档；下一条评论会使用新的干净上下文。') + durability
+  }
 
   /**
    * The renderer for one session, opened on first use and kept until the fiber
@@ -1498,6 +1855,7 @@ export function installBridge(
       ...config.sendDocs ? [{ name: PUT_COMMAND, description: '把工作区产物写成飞书文档' }] : [],
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
+      { name: DOC_COMMAND, description: '注册者私聊查看或重置文档评论会话' },
       { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
@@ -1642,6 +2000,19 @@ export function installBridge(
         .filter(pending => pending.chatId === subject.chatId).length,
       version: pluginVersion,
       documentCapabilities: documentCapabilities.snapshot(),
+      commentSurface: !config.commentDocs
+        ? { zh: '已关闭', en: 'Disabled' }
+        : lastDocumentCommentAt === undefined
+          ? {
+              zh: '已启用 · 从未收到评论事件（检查应用是否订阅 drive.notice.comment_add_v1）',
+              en: 'Enabled · no comment event received (check drive.notice.comment_add_v1 subscription)',
+            }
+          : {
+              zh: `已启用 · 事件最近到达 ${new Date(lastDocumentCommentAt).toISOString()} · `
+                + `${String(documentConversations.size)} 篇文档在会话中`,
+              en: `Enabled · last event ${new Date(lastDocumentCommentAt).toISOString()} · `
+                + `${String(documentConversations.size)} document sessions`,
+            },
     }
   }
 
@@ -1797,6 +2168,371 @@ export function installBridge(
     })
   }
 
+  /** Send the one-time owner notice for a genuinely new document session. */
+  const announceDocumentConversation = async (
+    entry: DocumentConversation,
+    asker: string,
+  ): Promise<void> => {
+    if (documentCommentsClosed || config.registeredBy === undefined || config.registeredBy === '') return
+    const outside = await isDocumentVisibleOutsideTenant(entry.target)
+    if (documentCommentsClosed) return
+    const message = `${asker} 在《${entry.title}》的评论里 @ 了我，已开会话。`
+      + `\n文档：${entry.url}`
+      + `\n工作区：${defaultCwd}`
+      + `${outside ? '\n⚠️ 这篇文档的可见范围已超出组织。' : ''}`
+    await port.send(config.registeredBy, { text: message }).catch((error: unknown) => {
+      notify(`lark-channel: sending the document-conversation notice failed: ${failureDetail(error)}`)
+    })
+  }
+
+  /** Preserve a failed comment result privately and start exact-scope authorization when possible. */
+  const reportDocumentReplyFailure = async (
+    entry: DocumentConversation,
+    text: string,
+    error: unknown,
+    operatorOpenId: string,
+  ): Promise<void> => {
+    const detail = failureDetail(error)
+    notify(`lark-channel: replying to document comment ${entry.target.fileToken} failed: ${detail}`)
+    const registeredBy = config.registeredBy
+    const recipient = registeredBy === undefined || registeredBy === '' ? operatorOpenId : registeredBy
+    if (recipient !== '') {
+      await port.send(recipient, {
+        text: `⚠️ 《${entry.title}》的评论回帖失败：${detail}\n本轮结果：\n${text}`,
+      }).catch(reportSendFailure)
+    }
+    const scopes = larkDocsErrorDetails(error).permissionViolations
+    // An app-changing authorization URL belongs only with the recorded
+    // registrar. Without one, preserve the result privately for the operator
+    // who triggered the turn and stop — a file token is never a chat id.
+    if (registeredBy !== undefined && registeredBy !== '' && scopes.length > 0 && documentAuthorization !== undefined) {
+      void documentAuthorization.request({
+        originChatId: registeredBy,
+        scopes,
+      })
+    }
+  }
+
+  /** Post exactly one bounded terminal result, then clear the typing reaction. */
+  const postDocumentCommentResult = async (
+    entry: DocumentConversation,
+    pending: PendingDocumentComment,
+    result: string,
+  ): Promise<void> => {
+    const fitted = truncateLarkDocComment(result)
+    try {
+      if (pending.isWhole) await port.comments.replyTopLevel(pending.target, fitted.text)
+      else await port.comments.reply(pending.target, pending.commentId, fitted.text)
+    } catch (error) {
+      await reportDocumentReplyFailure(entry, fitted.text, error, pending.operatorOpenId)
+    }
+    if (fitted.truncated) {
+      notify(`lark-channel: truncated document comment reply from ${String(fitted.actualRunes)} `
+        + `to ${String(fitted.limit)} runes for ${entry.target.fileToken}`)
+    }
+  }
+
+  /** A fetch already has a legal target, so its failure still gets one best-effort thread reply. */
+  const postDocumentFetchFailure = async (
+    evt: CommentEvent,
+    target: CommentTarget,
+    key: string,
+    error: unknown,
+  ): Promise<void> => {
+    const failure = `这一轮失败了：${failureDetail(error)}`
+    try {
+      // CommentSurface owns the whole-document 1069302 fallback. At this point
+      // fetch did not tell us `isWhole`, so inventing that protocol fact here
+      // would be less safe than asking the normalized surface to reply.
+      await port.comments.reply(target, evt.commentId, failure)
+    } catch (replyError) {
+      const details = await describeDocument(target)
+      await reportDocumentReplyFailure({
+        key,
+        sessionId: documentSessionIdForKey(key),
+        target,
+        title: details.title,
+        url: details.url,
+        lastActivity: evt.timestamp,
+      }, failure, replyError, evt.operator.openId)
+    }
+  }
+
+  /** Resolution failures have no lawful CommentTarget; report privately without fabricating one. */
+  const reportDocumentResolveFailure = async (evt: CommentEvent, error: unknown): Promise<void> => {
+    const detail = failureDetail(error)
+    notify(`lark-channel: resolving document comment target ${evt.fileToken} failed: ${detail}`)
+    const recipient = config.registeredBy === undefined || config.registeredBy === ''
+      ? evt.operator.openId
+      : config.registeredBy
+    if (recipient !== '') {
+      await port.send(recipient, {
+        text: `⚠️ 收到文档评论事件，但无法解析合法回帖目标（${evt.fileType}/${evt.fileToken}）：${detail}`,
+      }).catch(reportSendFailure)
+    }
+  }
+
+  /** Run one already-canonicalized event through fetch, admission, agent, and terminal cleanup. */
+  const processDocumentComment = async (
+    evt: CommentEvent,
+    target: CommentTarget,
+    key: string,
+  ): Promise<void> => {
+    let fetched
+    try {
+      fetched = await port.comments.fetch(target, evt.commentId)
+    } catch (error) {
+      if (!documentCommentsClosed) await postDocumentFetchFailure(evt, target, key, error)
+      return
+    }
+    if (documentCommentsClosed) return
+    if (fetched === null) {
+      if (config.registeredBy !== undefined && config.registeredBy !== '') {
+        await port.send(config.registeredBy, {
+          text: `⚠️ 收到文档 ${target.fileToken} 的评论事件，但评论 ${evt.commentId} 已找不到，未开会话。`,
+        }).catch(reportSendFailure)
+      }
+      return
+    }
+
+    const wasAdmitted = admittedDocumentKeys.has(key)
+    if (!await admitDocumentConversation(key)) {
+      if (documentCommentsClosed) return
+      const details = await describeDocument(target)
+      if (documentCommentsClosed) return
+      await postDocumentCommentResult({
+        key,
+        sessionId: documentSessionIdForKey(key),
+        target,
+        title: details.title,
+        url: details.url,
+        lastActivity: evt.timestamp,
+      }, {
+        key,
+        sessionId: documentSessionIdForKey(key),
+        target,
+        commentId: evt.commentId,
+        isWhole: fetched.isWhole,
+        operatorOpenId: evt.operator.openId,
+        replyId: evt.replyId,
+        answer: '',
+        settle: () => {},
+      }, '当前评论会话已满，请稍后重试')
+      return
+    }
+    if (documentCommentsClosed) {
+      if (!wasAdmitted) await forgetDocumentReservation(key)
+      return
+    }
+
+    const details = await describeDocument(target)
+    if (documentCommentsClosed) {
+      if (!wasAdmitted) await forgetDocumentReservation(key)
+      return
+    }
+    const asker = await operatorName(evt.operator.openId)
+    if (documentCommentsClosed) {
+      if (!wasAdmitted) await forgetDocumentReservation(key)
+      return
+    }
+    const preparedSessionId = prepareDocumentSession(key)
+    let opened
+    try {
+      opened = await sessions.acquireKey(key)
+    } catch (error) {
+      if (!wasAdmitted) await forgetDocumentReservation(key)
+      if (sessions.keyOf(preparedSessionId) === undefined) forgetDocumentSession(preparedSessionId)
+      if (documentCommentsClosed) return
+      const entry: DocumentConversation = {
+        key,
+        sessionId: preparedSessionId,
+        target,
+        title: details.title,
+        url: details.url,
+        lastActivity: evt.timestamp,
+      }
+      const failure = `这一轮失败了：${failureDetail(error)}`
+      if (config.registeredBy !== undefined && config.registeredBy !== '') {
+        await port.send(config.registeredBy, {
+          text: `⚠️ 无法为《${entry.title}》启动评论会话：${failureDetail(error)}`,
+        }).catch(reportSendFailure)
+      }
+      await postDocumentCommentResult(entry, {
+        key,
+        sessionId: preparedSessionId,
+        target,
+        commentId: evt.commentId,
+        isWhole: fetched.isWhole,
+        operatorOpenId: evt.operator.openId,
+        replyId: evt.replyId,
+        answer: '',
+        settle: () => {},
+      }, failure)
+      return
+    }
+    const sessionId = opened.handle.agent.session.id
+    const isNewSession = createdDocumentSessions.delete(sessionId)
+    const entry: DocumentConversation = {
+      key,
+      sessionId,
+      target,
+      title: details.title,
+      url: details.url,
+      lastActivity: evt.timestamp,
+    }
+    rememberDocumentConversation(entry)
+    if (documentCommentsClosed) {
+      await releaseDocumentConversation(key)
+      return
+    }
+    if (isNewSession) await announceDocumentConversation(entry, asker)
+    if (documentCommentsClosed) {
+      await releaseDocumentConversation(key)
+      return
+    }
+
+    const renderedReplies = fetched.replies.map(reply => ({
+      id: reply.reply_id,
+      text: larkDocCommentReplyText(reply),
+    }))
+    const questionIndex = evt.replyId === undefined
+      ? renderedReplies.length - 1
+      : renderedReplies.findIndex(reply => reply.id === evt.replyId)
+    const resolvedQuestionIndex = questionIndex < 0 ? renderedReplies.length - 1 : questionIndex
+    const question = renderedReplies[resolvedQuestionIndex]?.text.trim() || '（评论正文为空）'
+    const history = renderedReplies
+      .filter((_reply, index) => index !== resolvedQuestionIndex)
+      .map(reply => reply.text)
+      .filter(text => text.trim() !== '')
+    const message: HostUserMessage = Object.freeze({
+      id: randomUUID(),
+      role: 'user',
+      content: Object.freeze([{ type: 'text' as const, text: buildLarkDocCommentInbound({
+        documentTitle: entry.title,
+        askerName: asker,
+        quote: fetched.quote,
+        isWhole: fetched.isWhole,
+        question,
+        documentUrl: entry.url,
+        threadHistory: history,
+        isNewSession,
+      }) }]),
+      source: Object.freeze({ kind: 'user' as const }),
+    })
+
+    let reacted = false
+    try {
+      if (evt.replyId !== undefined) {
+        reacted = await port.comments.addReaction(target, evt.replyId).catch(() => false)
+      }
+      if (documentCommentsClosed) return
+      let settleTerminal!: (result: { readonly answer?: string; readonly error?: string }) => void
+      const terminal = new Promise<{ readonly answer?: string; readonly error?: string }>((settle) => {
+        settleTerminal = settle
+      })
+      const pending: PendingDocumentComment = {
+        key,
+        sessionId,
+        target,
+        commentId: evt.commentId,
+        isWhole: fetched.isWhole,
+        operatorOpenId: evt.operator.openId,
+        replyId: evt.replyId,
+        answer: '',
+        settle: settleTerminal,
+      }
+      if (documentCommentsClosed) return
+      pendingDocumentComments.set(message.id, pending)
+      if (documentCommentsClosed) {
+        pendingDocumentComments.delete(message.id)
+        return
+      }
+      try {
+        opened.handle.agent.followup(message)
+      } catch (error) {
+        pendingDocumentComments.delete(message.id)
+        await postDocumentCommentResult(entry, pending, `这一轮失败了：${failureDetail(error)}`)
+        return
+      }
+      const result = await terminal
+      pendingDocumentComments.delete(message.id)
+      if (activeDocumentComments.get(sessionId) === pending) activeDocumentComments.delete(sessionId)
+      await postDocumentCommentResult(
+        entry,
+        pending,
+        result.error === undefined ? result.answer || '（本轮没有产生输出）' : `这一轮失败了：${result.error}`,
+      )
+    } finally {
+      // Typing is a lifecycle marker, not a success marker. This outer finally
+      // also covers disposal immediately after the add-reaction await, before a
+      // pending turn is registered or followup is allowed to run.
+      if (reacted && evt.replyId !== undefined) {
+        await port.comments.removeReaction(target, evt.replyId).catch(() => {})
+      }
+    }
+  }
+
+  /** Serialize after alias resolution; a rejected operation never poisons the canonical tail. */
+  const enqueueCanonicalDocumentTurn = (
+    key: string,
+    operation: () => Promise<void>,
+    markTurnBusy = true,
+  ): Promise<void> => {
+    const previous = documentTurnTails.get(key) ?? Promise.resolve()
+    const running = previous.catch(() => {}).then(async () => {
+      if (documentCommentsClosed) return
+      if (markTurnBusy) beginDocumentTurn(key)
+      try {
+        await operation()
+      } finally {
+        if (markTurnBusy) endDocumentTurn(key)
+      }
+    })
+    const tail = running.catch(() => {})
+    documentTurnTails.set(key, tail)
+    return running.finally(() => {
+      if (documentTurnTails.get(key) === tail) documentTurnTails.delete(key)
+    })
+  }
+
+  /** Turn one normalized comment event into a document-scoped agent turn. */
+  const handleDocumentComment = async (evt: CommentEvent): Promise<void> => {
+    if (documentCommentsClosed) return
+    lastDocumentCommentAt = evt.timestamp
+    if (!isLarkDocCommentAccepted({
+      commentDocs: config.commentDocs,
+      operatorOpenId: evt.operator.openId,
+      botOpenId: ownBotId() ?? '',
+      mentionedBot: evt.mentionedBot,
+    })) return
+
+    beginRawDocumentTurn(evt.fileToken)
+    try {
+      let target: CommentTarget | null
+      try {
+        target = await port.comments.resolveTarget(evt.fileToken, evt.fileType)
+      } catch (error) {
+        if (!documentCommentsClosed) await reportDocumentResolveFailure(evt, error)
+        return
+      }
+      if (target === null || documentCommentsClosed) return
+      const key = `doc:${target.fileToken}`
+      rememberCanonicalDocumentKey(evt.fileToken, key)
+      await enqueueCanonicalDocumentTurn(key, () => processDocumentComment(evt, target!, key))
+    } finally {
+      endRawDocumentTurn(evt.fileToken)
+    }
+  }
+
+  /** Track the whole handler, including resolve before a canonical tail exists. */
+  const trackDocumentComment = (evt: CommentEvent): Promise<void> => {
+    if (documentCommentsClosed) return Promise.resolve()
+    let running!: Promise<void>
+    running = handleDocumentComment(evt).finally(() => { documentIngressTails.delete(running) })
+    documentIngressTails.add(running)
+    return running
+  }
+
 
   const handleMessage = async (msg: NormalizedMessage): Promise<void> => {
     // Authorization before anything else: a message here starts a
@@ -1874,6 +2610,7 @@ export function installBridge(
       channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
       || channelCommand === NEW_COMMAND || channelCommand === GET_COMMAND
+      || channelCommand === DOC_COMMAND
       || (config.sendDocs && channelCommand === PUT_COMMAND)
     ) {
       try {
@@ -1923,6 +2660,24 @@ export function installBridge(
           if (reply !== undefined) await port.send(msg.chatId, { markdown: reply }).catch(reportSendFailure)
           return
         }
+        if (channelCommand === DOC_COMMAND) {
+          const ownsDocumentControls = msg.chatType === 'p2p'
+            && config.registeredBy !== undefined
+            && config.registeredBy !== ''
+            && msg.senderId === config.registeredBy
+          if (!ownsDocumentControls) {
+            // Do not run the command and do not reveal whether any document is
+            // open. The inventory is bridge-wide, so ordinary chat admission
+            // is insufficient: only the recorded registrar may manage it,
+            // and only in a direct chat where the result cannot leak to a room.
+            await port.send(msg.chatId, {
+              text: '⚠️ `/doc` 仅限应用注册者在与机器人的私聊中使用。',
+            }).catch(reportSendFailure)
+            return
+          }
+          await port.send(msg.chatId, { markdown: await runDocumentCommand(msg.content) }).catch(reportSendFailure)
+          return
+        }
         // Dispose the conversation's current agent so the next message walks
         // the ladder again — under a new id after `/cd`, or resuming the same
         // session under the new route after `/model use`. The id is captured
@@ -1938,10 +2693,7 @@ export function installBridge(
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
         } else if (channelCommand === NEW_COMMAND) {
-          const resetSessionId = chatWorkspaces.sessionIdFor(key)
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
-          readDocuments.clear(resetSessionId)
-          documentCommentQuotas.clear(resetSessionId)
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
@@ -1959,15 +2711,6 @@ export function installBridge(
           .catch(reportSendFailure)
       }
       return
-    }
-    const hasReadableDocumentLink = extractLarkDocumentLinks(msg.content)
-      .some(link => link.kind === 'docx' || link.kind === 'wiki')
-    if (hasReadableDocumentLink) {
-      // An IM-only app cannot discover a tool it was never given. The document
-      // link itself is the human intent signal: request every currently enabled
-      // document capability's missing scopes once, while the collector below
-      // still leaves its explicit "not read" note for the model.
-      requestConfiguredDocumentAuthorization(msg.chatId)
     }
     try {
       const opened = await sessions.acquire(msg)
@@ -2018,19 +2761,6 @@ export function installBridge(
           hintWorkspace: !hintedWorkspaces.has(workspace),
         })
         if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
-        const documents = await collectLarkDocumentSnapshots(msg, port, {
-          workspace,
-          sessionId: opened.handle.agent.session.id,
-          enabled: config.receiveDocs,
-          capabilityEnabled: documentCapabilities.isEnabled('read'),
-          maxFileBytes: config.maxReceiveFileBytes,
-          readDocuments,
-          report: notify,
-          correctFailure: async (error) => {
-            await correctDocumentCapabilityFailure('read', error, msg.chatId)
-          },
-        })
-        inbound = { ...inbound, notes: [...inbound.notes, ...documents.notes] }
         images = await collectImages(
           msg,
           port,
@@ -2494,24 +3224,22 @@ export function installBridge(
    * This is the model's row, and the group gate is part of it rather than a flag
    * handed to a shared function: creating a document in a group mints a NEW
    * audience out of a turn the room did not type, which is the escalation ADR
-   * 0008 asks a human about. Appending is not gated here — that decision, and
-   * why, is recorded in ADR 0008's consequences.
+   * 0008 asks a human about. This model-owned path is create-only; only the
+   * human `/put --into` path below may append.
    * @param sessionId - the agent's session, which names the chat.
    * @param artifact - the frozen workspace content to publish.
-   * @param target - an already-read document to append to, or undefined to create.
    * @param signal - the calling execution's cancellation, which also takes down
    * a group approval still waiting on a human.
    */
   const deliverDocument = async (
     sessionId: string,
     artifact: LarkDocumentArtifact,
-    target: LarkDocumentTarget | undefined,
     signal?: AbortSignal,
   ): Promise<PublishedLarkDocument> => {
     const binding = bySession.get(sessionId)
     if (binding === undefined) throw new Error('This session is no longer bound to a chat, so the document has nowhere to go.')
     signal?.throwIfAborted()
-    if (target === undefined && binding.chatType !== 'p2p') {
+    if (binding.chatType !== 'p2p') {
       const refused = await askDocumentPublish(binding, artifact.title, signal)
       if (refused !== undefined) throw new Error(refused)
     }
@@ -2520,7 +3248,7 @@ export function installBridge(
       chatType: binding.chatType,
       senderId: binding.senderId,
       replyTarget: aimBySession.get(sessionId),
-    }, artifact, target, signal)
+    }, artifact, undefined, signal)
   }
 
   /**
@@ -3138,6 +3866,7 @@ export function installBridge(
   // intake covers up to `followup()` returning; the turn itself still runs in
   // the background, which is why reply targets bind to turns, not to arrival.
   ctx.effect(() => port.on('message', handleMessage), 'lark:on(message)')
+  ctx.effect(() => port.on('comment', trackDocumentComment), 'lark:on(comment)')
   ctx.effect(() => port.on('cardAction', handleCardAction), 'lark:on(cardAction)')
 
   // Observability. Without these, the failure modes an operator actually hits —
@@ -3210,8 +3939,16 @@ export function installBridge(
    */
   ctx.on('agent/inbox/claimed', payload => {
     const sessionId = payload.agent.session.id
-    const binding = bySession.get(sessionId)
     const id = payload.message.id
+    if (id !== undefined) {
+      const comment = pendingDocumentComments.get(id)
+      if (comment !== undefined) {
+        pendingDocumentComments.delete(id)
+        activeDocumentComments.set(sessionId, comment)
+        return
+      }
+    }
+    const binding = bySession.get(sessionId)
     if (binding === undefined || id === undefined) return
     const claimed = targetByMessageId.get(id)
     if (claimed === undefined) return
@@ -3223,10 +3960,31 @@ export function installBridge(
   // bridge additionally remembers each call's arguments for the approval card,
   // and forgets the turn's calls once it closes.
   ctx.on('session/event', (session, event: HostSessionEvent) => {
+    let documentComment = activeDocumentComments.get(session.id)
+    if (documentComment === undefined && isUserMessageEvent(event) && event.data.id !== undefined) {
+      documentComment = pendingDocumentComments.get(event.data.id)
+      if (documentComment !== undefined) {
+        pendingDocumentComments.delete(event.data.id)
+        activeDocumentComments.set(session.id, documentComment)
+      }
+    }
+    if (documentComment !== undefined) {
+      if (isAssistantMessageEvent(event)) {
+        const text = stripToolCallMarkup(assistantText(event.data))
+        if (text.trim() !== '') documentComment.answer = text
+      } else if (isTurnEndEvent(event)) {
+        const detail = event.data.reason.kind !== 'completed'
+          ? turnErrorDetail(event.data) || event.data.reason.kind
+          : undefined
+        documentComment.settle(detail === undefined
+          ? { answer: documentComment.answer }
+          : { error: detail })
+      }
+      return
+    }
     const binding = bySession.get(session.id)
     if (binding === undefined) return
     if (isTurnStartEvent(event)) {
-      documentCommentQuotas.beginTurn(session.id, event.data.turn)
       // Fail closed: a turn that claims none of our messages sends its answer
       // unaimed rather than at a guessed target — reusing the previous one is
       // how an injected turn's output lands on an unrelated thread.
@@ -3251,7 +4009,6 @@ export function installBridge(
       }
       calls.set(event.data.callId, { turn: event.data.turn, arguments: event.data.arguments })
     } else if (isTurnEndEvent(event)) {
-      documentCommentQuotas.finishTurn(session.id, event.data.turn)
       // The turn's writer is done, so a queued preset switch may take its own
       // turn at the log now.
       // Only THIS session's THIS turn: call ids are known unique per turn, so
@@ -3305,6 +4062,11 @@ export function installBridge(
   // it does the disposing — and it leaves an adopted one running for its owner.
   ctx.effect(() => () => {
     unwound = true
+    documentCommentsClosed = true
+    for (const pending of pendingDocumentComments.values()) pending.settle({ error: 'channel stopped' })
+    for (const pending of activeDocumentComments.values()) pending.settle({ error: 'channel stopped' })
+    pendingDocumentComments.clear()
+    activeDocumentComments.clear()
     for (const id of [...pendingApprovals.keys()]) settleApproval(id, 'cancelled')
     pendingApprovals.clear()
     for (const sessionId of [...bySession.keys()]) questions.cancelSession(sessionId)
@@ -3315,8 +4077,27 @@ export function installBridge(
     callSnapshots.clear()
     runningBySession.clear()
     aimBySession.clear()
-    readDocuments.clearAll()
-    documentCommentQuotas.clearAll()
+    const documentTurnsDrained = (async () => {
+      // Closing is synchronous and every post-await gate observes it, so no new
+      // ingress or canonical tail can be registered after this sweep begins.
+      // Loop nevertheless makes the invariant explicit and covers a handler
+      // that was between raw resolution and canonical queue publication.
+      while (documentIngressTails.size > 0 || documentTurnTails.size > 0) {
+        await Promise.allSettled([
+          ...documentIngressTails,
+          ...documentTurnTails.values(),
+        ])
+      }
+      await documentAdmissionTail
+      await sessions.close()
+      documentConversations.clear()
+      admittedDocumentKeys.clear()
+      retiringDocumentKeys.clear()
+      canonicalByRawDocument.clear()
+      operatorNames.clear()
+      createdDocumentSessions.clear()
+      documentSessionIds.clear()
+    })()
     return Promise.allSettled([
       // Before the sessions: a command still in flight is a writer on a
       // session log, and disposal that does not wait for it leaves this
@@ -3324,7 +4105,7 @@ export function installBridge(
       // background set carries what surrounds those commands — opening an
       // agent, answering the chat, repainting a card.
       maintenance.close().then(() => drainBackground()),
-      sessions.close(),
+      documentTurnsDrained,
       ...open.map((binding) => binding.renderer.close()),
     ]).then(() => undefined)
   }, 'lark:agents')
@@ -3341,6 +4122,9 @@ export function installBridge(
       ctx.logger.error('lark channel connect failed: %s', error)
     }).finally(finishCapabilityProbe)
     return () => {
+      // This effect is registered last and therefore begins teardown first.
+      // Close admission before disconnect awaits transport/network cleanup.
+      documentCommentsClosed = true
       capabilityProbeCancelled = true
       documentAuthorizationLifetime.abort()
       finishCapabilityProbe()
@@ -3351,15 +4135,12 @@ export function installBridge(
   return {
     capabilities: documentCapabilities,
     correctFailure: correctDocumentCapabilityFailure,
-    readDocuments,
   }
 }
 
 /** Capability seam consumed by the later document protocol operations. */
 export interface LarkDocRuntimeAccess {
   readonly capabilities: LarkDocCapabilities
-  /** Session-scoped tokens successfully landed as snapshots. */
-  readonly readDocuments: ReadLarkDocumentSessions
   /** Correct the global table and, when enabled, start one owner-targeted QR flow. */
   correctFailure(
     capability: LarkDocCapability,

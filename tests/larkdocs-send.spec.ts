@@ -246,7 +246,7 @@ describe('send_doc and /put bridge wiring', () => {
     await harness.dispose()
   })
 
-  it('corrects write capability for wiki target scope violations from send_doc and /put, but not resource ACLs', async () => {
+  it('corrects write capability for send_doc and /put scope violations, but not resource ACLs', async () => {
     const workspace = await workspaceWithReport()
     const registerApp = async (request: {
       onQRCodeReady(input: { url: string; expireIn: number }): void
@@ -255,18 +255,17 @@ describe('send_doc and /put bridge wiring', () => {
       return { client_id: 'cli_test', client_secret: 'unchanged' }
     }
     const model = await mountChannel({ cwd: workspace, registeredBy: SENDER_ID }, { registerApp })
-    model.fake.wikiResponses.set('wiki_scope', {
+    model.fake.documentWriteResponses.set('POST /open-apis/docs_ai/v1/documents', {
       code: 99991672,
-      msg: 'wiki write scope missing',
-      error: { permission_violations: [{ subject: 'wiki:node:write-test' }] },
+      msg: 'document write scope missing',
+      error: { permission_violations: [{ subject: 'docx:document:create-test' }] },
     })
     const bound = await bind(model)
-    await expect(bound.tool.execute({
-      path: 'report.md', into: 'https://acme.feishu.cn/wiki/wiki_scope',
-    }, { agent: bound.created.agent })).rejects.toThrow(/wiki write scope missing/)
+    await expect(bound.tool.execute({ path: 'report.md' }, { agent: bound.created.agent }))
+      .rejects.toThrow(/document write scope missing/)
     await vi.waitFor(() => { expect(cards(model).length).toBeGreaterThan(0) })
     expect(model.notices.some(line => line.includes('document write capability disabled'))).toBe(true)
-    expect(model.fake.documentRequests).toHaveLength(0)
+    expect(model.fake.documentRequests).toHaveLength(1)
     await model.fake.emitMessage(fakeMessage({ chatId: 'oc_after_write_correction', messageId: 'om_after_correction' }))
     await vi.waitFor(() => { expect(model.agents.created).toHaveLength(2) })
     expect(model.agents.created[1]!.registeredTools.map(tool => tool.name)).not.toContain(SEND_DOC_TOOL)
@@ -286,11 +285,13 @@ describe('send_doc and /put bridge wiring', () => {
     await command.dispose()
 
     const acl = await mountChannel({ cwd: workspace, registeredBy: SENDER_ID }, { registerApp })
-    acl.fake.wikiResponses.set('wiki_acl', { code: 1770001, msg: 'document is not shared with this app' })
+    acl.fake.documentWriteResponses.set('POST /open-apis/docs_ai/v1/documents', {
+      code: 1770001,
+      msg: 'document is not shared with this app',
+    })
     const aclBound = await bind(acl)
-    await expect(aclBound.tool.execute({
-      path: 'report.md', into: 'https://acme.feishu.cn/wiki/wiki_acl',
-    }, { agent: aclBound.created.agent })).rejects.toThrow(/not shared/)
+    await expect(aclBound.tool.execute({ path: 'report.md' }, { agent: aclBound.created.agent }))
+      .rejects.toThrow(/not shared/)
     expect(cards(acl)).toHaveLength(0)
     expect(acl.notices.some(line => line.includes('document write capability disabled'))).toBe(false)
     await acl.dispose()
@@ -334,35 +335,6 @@ describe('send_doc and /put bridge wiring', () => {
       && line.includes('only the bot can open it'))).toBe(true)
     await createHarness.dispose()
 
-    const appendHarness = await mountChannel({ cwd: workspace })
-    appendHarness.fake.documentResponses.set('doc_read', {
-      code: 0, data: { document: { title: 'Read', content: '# snapshot' } },
-    })
-    const appendBound = await bind(appendHarness, {
-      chatType: 'group', chatId: 'oc_abort_append', content: 'https://acme.feishu.cn/docx/doc_read',
-    })
-    const appendResponse = deferred<object>()
-    appendHarness.fake.documentWriteResponses.set('PUT /open-apis/docs_ai/v1/documents/doc_read', appendResponse.promise)
-    const appendController = new AbortController()
-    const appending = appendBound.tool.execute({
-      path: 'report.md', into: 'https://acme.feishu.cn/docx/doc_read',
-    }, { agent: appendBound.created.agent, signal: appendController.signal })
-      .then(value => value, (error: unknown) => error)
-    await vi.waitFor(() => {
-      expect(appendHarness.fake.documentRequests.some(request => request.method === 'PUT')).toBe(true)
-    })
-    expect(appendHarness.fake.documentRequests.at(-1)?.signal).toBe(appendController.signal)
-    appendController.abort(new Error('cancelled deferred append'))
-    appendResponse.resolve({ code: 0, data: { document: { revision_id: 2 } } })
-    // The append landed. Calling this "failed" is what made a person send the
-    // same content again, so the room is told it worked and told not to resend.
-    await expect(appending).resolves.toMatchObject({ sent: true, appended: true })
-    expect(sentText(appendHarness)).toContain('已追加')
-    expect(sentText(appendHarness)).toContain('不要重发')
-    expect(appendHarness.notices.some(line => line.includes('the write did land'))).toBe(true)
-    expect(appendHarness.notices.some(line => line.includes('failed'))).toBe(false)
-    await appendHarness.dispose()
-
     const grantHarness = await mountChannel({ cwd: workspace })
     createFixture(grantHarness, 'grant_cancelled')
     const grantResponse = deferred<object>()
@@ -385,7 +357,7 @@ describe('send_doc and /put bridge wiring', () => {
     await grantHarness.dispose()
   })
 
-  it('returns partial success instead of repeating create/append when the final chat receipt fails', async () => {
+  it('returns partial success instead of repeating create when the final chat receipt fails', async () => {
     const workspace = await workspaceWithReport()
     const created = await mountChannel({ cwd: workspace })
     createFixture(created)
@@ -399,26 +371,6 @@ describe('send_doc and /put bridge wiring', () => {
       })
     expect(created.fake.documentRequests.filter(request => request.method === 'POST')).toHaveLength(1)
     await created.dispose()
-
-    const appended = await mountChannel({ cwd: workspace })
-    appended.fake.documentResponses.set('doc_read', {
-      code: 0, data: { document: { title: 'Read', content: '# snapshot' } },
-    })
-    const appendBound = await bind(appended, { content: 'https://acme.feishu.cn/docx/doc_read' })
-    appended.fake.documentWriteResponses.set('PUT /open-apis/docs_ai/v1/documents/doc_read', {
-      code: 0, data: { document: { revision_id: 2 } },
-    })
-    appended.fake.state.failNextSend = true
-    await expect(appendBound.tool.execute({
-      path: 'report.md', into: 'https://acme.feishu.cn/docx/doc_read',
-    }, { agent: appendBound.created.agent })).resolves.toMatchObject({
-      sent: true,
-      appended: true,
-      link: 'https://acme.feishu.cn/docx/doc_read',
-      warning: expect.stringContaining('不要重试写入'),
-    })
-    expect(appended.fake.documentRequests.filter(request => request.method === 'PUT')).toHaveLength(1)
-    await appended.dispose()
 
     const command = await mountChannel({ cwd: workspace })
     createFixture(command, 'put_receipt')
@@ -472,13 +424,14 @@ describe('send_doc and /put bridge wiring', () => {
     // map informs but cannot gate, so `scopeGrants: []` no longer turns
     // anything off. The platform's own violation is what does.
     const noCapability = await mountChannel({ cwd: workspace, docAuthorizeOnDemand: false })
-    noCapability.fake.documentResponses.set('doc_denied', {
+    noCapability.fake.documentWriteResponses.set('POST /open-apis/docs_ai/v1/documents', {
       code: 99991672,
       msg: 'Access denied',
-      error: { permission_violations: [{ subject: 'docx:document:readonly' }] },
+      error: { permission_violations: [{ subject: 'docx:document:create' }] },
     })
-    await noCapability.fake.emitMessage(fakeMessage({ content: 'https://acme.feishu.cn/docx/doc_denied' }))
-    await vi.waitFor(() => { expect(noCapability.agents.created).toHaveLength(1) })
+    const deniedBound = await bind(noCapability)
+    await expect(deniedBound.tool.execute({ path: 'report.md' }, { agent: deniedBound.created.agent }))
+      .rejects.toThrow(/Access denied/u)
     // A new chat, because the agent that made the failing call keeps the tool
     // table it was born with.
     await noCapability.fake.emitMessage(fakeMessage({ chatId: 'oc_dark', messageId: 'om_dark', content: 'hi' }))

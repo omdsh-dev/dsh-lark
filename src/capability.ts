@@ -24,19 +24,16 @@ export const GRANTED_SCOPE_STATUS = 1
 export const DEFAULT_CAPABILITY_PROBE_DEADLINE_MS = 10_000
 
 /** Stable order used by status cards and authorization requests. */
-export const LARK_DOC_CAPABILITIES: readonly LarkDocCapability[] = ['read', 'write', 'comment']
+export const LARK_DOC_CAPABILITIES: readonly LarkDocCapability[] = ['write']
 
 /** Agent tools gated by each capability; automatic link receipt has no tool name. */
 export const LARK_DOC_TOOL_CAPABILITIES = {
   send_doc: 'write',
-  read_doc_anchors: 'comment',
-  comment_on_doc: 'comment',
 } as const satisfies Readonly<Record<string, LarkDocCapability>>
 
 /** Configuration switches relevant to the model-visible document tools. */
 export interface LarkDocToolSwitches {
   readonly sendDocs: boolean
-  readonly commentDocs: boolean
 }
 
 /** Tool definitions later document tasks contribute, keyed by their fixed names. */
@@ -65,12 +62,11 @@ export function registerLarkDocTools(input: {
   const registered: string[] = []
   for (const [name, capability] of Object.entries(LARK_DOC_TOOL_CAPABILITIES) as
     [keyof typeof LARK_DOC_TOOL_CAPABILITIES, LarkDocCapability][]) {
-    const configured = capability === 'write' ? input.switches.sendDocs : input.switches.commentDocs
     const definition = input.definitions?.[name]
     // A deployment-level deny always wins over a feature switch or a granted
     // scope. Registering here would shadow the very tool denyTools removed.
     if (input.denied.has(name)) continue
-    if (!configured || !input.snapshot[capability].enabled) {
+    if (!input.switches.sendDocs || !input.snapshot[capability].enabled) {
       input.denied.add(name)
       continue
     }
@@ -94,7 +90,7 @@ export interface LarkDocCapabilityState {
   readonly enabled: boolean
   /** Static or runtime-discovered scopes not currently granted. */
   readonly missingScopes: readonly string[]
-  /** False while design §3 has not verified the complete static scope list. */
+  /** False while the current design §8 probe has not verified the complete static scope list. */
   readonly scopeMapVerified: boolean
   /** Why the current decision was made. */
   readonly source: 'scope-list' | 'optimistic' | 'runtime-correction'
@@ -146,9 +142,7 @@ export class LarkDocCapabilities {
    * later grant of any single member satisfy it.
    */
   readonly #discovered: Record<LarkDocCapability, string[][]> = {
-    read: [],
     write: [],
-    comment: [],
   }
   #granted = new Set<string>()
   #mode: 'scope-list' | 'optimistic' = 'optimistic'
@@ -233,9 +227,7 @@ export class LarkDocCapabilities {
   /** Immutable view for cards and creation-time tool registration. */
   snapshot(): LarkDocCapabilitySnapshot {
     return {
-      read: this.state('read'),
       write: this.state('write'),
-      comment: this.state('comment'),
     }
   }
 
@@ -447,6 +439,7 @@ function capabilityFingerprint(snapshot: LarkDocCapabilitySnapshot): string {
 export function createDocumentAuthorizationCoordinator(
   options: DocumentAuthorizationOptions,
 ): DocumentAuthorizationCoordinator {
+  const commentEvent = 'drive.notice.comment_add_v1'
   interface QueuedAuthorization {
     readonly originChatId: string
     readonly scopes: readonly string[]
@@ -479,7 +472,12 @@ export function createDocumentAuthorizationCoordinator(
       return
     }
     flow.sends.push(options.chat.send(origin, {
-      card: documentAuthorizationCard({ scopes: [...flow.scopes], url: flow.url, exposed: true }),
+        card: documentAuthorizationCard({
+          scopes: [...flow.scopes],
+          events: [commentEvent],
+          url: flow.url,
+          exposed: true,
+        }),
     }).catch((error: unknown) => {
       options.report(`lark-channel: sending the document authorization card failed: ${String(error)}`)
     }))
@@ -490,7 +488,12 @@ export function createDocumentAuthorizationCoordinator(
     if (options.registeredBy !== undefined && options.registeredBy !== '' && !flow.registrarCardSent) {
       flow.registrarCardSent = true
       flow.sends.push(options.chat.send(options.registeredBy, {
-        card: documentAuthorizationCard({ scopes: [...flow.scopes], url, exposed: false }),
+        card: documentAuthorizationCard({
+          scopes: [...flow.scopes],
+          events: [commentEvent],
+          url,
+          exposed: false,
+        }),
       }).catch((error: unknown) => {
         options.report(`lark-channel: sending the document authorization card failed: ${String(error)}`)
       }))
@@ -515,11 +518,15 @@ export function createDocumentAuthorizationCoordinator(
     }
     active = flow
     const before = capabilityFingerprint(options.capabilities.snapshot())
+    const grantedBefore = new Set(scopes.filter(scope => options.capabilities.isScopeGranted(scope)))
     try {
       await options.register({
         source: 'dsh-lark-channel',
         appId: options.appId,
-        addons: { scopes: { tenant: scopes } },
+        addons: {
+          scopes: { tenant: scopes },
+          events: { items: { tenant: [commentEvent] } },
+        },
         signal: options.signal,
         onQRCodeReady({ url }) { publishActiveUrl(flow, url) },
       })
@@ -528,9 +535,12 @@ export function createDocumentAuthorizationCoordinator(
       const rechecked = await options.refresh()
       if (options.signal.aborted) return
       const after = capabilityFingerprint(rechecked.snapshot)
+      const newlyGrantedScopes = scopes.filter(scope =>
+        !grantedBefore.has(scope) && options.capabilities.isScopeGranted(scope),
+      )
       const outcome = rechecked.mode === 'failed'
         ? 'failed'
-        : before === after ? 'unchanged' : 'changed'
+        : before === after && newlyGrantedScopes.length === 0 ? 'unchanged' : 'changed'
       const targets = options.registeredBy === undefined || options.registeredBy === ''
         ? [...flow.origins]
         : [options.registeredBy]
@@ -538,6 +548,7 @@ export function createDocumentAuthorizationCoordinator(
         card: documentAuthorizationResultCard({
           outcome,
           capabilities: documentCapabilityCopy(rechecked.snapshot),
+          grantedScopes: newlyGrantedScopes,
         }),
       })))
     } finally {

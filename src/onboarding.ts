@@ -46,7 +46,10 @@ export interface RegisterAppRequest {
   /** Pre-filled name/description shown on the app-creation page. */
   appPreset?: { name: string; desc: string }
   /** Incremental application-identity scopes for on-demand re-authorization. */
-  addons?: { scopes: { tenant: string[] } }
+  addons?: {
+    scopes: { tenant: string[] }
+    events?: { items: { tenant: string[] } }
+  }
   /** Aborting withdraws the pending scan. */
   signal: AbortSignal
   /** Called once the QR URL is ready to show. */

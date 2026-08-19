@@ -863,7 +863,7 @@ describe('dsh-lark-channel', () => {
     })
 
     it('spends no standing prompt on files where none can arrive', async () => {
-      const harness = await mountChannel({ receiveFiles: false, receiveDocs: false })
+      const harness = await mountChannel({ receiveFiles: false })
       await harness.fake.emitMessage(fakeMessage())
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       const presence = harness.agents.created[0]!.promptSections.find((s) => s.name === 'lark-channel:presence')

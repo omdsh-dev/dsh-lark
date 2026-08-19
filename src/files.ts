@@ -221,9 +221,8 @@ export function inboxDirectoryFor(msg: NormalizedMessage, workspace: string): st
 }
 
 /**
- * Create and prove the one inbox directory shared by every inbound item in a
- * message. Document snapshots use this same boundary rather than reproducing
- * its path and symlink checks in their protocol module.
+ * Create and prove the one inbox directory shared by every inbound file in a
+ * message.
  * @param msg - the inbound message whose items are being landed.
  * @param workspace - the conversation workspace.
  * @returns the canonical absolute directory that may be written to.

@@ -4,6 +4,9 @@ import { vi } from 'vitest'
 import type {
   CardActionEvent,
   CardActionResponse,
+  CommentEvent,
+  CommentTarget,
+  FetchedComment,
   LarkChannelError,
   MarkdownStreamController,
   NormalizedMessage,
@@ -33,12 +36,12 @@ import { LARK_DOC_SCOPE_REQUIREMENTS } from '../src/larkdocs.ts'
 import type { LarkScopeGrant, LarkScopeListResponse } from '../src/larkdocs.ts'
 
 /**
- * How many inbound subscriptions `installBridge` opens: `message`,
+ * How many inbound subscriptions `installBridge` opens: `message`, `comment`,
  * `cardAction`, `reject`, `error`, `reconnecting`, `reconnected`. Tests use the
  * count as the "bridge is installed" signal, so it lives here rather than being
  * pinned at each call site.
  */
-export const INBOUND_SUBSCRIPTIONS = 6
+export const INBOUND_SUBSCRIPTIONS = 7
 
 /** One outbound message captured by the fake port. */
 export interface SentMessage {
@@ -49,11 +52,12 @@ export interface SentMessage {
 
 type MessageHandler = (msg: NormalizedMessage) => void | Promise<void>
 type CardActionHandler = (evt: CardActionEvent) => void | CardActionResponse | Promise<void | CardActionResponse>
+type CommentHandler = (evt: CommentEvent) => void | Promise<void>
 type RejectHandler = (evt: RejectEvent) => void
 type ErrorHandler = (err: LarkChannelError) => void
 type ConnectionStateHandler = () => void
 /** Any inbound subscription the fake port accepts, whatever the event name. */
-type PortHandler = MessageHandler | CardActionHandler | RejectHandler | ErrorHandler | ConnectionStateHandler
+type PortHandler = MessageHandler | CardActionHandler | CommentHandler | RejectHandler | ErrorHandler | ConnectionStateHandler
 
 /** One streaming card opened by the renderer, with the content it received. */
 export interface StreamedCard {
@@ -70,6 +74,16 @@ export interface StreamedCard {
 export function createFakePort() {
   const messageHandlers: MessageHandler[] = []
   const cardHandlers: CardActionHandler[] = []
+  const commentHandlers: CommentHandler[] = []
+  /**
+   * Exact dependency contract used by `createLarkChannel`: composite event
+   * identities are de-duplicated and handlers are serialized by file token,
+   * while distinct documents may dispatch concurrently. Keeping that seam in
+   * the fake prevents bridge tests from proving behavior against an impossible
+   * direct-handler scheduler.
+   */
+  const dispatchedComments = new Set<string>()
+  const commentDispatchByFile = new Map<string, Promise<void>>()
   /** Every other subscription, by event name, so a test can replay any inbound event. */
   const byName = new Map<string, PortHandler[]>()
   const sent: SentMessage[] = []
@@ -103,7 +117,14 @@ export function createFakePort() {
    */
   const downloads: { fileKey: string; via: 'memory' | 'disk' }[] = []
   /** Optional holds a test injects into port operations to stage races. */
-  const gates: { beforeSend?: () => Promise<void> } = {}
+  const gates: {
+    beforeSend?: () => Promise<void>
+    beforeCommentResolve?: (fileToken: string) => Promise<void>
+    beforeCommentFetch?: (commentId: string) => Promise<void>
+    beforeDocumentMetadata?: (fileToken: string) => Promise<void>
+    beforeOperatorLookup?: (openId: string) => Promise<void>
+    beforeCommentReaction?: (replyId: string) => Promise<void>
+  } = {}
   const state = {
     connects: 0,
     disconnects: 0,
@@ -128,6 +149,12 @@ export function createFakePort() {
     scopeLists: 0,
     /** Reject repaints, as a message too old to edit does. */
     failCardUpdate: false,
+    /** Platform-shaped failure injected into document-comment replies. */
+    commentReplyError: undefined as unknown | undefined,
+    /** Transport/protocol failure injected before a comment can bind a session. */
+    commentFetchError: undefined as unknown | undefined,
+    /** Transport/protocol failure injected while canonicalizing a comment target. */
+    commentResolveError: undefined as unknown | undefined,
   }
   const scopeGrants: LarkScopeGrant[] = [...new Set(Object.values(LARK_DOC_SCOPE_REQUIREMENTS).flatMap(item => item.scopes))]
     .map(scopeName => ({ scope_name: scopeName, grant_status: 1, scope_type: 'tenant' as const }))
@@ -156,6 +183,16 @@ export function createFakePort() {
   /** Typed wiki-node fixtures and payloads, kept separate from docs_ai. */
   const wikiResponses = new Map<string, unknown>()
   const wikiRequests: { params: { token: string } }[] = []
+  const commentResponses = new Map<string, FetchedComment | null>()
+  const commentReplies: { target: CommentTarget; commentId?: string; text: string; topLevel: boolean }[] = []
+  const commentReactions: { action: 'add' | 'delete'; target: CommentTarget; replyId: string }[] = []
+  const documentMetadata = new Map<string, { title: string; url: string }>()
+  const documentPermissions = new Map<string, {
+    external_access_entity?: 'open' | 'closed' | 'allow_share_partner_tenant'
+    link_share_entity?: string
+  }>()
+  const contactNames = new Map<string, string>()
+  const contactRequests: string[] = []
   let counter = 0
 
   /**
@@ -166,6 +203,7 @@ export function createFakePort() {
   const listFor = (name: string): PortHandler[] => {
     if (name === 'message') return messageHandlers as PortHandler[]
     if (name === 'cardAction') return cardHandlers as PortHandler[]
+    if (name === 'comment') return commentHandlers as PortHandler[]
     const existing = byName.get(name)
     if (existing !== undefined) return existing
     const fresh: PortHandler[] = []
@@ -197,9 +235,33 @@ export function createFakePort() {
         const response = wikiResponses.get(payload.params.token)
         return (response ?? { code: 404, msg: `no such wiki node ${payload.params.token} (fake)` }) as never
       } } } },
-      drive: { v1: { permissionMember: { create: async (payload) => {
-        permissionRequests.push(payload)
-        return (permissionResponses.get(payload.path.token) ?? { code: 0, msg: 'ok' }) as never
+      drive: {
+        v1: {
+          permissionMember: { create: async (payload) => {
+            permissionRequests.push(payload)
+            return (permissionResponses.get(payload.path.token) ?? { code: 0, msg: 'ok' }) as never
+          } },
+          meta: { batchQuery: async (payload) => {
+            const token = payload.data.request_docs[0]?.doc_token
+            if (token !== undefined) await gates.beforeDocumentMetadata?.(token)
+            return {
+              data: {
+                metas: payload.data.request_docs.flatMap(({ doc_token }) => {
+                  const meta = documentMetadata.get(doc_token)
+                  return meta === undefined ? [] : [{ doc_token, ...meta }]
+                }),
+              },
+            }
+          } },
+        },
+        v2: { permissionPublic: { get: async (payload) => ({
+          data: { permission_public: documentPermissions.get(payload.path.token) },
+        }) } },
+      },
+      contact: { v3: { user: { get: async (payload) => {
+        contactRequests.push(payload.path.user_id)
+        await gates.beforeOperatorLookup?.(payload.path.user_id)
+        return { data: { user: { name: contactNames.get(payload.path.user_id) } } }
       } } } },
       request: async (request) => {
         documentRequests.push(request)
@@ -212,6 +274,37 @@ export function createFakePort() {
     },
     async connect() { state.connects += 1 },
     async disconnect() { state.disconnects += 1 },
+    getBotIdentity() { return { openId: 'ou_bot', name: 'DSH Agent' } },
+    comments: {
+      async resolveTarget(fileToken, fileType) {
+        await gates.beforeCommentResolve?.(fileToken)
+        if (state.commentResolveError !== undefined) throw state.commentResolveError
+        if (!['doc', 'docx', 'sheet', 'file'].includes(fileType)) return null
+        const node = wikiResponses.get(fileToken) as { data?: { node?: { obj_token?: string; obj_type?: string } } } | undefined
+        return node?.data?.node?.obj_token !== undefined && node.data.node.obj_type !== undefined
+          ? { fileToken: node.data.node.obj_token, fileType: node.data.node.obj_type as CommentTarget['fileType'] }
+          : { fileToken, fileType: fileType as CommentTarget['fileType'] }
+      },
+      async fetch(_target, commentId) {
+        await gates.beforeCommentFetch?.(commentId)
+        if (state.commentFetchError !== undefined) throw state.commentFetchError
+        return commentResponses.get(commentId) ?? null
+      },
+      async reply(target, commentId, text, opts) {
+        if (state.commentReplyError !== undefined) throw state.commentReplyError
+        commentReplies.push({ target, commentId, text, topLevel: opts?.topLevel === true })
+      },
+      async replyTopLevel(target, text) {
+        if (state.commentReplyError !== undefined) throw state.commentReplyError
+        commentReplies.push({ target, text, topLevel: true })
+      },
+      async addReaction(target, replyId) {
+        await gates.beforeCommentReaction?.(replyId)
+        commentReactions.push({ action: 'add', target, replyId })
+        return true
+      },
+      async removeReaction(target, replyId) { commentReactions.push({ action: 'delete', target, replyId }) },
+    } as ChannelPort['comments'],
     async getChatMembers(chatId) {
       memberLookups.push(chatId)
       if (state.failChatMembers) throw new Error('cannot list chat members (fake)')
@@ -337,10 +430,34 @@ export function createFakePort() {
     permissionRequests,
     wikiResponses,
     wikiRequests,
+    commentResponses,
+    commentReplies,
+    commentReactions,
+    documentMetadata,
+    documentPermissions,
+    contactNames,
+    contactRequests,
     gates,
     /** Deliver one inbound chat message to every subscribed handler. */
     async emitMessage(msg: NormalizedMessage): Promise<void> {
       for (const handler of [...messageHandlers]) await handler(msg)
+    },
+    /** Deliver through CommentSurface's de-duplicated, per-document dispatcher contract. */
+    async emitComment(evt: CommentEvent): Promise<void> {
+      const identity = `comment:${evt.fileToken}:${evt.commentId}:${evt.replyId ?? ''}`
+      if (dispatchedComments.has(identity)) return
+      dispatchedComments.add(identity)
+      const previous = commentDispatchByFile.get(evt.fileToken) ?? Promise.resolve()
+      const running = previous.catch(() => {}).then(async () => {
+        for (const handler of [...commentHandlers]) await handler(evt)
+      })
+      const tail = running.catch(() => {})
+      commentDispatchByFile.set(evt.fileToken, tail)
+      try {
+        await running
+      } finally {
+        if (commentDispatchByFile.get(evt.fileToken) === tail) commentDispatchByFile.delete(evt.fileToken)
+      }
     },
     /** Deliver one policy rejection to every subscribed handler. */
     emitReject(evt: RejectEvent): void {
@@ -505,6 +622,12 @@ export function createFakePermissionPresets(
 /** An in-memory `agents` registry capturing every agent it produced. */
 export function createFakeAgents(options: { readonly canRegister?: boolean } = {}) {
   const created: CreatedAgent[] = []
+  const disposed: string[] = []
+  const state: {
+    failNextCreate: boolean
+    beforeCreate?: (sessionId: string) => Promise<void>
+    beforeDispose?: (sessionId: string) => Promise<void>
+  } = { failNextCreate: false }
   /** Session ids a test declared stored, so `resume` loads them instead of rejecting. */
   const resumable = new Set<string>()
   /** Agents a test declared already live under another owner, so `get` adopts one. */
@@ -609,6 +732,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       readonly agentOptions?: HostAgentOptions
       readonly setup?: (agentCtx: Context) => Promise<void>
     }) {
+      await state.beforeCreate?.(options.resumeSessionId)
       resumed.push(options.resumeSessionId)
       if (!resumable.has(options.resumeSessionId)) {
         throw new Error(`no stored session for ${options.resumeSessionId} (fake)`)
@@ -620,7 +744,10 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
         agentOptions: options.agentOptions,
         ...await compose(options.setup),
         agent,
-        dispose: vi.fn<() => Promise<void>>(async () => {}),
+        dispose: vi.fn<() => Promise<void>>(async () => {
+          await state.beforeDispose?.(options.resumeSessionId)
+          disposed.push(options.resumeSessionId)
+        }),
       }
       created.push(record)
       return { agent, dispose: record.dispose }
@@ -631,6 +758,11 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       readonly agentOptions?: HostAgentOptions
       readonly setup?: (agentCtx: Context) => Promise<void>
     }) {
+      await state.beforeCreate?.(options.sessionId)
+      if (state.failNextCreate) {
+        state.failNextCreate = false
+        throw new Error(`agent create rejected for ${options.sessionId} (fake)`)
+      }
       const agent = makeAgent(options.sessionId)
       const record: CreatedAgent = {
         sessionId: options.sessionId,
@@ -638,7 +770,10 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
         agentOptions: options.agentOptions,
         ...await compose(options.setup),
         agent,
-        dispose: vi.fn<() => Promise<void>>(async () => {}),
+        dispose: vi.fn<() => Promise<void>>(async () => {
+          await state.beforeDispose?.(options.sessionId)
+          disposed.push(options.sessionId)
+        }),
       }
       created.push(record)
       return { agent, dispose: record.dispose }
@@ -646,6 +781,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
   }
   return {
     created,
+    disposed,
     service,
     /** Ids `resume` loads, and agents `get` adopts. */
     resumable,
@@ -653,6 +789,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
     /** Ids handed to `resume` and to `get`, in call order. */
     resumed,
     looked,
+    state,
     /** Declare one id already live under another owner. */
     declareLive(sessionId: string): CreatedAgent['agent'] {
       const agent = makeAgent(sessionId)

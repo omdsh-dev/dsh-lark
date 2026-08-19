@@ -87,6 +87,12 @@ export interface Config {
    * zero. Absent is the first session, whose id is unchanged.
    */
   chatEpochs?: Record<string, string>
+  /**
+   * Managed state, not configuration: how many times each canonical document
+   * conversation has been reset with `/doc reset`, keyed by `doc:<fileToken>`.
+   * Absent is the original durable session id.
+   */
+  documentGenerations?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -189,31 +195,25 @@ export interface Config {
    */
   maxSendFileBytes?: number
   /**
-   * Read Feishu/Lark document links from chat into immutable workspace
-   * snapshots. On by default; the snapshot is an inbound file and stays
-   * untrusted data rather than entering the prompt as instructions.
-   */
-  receiveDocs?: boolean
-  /**
    * Let chat agents publish workspace artifacts as cloud documents. On by
    * default. New documents grant exactly the receiving direct user or group;
    * model-driven group creation waits for approval, while human `/put` does
-   * not. Agent-owned sends share the per-chat held-content ceiling with
-   * `send_file`; appending preserves the target document's existing audience.
+   * not. The model tool creates only; human `/put --into` may append to its
+   * explicit target. Agent-owned sends share the per-chat held-content ceiling
+   * with `send_file`.
    */
   sendDocs?: boolean
   /**
-   * Let chat agents add anchored comments to documents this conversation has
-   * already read. On by default; each turn remains bounded by
-   * {@link maxDocCommentsPerTurn}.
+   * Enable document-comment events as an agent conversation surface. One
+   * durable session is derived per document; only explicit non-self mentions
+   * open turns, and terminal replies return to the triggering comment thread.
    */
   commentDocs?: boolean
-  /** Maximum anchored document comments one agent turn may create. */
-  maxDocCommentsPerTurn?: number
   /**
    * Start the QR re-authorization flow when a real document call reports
-   * missing tenant scopes. Off leaves the failure visible without sending an
-   * app-configuration link.
+   * missing tenant scopes. The same additive request includes the document
+   * comment event subscription. Off leaves the failure visible without sending
+   * an app-configuration link.
    */
   docAuthorizeOnDemand?: boolean
   /**
@@ -296,6 +296,7 @@ export interface ResolvedConfig {
   chatWorkspaces: Record<string, string>
   chatModels: Record<string, string>
   chatEpochs: Record<string, string>
+  documentGenerations: Record<string, string>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -307,10 +308,8 @@ export interface ResolvedConfig {
   maxReceiveFileBytes: number
   sendFiles: boolean
   maxSendFileBytes: number
-  receiveDocs: boolean
   sendDocs: boolean
   commentDocs: boolean
-  maxDocCommentsPerTurn: number
   docAuthorizeOnDemand: boolean
   hideProcessWhenDone: boolean
   syncSlashCommands: boolean
@@ -336,6 +335,7 @@ export const Config: z<Config> = z.object({
   chatWorkspaces: z.dict(String).default({}),
   chatModels: z.dict(String).default({}),
   chatEpochs: z.dict(String).default({}),
+  documentGenerations: z.dict(String).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -347,10 +347,8 @@ export const Config: z<Config> = z.object({
   maxReceiveFileBytes: z.number().default(20 * 1024 * 1024),
   sendFiles: z.boolean().default(true),
   maxSendFileBytes: z.number().default(20 * 1024 * 1024),
-  receiveDocs: z.boolean().default(true),
   sendDocs: z.boolean().default(true),
   commentDocs: z.boolean().default(true),
-  maxDocCommentsPerTurn: z.number().default(20),
   docAuthorizeOnDemand: z.boolean().default(true),
   hideProcessWhenDone: z.boolean().default(false),
   syncSlashCommands: z.boolean().default(true),
@@ -375,6 +373,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     chatWorkspaces: config.chatWorkspaces ?? {},
     chatModels: config.chatModels ?? {},
     chatEpochs: config.chatEpochs ?? {},
+    documentGenerations: config.documentGenerations ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,
@@ -383,10 +382,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxReceiveFileBytes: config.maxReceiveFileBytes ?? 20 * 1024 * 1024,
     sendFiles: config.sendFiles ?? true,
     maxSendFileBytes: config.maxSendFileBytes ?? 20 * 1024 * 1024,
-    receiveDocs: config.receiveDocs ?? true,
     sendDocs: config.sendDocs ?? true,
     commentDocs: config.commentDocs ?? true,
-    maxDocCommentsPerTurn: config.maxDocCommentsPerTurn ?? 20,
     docAuthorizeOnDemand: config.docAuthorizeOnDemand ?? true,
     hideProcessWhenDone: config.hideProcessWhenDone ?? false,
     syncSlashCommands: config.syncSlashCommands ?? true,

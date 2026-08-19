@@ -1,6 +1,6 @@
 /**
  * Publishing workspace artifacts as Lark documents: path safety, the agent
- * tool, the human `/put` command, and conversation-scoped target constraints.
+ * tool and the human `/put` command.
  *
  * Platform URLs, bodies, tokens, scope errors and raw SDK calls stay in
  * `larkdocs.ts` under ADR 0006. This module owns only channel business policy.
@@ -16,7 +16,6 @@ import {
   resolveOutboundFile,
 } from './outbound-file.ts'
 import type { OutboundFile } from './outbound-file.ts'
-import type { ReadLarkDocumentSessions } from './larkdoc-session.ts'
 import { describeLarkDocumentFailure } from './larkdocs.ts'
 import type { LarkDocumentTarget, WrittenLarkDocument } from './larkdocs.ts'
 
@@ -43,18 +42,14 @@ export interface PublishedLarkDocument extends WrittenLarkDocument {
 
 /** Boundaries the agent-scoped document tool needs from the bridge. */
 export interface SendDocPorts {
-  readonly readDocuments: ReadLarkDocumentSessions
   readonly maxBytes: number
   readonly report: (line: string) => void
   workspaceOf(sessionId: string): string | undefined
-  /** Resolve docx/wiki and apply Task #0 write-capability correction on scope failures. */
-  resolveTarget(sessionId: string, value: string, signal?: AbortSignal): Promise<LarkDocumentTarget>
   /** Share the per-chat outbound-content quota with `send_file`; direct chats run without a held slot. */
   withOutboundSlot<T>(sessionId: string, operation: () => Promise<T>): Promise<T>
   publish(
     sessionId: string,
     artifact: LarkDocumentArtifact,
-    target: LarkDocumentTarget | undefined,
     signal?: AbortSignal,
   ): Promise<PublishedLarkDocument>
 }
@@ -90,14 +85,13 @@ export function sendDocTool(ports: SendDocPorts): object {
     name: SEND_DOC_TOOL,
     description: 'Turn one markdown file from the current workspace into a Feishu document and return its link '
       + 'to this chat. Use it for long artifacts a chat message reads badly: reports, reviews, design notes. '
-      + 'Short content belongs in your reply instead. Pass into to append to a document this session has already read.',
+      + 'Short content belongs in your reply instead.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['path'],
       properties: {
         path: { type: 'string', description: 'Path to the markdown file, inside the workspace.' },
-        into: { type: 'string', description: 'Optional docx/wiki link this session has already read; append there.' },
       },
     },
     output: {
@@ -124,7 +118,7 @@ export function sendDocTool(ports: SendDocPorts): object {
       appended: boolean
       warning?: string | undefined
     }> {
-      const input = args as { path?: unknown; into?: unknown } | null | undefined
+      const input = args as { path?: unknown } | null | undefined
       const requested = String(input?.path ?? '')
       const context = exec as { agent?: { session?: { id?: string } }; signal?: AbortSignal }
       const sessionId = context.agent?.session?.id
@@ -143,20 +137,11 @@ export function sendDocTool(ports: SendDocPorts): object {
 
       return ports.withOutboundSlot(sessionId, async () => {
         throwIfAborted(context.signal)
-        const suppliedInto = typeof input?.into === 'string' ? input.into.trim() : ''
-        const target = suppliedInto === ''
-          ? undefined
-          : await ports.resolveTarget(sessionId, suppliedInto, context.signal)
-        if (target !== undefined && !ports.readDocuments.has(sessionId, target.fileToken)) {
-          throw new Error('That document was not read in this conversation. send_doc may append only to a document '
-            + 'this session has already read; ask the person to send its link here first.')
-        }
-        throwIfAborted(context.signal)
         // The shared slot was claimed before this read, so three pending group
         // document approvals cannot be followed by a fourth pinned buffer.
         const artifact = await readDocumentArtifact(verdict.file)
         throwIfAborted(context.signal)
-        const published = await ports.publish(sessionId, artifact, target, context.signal)
+        const published = await ports.publish(sessionId, artifact, context.signal)
         return {
           sent: true as const,
           link: published.url,
@@ -210,7 +195,7 @@ export async function runPutCommand(
     throwIfAborted(signal)
     const artifact = await readDocumentArtifact(verdict.file)
     throwIfAborted(signal)
-    // Human-owned /put deliberately has no ReadLarkDocumentSessions constraint.
+    // Human-owned /put may append because the person explicitly selected the target.
     const target = parsed.into === undefined ? undefined : await resolveTarget(parsed.into, signal)
     throwIfAborted(signal)
     const published = await publish(artifact, target, signal)
