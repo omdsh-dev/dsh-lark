@@ -940,16 +940,23 @@ export function createFakeCommands(
   outcomes: Record<string, { kind: 'success'; text?: string } | { kind: 'error'; text: string }> = {},
 ) {
   const executed: string[] = []
+  const imageBatches: (readonly unknown[])[] = []
+  const signals: AbortSignal[] = []
   const service: HostCommands = {
     list: () => available,
-    async execute(_agent, line, _signal) {
+    async execute(_agent, line, images, signal) {
+      // Model the current host boundary closely enough that a three-argument
+      // caller fails here in the same place the real command runtime does.
+      if (signal.aborted) throw signal.reason
       executed.push(line)
+      imageBatches.push(images)
+      signals.push(signal)
       const name = commandName(line) ?? ''
       if (!available.some(c => c.name === name)) return undefined
       return { result: outcomes[name] ?? { kind: 'success', text: `ran ${name}` } }
     },
   }
-  return { service, executed }
+  return { service, executed, imageBatches, signals }
 }
 
 /** An in-memory `tools` registry that can describe calls and record guards. */

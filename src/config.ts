@@ -23,6 +23,8 @@ const DEFAULT_DENY_TOOLS = [] as const
 /**
  * Runtime plugin configuration supplied by the profile composition. Package
  * installation policy is owned by the provisioning CLI, not this schema.
+ * The runtime boundary targets DeepSeek Harness rc.8 or newer, whose command
+ * execution API carries image attachments before its cancellation signal.
  */
 export interface Config {
   /**

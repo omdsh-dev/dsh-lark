@@ -1402,6 +1402,9 @@ describe('dsh-lark-channel', () => {
       const harness = await mountChannel({}, { commands: commands.service })
       await harness.fake.emitMessage(fakeMessage({ content: '/clear' }))
       await vi.waitFor(() => { expect(commands.executed).toEqual(['/clear']) })
+      expect(commands.imageBatches).toEqual([[]])
+      expect(commands.signals).toHaveLength(1)
+      expect(commands.signals[0]!.aborted).toBe(false)
 
       // The model never sees the line: a command is a control, not a prompt.
       const created = harness.agents.created[0]!

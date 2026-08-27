@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Host-owned slash commands work on current DeepSeek Harness releases again. The command API gained an image-attachment argument in `0.1.0-rc.8`; the channel now passes an explicit empty image batch before the cancellation signal, so `/permission` and every other delegated command no longer leave the host reading `aborted` from an absent fourth argument.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
