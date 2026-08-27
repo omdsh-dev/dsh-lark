@@ -169,7 +169,7 @@ dsh web
 ## 环境要求
 
 - Node.js `^22.19.0 || >=24`
-- DeepSeek Harness `0.1.0-rc.6` 或更新版本
+- DeepSeek Harness `0.1.0-rc.8` 或更新版本（宿主命令从此版本起使用带图片参数的四参数接口）
 - 飞书或 Lark 租户
 
 原生思考过程需要飞书 PC 7.70、移动端 7.74 或更新版本；旧客户端可以使用 `output: 'stream'`。

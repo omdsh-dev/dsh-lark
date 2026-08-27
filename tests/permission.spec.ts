@@ -107,6 +107,29 @@ describe('switching the preset', () => {
     expect(ran).toEqual(['/permission danger-full-access'])
   })
 
+  it('keeps the empty image batch and abort signal in their current host slots', async () => {
+    const suppliedSignal = AbortSignal.timeout(1000)
+    let receivedImages: readonly unknown[] | undefined
+    let receivedSignal: AbortSignal | undefined
+    const commands: HostCommands = {
+      list: () => [],
+      execute: async (_agent, line, images, signal) => {
+        // Reading this is the exact operation that crashed when the channel
+        // passed its signal as argument three and left argument four missing.
+        expect(signal.aborted).toBe(false)
+        expect(line).toBe('/permission danger-full-access')
+        receivedImages = images
+        receivedSignal = signal
+        return { result: { kind: 'success' as const, text: 'switched' } }
+      },
+    }
+
+    expect(await switchPreset(agent, commands, UNCONFINED_PRESET, suppliedSignal))
+      .toEqual({ ok: true, detail: 'switched' })
+    expect(receivedImages).toEqual([])
+    expect(receivedSignal).toBe(suppliedSignal)
+  })
+
   it('reports a refusal instead of claiming success', async () => {
     const { commands } = fakeCommands({})
     const outcome = await switchPreset(agent, commands, 'nonsense', AbortSignal.timeout(1000))
@@ -228,9 +251,9 @@ describe('a switch cancelled after the command started', () => {
     const reason = new Error('the conversation moved on')
     const commands: HostCommands = {
       list: () => [],
-      execute: async (_agent, _line, signal) => {
+      execute: async (_agent, _line, _images, signal) => {
         await new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
+          signal.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
         })
         return { result: { kind: 'success' as const, text: 'unreachable' } }
       },

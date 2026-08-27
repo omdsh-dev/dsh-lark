@@ -308,6 +308,13 @@ export interface HostCommandExecution {
     | { readonly kind: 'error'; readonly text: string }
 }
 
+/** One base64-encoded image accompanying a host command invocation. */
+export interface HostEncodedImageAttachment {
+  readonly mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  readonly data: string
+  readonly name?: string
+}
+
 /**
  * The `commands` runtime: slash commands dispatched WITHOUT a model turn, which
  * is why a chat must route them here instead of letting the model read a literal
@@ -321,7 +328,12 @@ export interface HostCommands {
    * or the name does not resolve, which is what distinguishes an unknown
    * command from one that ran and failed.
    */
-  execute(agent: HostAgent, line: string, signal: AbortSignal): Promise<HostCommandExecution | undefined>
+  execute(
+    agent: HostAgent,
+    line: string,
+    images: readonly HostEncodedImageAttachment[],
+    signal: AbortSignal,
+  ): Promise<HostCommandExecution | undefined>
 }
 
 /** The `systemPrompt` assembler, as this plugin's per-agent composition uses it. */

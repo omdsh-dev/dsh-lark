@@ -3,6 +3,7 @@
 # must match package.json.
 # Package installation policy (the profile's pnpm build-script settings) is
 # prepared by the provisioning CLI before this runtime patch is loaded.
+# Runtime command dispatch requires DeepSeek Harness 0.1.0-rc.8 or newer.
 
 - insert:
     - id: lark-channel

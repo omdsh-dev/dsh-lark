@@ -257,7 +257,7 @@ export async function switchPreset(
 ): Promise<{ readonly ok: boolean; readonly detail?: string }> {
   if (commands === undefined) return { ok: false, detail: 'no command runtime is composed' }
   const execution = await commands
-    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, signal)
+    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, [], signal)
     .catch((error: unknown) => {
       // A cancelled command is not a failed one, and flattening the two here
       // is invisible from the outside: the caller would see an ordinary

@@ -169,7 +169,7 @@ dsh web
 ## Requirements
 
 - Node.js `^22.19.0 || >=24`
-- DeepSeek Harness `0.1.0-rc.6` or newer
+- DeepSeek Harness `0.1.0-rc.8` or newer (the host command API uses its image-aware four-argument form from rc.8)
 - A Feishu or Lark tenant
 
 A native thinking process needs Feishu PC 7.70 / mobile 7.74 or newer; older clients can use `output: 'stream'`.

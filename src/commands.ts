@@ -110,7 +110,10 @@ export async function runCommandLine(
   if (commands === undefined) {
     return { reply: `⚠️ 本部署没有组合命令运行时，\`/${name}\` 无法执行。`, resolved: false }
   }
-  const execution = await commands.execute(agent, trimmed, signal)
+  // rc.8 made composer images an explicit third argument. This channel does
+  // not submit images with slash commands, so the host receives an empty batch
+  // and the abort signal keeps its fourth slot.
+  const execution = await commands.execute(agent, trimmed, [], signal)
   if (execution === undefined) {
     return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent)}`, resolved: false }
   }
