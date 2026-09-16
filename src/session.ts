@@ -168,6 +168,17 @@ export class ConversationSessions {
    * message drives a disposed agent.
    */
   private readonly retiring = new Map<string, Promise<void>>()
+  /**
+   * Fresh session id per conversation key, taken when the derived one turned
+   * out to exist but could not be resumed.
+   *
+   * Without this rung the ladder deadlocks: `resume` rejects (unreadable or
+   * legacy log, stale lock ownership) and `create` then fails with
+   * `SessionAlreadyExistsError` for the very id the resume just refused — a
+   * state the next message re-enters, forever. The conversation stays broken
+   * until an operator moves the session directory aside by hand.
+   */
+  private readonly recovered = new Map<string, string>()
   private closed = false
 
   /**
@@ -247,7 +258,7 @@ export class ConversationSessions {
         // Reusable only while it still IS this key's session: a workspace
         // switch re-derives the id, and a stale binding is released — a second
         // release is a no-op — before walking under the new state.
-        if (bound.handle.agent.session.id === this.idFor(key)) return bound
+        if (bound.handle.agent.session.id === this.effectiveId(key)) return bound
         await this.release(key)
         continue
       }
@@ -273,7 +284,7 @@ export class ConversationSessions {
       if (
         this.generation(key) === generation
         && this.opened.get(key) === result
-        && result.handle.agent.session.id === this.idFor(key)
+        && result.handle.agent.session.id === this.effectiveId(key)
       ) return result
     }
   }
@@ -418,7 +429,7 @@ export class ConversationSessions {
    * @throws when creation — the last rung — also fails.
    */
   private async reach(key: string): Promise<OpenedSession> {
-    const sessionId = this.idFor(key)
+    const sessionId = this.effectiveId(key)
     const live = this.ladder.lookup(sessionId)
     // Whoever created a live agent still owns taking it down.
     if (live !== undefined) return { handle: live, owned: false }
@@ -433,6 +444,47 @@ export class ConversationSessions {
         `lark-channel: resuming session for ${key} failed, starting a new one: ${failureDetail(error)}`,
       )
     }
-    return { handle: await this.ladder.create(sessionId), owned: true }
+    try {
+      return { handle: await this.ladder.create(sessionId), owned: true }
+    } catch (error) {
+      // A session that exists but cannot be resumed lands here: `resume` just
+      // refused this very id and `create` reports it as taken, so retrying the
+      // same id can never succeed. Take a fresh one for this conversation
+      // instead of leaving it dead until an operator moves the directory aside.
+      if (!isSessionAlreadyExists(error)) throw error
+      const freshId = `${sessionId}-${recoverySuffix()}`
+      this.recovered.set(key, freshId)
+      this.ladder.report(
+        `lark-channel: session ${sessionId} is unusable (already exists); ` +
+          `recovering with a fresh session ${freshId}`,
+      )
+      return { handle: await this.ladder.create(freshId), owned: true }
+    }
   }
+
+  /**
+   * The session id one key currently derives, recovery included.
+   * @param key - the conversation key.
+   * @returns the recovered id once one was taken, else the derived one.
+   */
+  private effectiveId(key: string): string {
+    return this.recovered.get(key) ?? this.idFor(key)
+  }
+}
+
+/** The error a host raises when a session id is already taken on disk. */
+function isSessionAlreadyExists(error: unknown): boolean {
+  if ((error as { name?: string } | undefined)?.name === 'SessionAlreadyExistsError') return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /already exists/i.test(message)
+}
+
+/**
+ * A distinguishing tail for a recovered session id, so the replacement cannot
+ * collide with the id it replaces (or with another recovery of the same key).
+ * @param now - the clock reading to derive it from.
+ * @returns a short lowercase alphanumeric suffix.
+ */
+function recoverySuffix(now: number = Date.now()): string {
+  return `${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`
 }

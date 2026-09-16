@@ -612,3 +612,55 @@ describe('closing while a walk is still running', () => {
   })
 })
 
+
+
+describe('a session that exists but cannot be resumed', () => {
+  /** A ladder where one id is taken on disk yet `resume` refuses it. */
+  function stuckLadder() {
+    const dead = new Set<string>(['lark-oc_1'])
+    const created: string[] = []
+    const reported: string[] = []
+    const ladder: SessionLadder = {
+      lookup: () => undefined,
+      resume: async () => { throw new Error('busy: owned by this process') },
+      create: async (sessionId) => {
+        if (dead.has(sessionId)) {
+          const error = new Error(`session "${sessionId}" already exists`)
+          error.name = 'SessionAlreadyExistsError'
+          throw error
+        }
+        created.push(sessionId)
+        return {
+          agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+          dispose: async () => {},
+        }
+      },
+      report: (line) => { reported.push(line) },
+    }
+    return { ladder, created, reported }
+  }
+
+  it('recovers with a fresh id instead of leaving the conversation dead', async () => {
+    const { ladder, created, reported } = stuckLadder()
+    const sessions = new ConversationSessions('chat', ladder)
+
+    const opened = await sessions.acquireKey('oc_1')
+    expect(opened.owned).toBe(true)
+    expect(opened.handle.agent.session.id).toMatch(/^lark-oc_1-/)
+    expect(created).toEqual([opened.handle.agent.session.id])
+    expect(reported.join('\n')).toContain('recovering with a fresh session')
+    await sessions.close()
+  })
+
+  it('keeps the recovered id for later messages of the same conversation', async () => {
+    const { ladder, created } = stuckLadder()
+    const sessions = new ConversationSessions('chat', ladder)
+
+    const first = await sessions.acquireKey('oc_1')
+    await sessions.release('oc_1')
+    const second = await sessions.acquireKey('oc_1')
+    expect(second.handle.agent.session.id).toBe(first.handle.agent.session.id)
+    expect(created).toEqual([first.handle.agent.session.id, first.handle.agent.session.id])
+    await sessions.close()
+  })
+})
