@@ -152,6 +152,7 @@ dsh web
 - `sessionScope` is `chat`, `chat-thread`, or `chat-sender`.
 - `instance` names an extra bot row; the first stays unnamed, which keeps its settings and sessions exactly where they are.
 - `botPeers` restricts which bots are answered; `botHops` bounds consecutive bot turns (six).
+- `ignoreOtherMentions` pairs with `requireMention: false` (answer without an @): a group message that @-s someone else and not this bot is skipped, while messages @-ing this bot and unaddressed messages still answer — two free-response bots sharing one room each answer their own questions.
 - A card that changes state is bound to the chat it was sent to: forwarded elsewhere, it governs nothing.
 - Where the deployment composes a credentials service, the scanned app secret is stored there; one written into settings by an older version moves on the next boot.
 - Image input is off by default: turn on `attachImages` only for a model you know accepts images.
