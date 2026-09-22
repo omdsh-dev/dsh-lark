@@ -229,6 +229,15 @@ export interface Config {
   /** In group chats, only respond when the bot is @-mentioned. */
   requireMention?: boolean
   /**
+   * Free-response rooms (`requireMention: false`) answer every message —
+   * including one `@`-ed to someone else. Set this to yield in that case: a
+   * group message that carries mentions and none of them is this bot is
+   * skipped, while messages that mention this bot (alone or alongside others)
+   * and unaddressed messages still answer. This is how two free-response bots
+   * share one room without both answering every question meant for the other.
+   */
+  ignoreOtherMentions?: boolean
+  /**
    * Open ids (`ou_…`) allowed to send direct messages, when a deployment wants
    * to narrow them further. Empty serves anyone who can reach the bot at all,
    * which the platform already decides: an app's visibility scope is what says
@@ -285,6 +294,7 @@ export interface ResolvedConfig {
   botPeers: string[]
   botHops: number
   requireMention: boolean
+  ignoreOtherMentions: boolean
   senderAllowlist: string[]
   groupAllowlist: string[]
   approvers: string[]
@@ -320,6 +330,7 @@ export const Config: z<Config> = z.object({
   botPeers: z.array(String).default([]),
   botHops: z.number().default(DEFAULT_BOT_HOPS),
   requireMention: z.boolean().default(true),
+  ignoreOtherMentions: z.boolean().default(false),
   senderAllowlist: z.array(String),
   groupAllowlist: z.array(String),
   approvers: z.array(String),
@@ -352,6 +363,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     botPeers: config.botPeers ?? [],
     botHops: config.botHops ?? DEFAULT_BOT_HOPS,
     requireMention: config.requireMention ?? true,
+    ignoreOtherMentions: config.ignoreOtherMentions ?? false,
     senderAllowlist: config.senderAllowlist ?? [],
     groupAllowlist: config.groupAllowlist ?? [],
     approvers: config.approvers ?? [],

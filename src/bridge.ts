@@ -1571,6 +1571,17 @@ export function installBridge(
       notify(`lark-channel: ignored a message in ${msg.chatId}: ${refusal}`)
       return
     }
+    // A free-response room may still not answer a question aimed at someone
+    // else: the transport gate only knows whether THIS bot was mentioned, and
+    // with requireMention off it passes everything. When a deployment says so,
+    // a message carrying mentions that skip this bot is not its to answer —
+    // otherwise every free-response bot in the room answers every `@`. Traced
+    // at debug like the transport's own no_mention: a steady state of the
+    // room, and flooding the operator console with it would teach nothing.
+    if (config.ignoreOtherMentions && msg.mentions.length > 0 && !msg.mentionedBot) {
+      ctx.logger.debug('skipped %s in %s: addressed to another mention', msg.messageId, msg.chatId)
+      return
+    }
     // A message from a bot is answered only where the deployment named that
     // bot and the exchange still has hops left. `undefined` means the event
     // omitted the sender kind, which is "unknown", not "not a bot" — and

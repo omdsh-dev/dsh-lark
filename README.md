@@ -152,6 +152,7 @@ dsh web
 - `sessionScope` 支持 `chat`、`chat-thread` 和 `chat-sender` 三种会话粒度。
 - `instance` 用于命名额外的机器人实例；第一个机器人保持未命名，以兼容已有设置和会话。
 - `botPeers` 可以限制允许对话的机器人，`botHops` 控制连续机器人轮次，默认是 6。
+- `ignoreOtherMentions` 搭配 `requireMention: false`（免@应答）：群里消息 @ 了别人而不是本机器人时跳过不答，@ 本机器人或没 @ 任何人的消息照常回答——两个免@机器人在同一个群里各答各的问题。
 - 会改变状态的卡片绑定原聊天，转发到其他聊天后不能操作原会话。
 - 部署提供 credentials 服务时，扫码得到的 App Secret 会存入其中；旧版本写在 settings 中的 secret 会在下次启动时自动迁移。
 - 图片附件默认关闭；只有确认当前模型支持视觉时，才应开启 `attachImages`。

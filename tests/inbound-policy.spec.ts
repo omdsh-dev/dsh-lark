@@ -135,6 +135,69 @@ describe('inbound admission', () => {
   })
 })
 
+describe('ignoreOtherMentions', () => {
+  it('skips a free-response group message addressed to someone else', async () => {
+    const harness = await mountChannel({ requireMention: false, ignoreOtherMentions: true })
+    try {
+      await harness.fake.emitMessage(fakeMessage({
+        chatType: 'group',
+        mentions: [{ key: '@_user_1', openId: 'ou_colleague', name: 'Colleague' }],
+        mentionedBot: false,
+      }))
+      await new Promise((done) => { setTimeout(done, 30) })
+      // Not this room's question: no agent, no turn, no words in the chat.
+      expect(harness.agents.created).toHaveLength(0)
+      expect(harness.fake.sent).toHaveLength(0)
+      // And not the operator's problem either — a steady state, debug at most.
+      expect(harness.notices.join('\n')).not.toContain('ignored')
+      expect(logged(harness.logs, 'info', 'addressed to another mention')).toEqual([])
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('still answers when the same message mentions this bot too', async () => {
+    const harness = await mountChannel({ requireMention: false, ignoreOtherMentions: true })
+    try {
+      await harness.fake.emitMessage(fakeMessage({
+        chatType: 'group',
+        mentions: [
+          { key: '@_user_1', openId: 'ou_colleague', name: 'Colleague' },
+          { key: '@_user_2', openId: 'ou_self', name: 'This Bot', isBot: true },
+        ],
+        mentionedBot: true,
+      }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('still answers an unaddressed message', async () => {
+    const harness = await mountChannel({ requireMention: false, ignoreOtherMentions: true })
+    try {
+      await harness.fake.emitMessage(fakeMessage({ chatType: 'group' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('answers messages for others when the flag is off (default)', async () => {
+    const harness = await mountChannel({ requireMention: false })
+    try {
+      await harness.fake.emitMessage(fakeMessage({
+        chatType: 'group',
+        mentions: [{ key: '@_user_1', openId: 'ou_colleague', name: 'Colleague' }],
+        mentionedBot: false,
+      }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    } finally {
+      await harness.dispose()
+    }
+  })
+})
+
 describe('transport observability', () => {
   it('reports a transport failure with its code', async () => {
     const harness = await mountChannel()

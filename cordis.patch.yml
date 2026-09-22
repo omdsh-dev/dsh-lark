@@ -37,6 +37,8 @@
         # syncSlashCommands: true    # publish commands to the bot's `/` panel
         # sessionScope: chat         # chat-thread / chat-sender split it finer
         requireMention: true
+        # ignoreOtherMentions: false  # with requireMention: false, skip messages
+        #                             # that @ someone else but not this bot
         # Authorization narrows; it does not gate. Who can reach the bot at all
         # is the app's visibility scope in the developer console. Unconfigured,
         # this serves any room it is added to (when @-mentioned) and anyone the
