@@ -228,7 +228,7 @@ describe('a switch cancelled after the command started', () => {
     const reason = new Error('the conversation moved on')
     const commands: HostCommands = {
       list: () => [],
-      execute: async (_agent, _line, signal) => {
+      execute: async (_agent, _line, _attachments, signal) => {
         await new Promise((_resolve, reject) => {
           signal?.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
         })

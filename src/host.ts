@@ -321,7 +321,12 @@ export interface HostCommands {
    * or the name does not resolve, which is what distinguishes an unknown
    * command from one that ran and failed.
    */
-  execute(agent: HostAgent, line: string, signal: AbortSignal): Promise<HostCommandExecution | undefined>
+  execute(
+    agent: HostAgent,
+    line: string,
+    submittedAttachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<HostCommandExecution | undefined>
 }
 
 /** The `systemPrompt` assembler, as this plugin's per-agent composition uses it. */
