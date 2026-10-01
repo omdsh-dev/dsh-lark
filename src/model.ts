@@ -62,10 +62,12 @@ export function modelActionValue(value: unknown): ModelActionValue | undefined {
 /** Entry value marking "explicitly the default": deep-merge persistence cannot delete a key. */
 const DEFAULT_MARKER = ''
 
-/** One provider/model pair, both halves known. */
+/** One provider/model pair, both halves known, with an optional thinking level. */
 export interface ModelRoute {
   readonly provider: string
   readonly model: string
+  /** Absent leaves the model's own default in force. */
+  readonly reasoningEffort?: string | undefined
 }
 
 /** One advertised model, as the host llm registry lists it. */
@@ -73,7 +75,12 @@ export interface CatalogEntry {
   readonly provider: string
   readonly id: string
   readonly name: string
+  /** The thinking levels the route accepts: empty when it offers none, absent when unknown. */
+  readonly efforts?: readonly string[] | undefined
 }
+
+/** Separates the thinking level from the route in a persisted entry. */
+const EFFORT_SEPARATOR = '#'
 
 /**
  * Render a route (or a partial deployment selection) for the chat.
@@ -84,27 +91,92 @@ export function formatRoute(options: HostAgentOptions): string {
   const parts = [options.provider, options.model].filter(
     (part): part is string => part !== undefined && part !== '',
   )
-  return parts.length === 0 ? '宿主默认' : parts.join('/')
+  if (parts.length === 0) return '宿主默认'
+  const effort = options.reasoningEffort === undefined || options.reasoningEffort === ''
+    ? ''
+    : ` · effort ${options.reasoningEffort}`
+  return `${parts.join('/')}${effort}`
 }
 
 /**
  * Serialize a route for the persisted entry. The first `/` splits it back
  * apart, so the provider half must not contain one — and host provider route
- * keys do not, while model ids (`org/model` styles) may.
+ * keys do not, while model ids (`org/model` styles) may. A thinking level
+ * rides after a `#`, so an entry written before levels existed still reads
+ * as the same route.
  */
-function serializeRoute(route: ModelRoute): string {
-  return `${route.provider}/${route.model}`
+export function serializeRoute(route: ModelRoute): string {
+  const effort = route.reasoningEffort === undefined ? '' : `${EFFORT_SEPARATOR}${route.reasoningEffort}`
+  return `${route.provider}/${route.model}${effort}`
 }
 
 /**
  * Parse one persisted entry back into a route.
  * @param entry - a non-marker entry value.
- * @returns the route, treating everything after the first `/` as the model id.
+ * @returns the route, treating everything after the first `/` as the model id
+ *   and a trailing `#level` as its thinking level.
  */
 export function parseRoute(entry: string): ModelRoute | undefined {
-  const separator = entry.indexOf('/')
-  if (separator <= 0 || separator === entry.length - 1) return undefined
-  return { provider: entry.slice(0, separator), model: entry.slice(separator + 1) }
+  const hash = entry.lastIndexOf(EFFORT_SEPARATOR)
+  const base = hash > 0 ? entry.slice(0, hash) : entry
+  const effort = hash > 0 ? entry.slice(hash + 1) : ''
+  const separator = base.indexOf('/')
+  if (separator <= 0 || separator === base.length - 1) return undefined
+  return {
+    provider: base.slice(0, separator),
+    model: base.slice(separator + 1),
+    ...effort === '' ? {} : { reasoningEffort: effort },
+  }
+}
+
+/**
+ * The levels one route offers, read from the catalog.
+ * @param catalog - advertised routes.
+ * @param route - the route to look up.
+ * @returns the offered levels; empty when the route is unlisted or offers none.
+ */
+export function effortsFor(catalog: readonly CatalogEntry[], route: HostAgentOptions): readonly string[] {
+  return catalog.find(entry => entry.provider === route.provider && entry.id === route.model)?.efforts ?? []
+}
+
+/**
+ * Carry the deployment's thinking level onto a route that names none, when
+ * the route offers it. Without this, a switch would silently drop thinking:
+ * the route replaces the whole default selection, level included.
+ * @param route - the route being switched to.
+ * @param catalog - advertised routes.
+ * @param inherited - the deployment default's level, if any.
+ * @returns the route, with the inherited level where it applies.
+ */
+export function withInheritedEffort(
+  route: ModelRoute,
+  catalog: readonly CatalogEntry[],
+  inherited: string | undefined,
+): ModelRoute {
+  if (route.reasoningEffort !== undefined || inherited === undefined) return route
+  return effortsFor(catalog, route).includes(inherited) ? { ...route, reasoningEffort: inherited } : route
+}
+
+/**
+ * Refuse a level for a route the catalog lists with no levels at all. An
+ * unlisted route stays advisory, but a listed one that offers nothing will
+ * fail the next request with UNSUPPORTED_REASONING_EFFORT, so say it here and
+ * point at a route carrying the same model id that does offer levels.
+ * @returns the refusal, or undefined when the level may be recorded.
+ */
+function refuseLevelless(catalog: readonly CatalogEntry[], route: HostAgentOptions): string | undefined {
+  const listed = catalog.find(entry => entry.provider === route.provider && entry.id === route.model)
+  if (listed?.efforts === undefined || listed.efforts.length > 0) return undefined
+  const elsewhere = catalog.filter(entry => entry.id === route.model && (entry.efforts ?? []).length > 0)
+  const hint = elsewhere.length === 0
+    ? ''
+    : `\n可调档位的路由：${elsewhere.map(entry => `\`/${MODEL_COMMAND} use ${entry.provider}/${entry.id} <effort>\``).join('、')}`
+  return `⚠️ \`${route.provider}/${route.model}\` 这条路由不支持调 effort。${hint}`
+}
+
+/** Render offered levels for the chat. */
+function renderEfforts(efforts: readonly string[]): string {
+  return efforts.length === 0 ? '（该模型未声明档位）' : efforts.map(id => `\`${id}\``).join(' ')
 }
 
 /** What one `/model use` or `/model reset` attempt concluded. */
@@ -202,6 +274,8 @@ export function modelPickerCard(
   deploymentRoute: string,
 ): object {
   const shown = catalog.slice(0, PICKER_ROWS)
+  // A pick carries the level the conversation already runs at when the picked
+  // route offers it, so pressing a row changes the model and nothing else.
   // Marked per rendering: a picker card stays in the chat, and switching back
   // to a model already picked once is an ordinary thing to want.
   const pick = (route?: string): ModelActionValue => marked({
@@ -219,7 +293,13 @@ export function modelPickerCard(
       label: `${entry.provider}/${entry.id}`,
       detail: entry.name === entry.id ? undefined : entry.name,
       current: current !== undefined && entry.provider === current.provider && entry.id === current.model,
-      value: pick(serializeRoute({ provider: entry.provider, model: entry.id })),
+      value: pick(serializeRoute({
+        provider: entry.provider,
+        model: entry.id,
+        ...current?.reasoningEffort !== undefined && (entry.efforts ?? []).includes(current.reasoningEffort)
+          ? { reasoningEffort: current.reasoningEffort }
+          : {},
+      })),
     })),
     hidden: catalog.length - shown.length,
     // Nothing to reset to when the conversation is already on the default.
@@ -233,6 +313,8 @@ export interface ModelCommandPorts {
   readonly catalog: () => Promise<readonly CatalogEntry[]>
   /** The deployment default's display form. */
   readonly deploymentRoute: () => string
+  /** The deployment default's selection, when one resolves. */
+  readonly deploymentSelection?: (() => HostAgentOptions | undefined) | undefined
   /** Awaited after a change, before the reply; releases the conversation's agent. */
   readonly release: () => Promise<void>
 }
@@ -310,22 +392,68 @@ export async function runModelCommand(
     return { markdown: `🤖 已切回默认模型 \`${ports.deploymentRoute()}\`\n下一条消息起生效，上下文保留。${durability}` }
   }
 
-  if (verb === 'use') {
-    const target = rest.join(' ').trim()
-    if (target === '') return { markdown: `用法：\`/${MODEL_COMMAND} use <provider/model 或模型名>\`` }
-    const resolved = resolveRouteInput(target, await ports.catalog())
-    if ('reason' in resolved) return { markdown: `⚠️ ${resolved.reason}` }
-    const result = await store.set(key, resolved.route)
-    if (!result.changed) return { markdown: `🤖 本会话已在使用 \`${formatRoute(resolved.route)}\`。` }
-    await ports.release()
-    const advisory = resolved.listed ? '' : '\n（目录未列出该路由；宿主目录是建议性的，仍按你给的设置。）'
-    const durability = result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'
-    return {
-      markdown: `🤖 已切换到 \`${formatRoute(resolved.route)}\`\n下一条消息起生效，上下文保留。${advisory}${durability}`,
+  if (verb === 'effort') {
+    const level = rest.join(' ').trim()
+    const catalog = await ports.catalog()
+    const base = currentRoute ?? ports.deploymentSelection?.()
+    if (base?.provider === undefined || base.model === undefined) {
+      return { markdown: `⚠️ 读不到当前模型，请用 \`/${MODEL_COMMAND} use <provider/model> <effort>\`。` }
     }
+    const offered = effortsFor(catalog, base)
+    const levelless = level === '' ? undefined : refuseLevelless(catalog, base)
+    if (levelless !== undefined) return { markdown: levelless }
+    if (level === '') {
+      return {
+        markdown: `🧠 当前 effort：\`${base.reasoningEffort ?? '未设置（模型默认）'}\`\n可选：${renderEfforts(offered)}\n用法：\`/${MODEL_COMMAND} effort <档位>\``,
+      }
+    }
+    if (offered.length > 0 && !offered.includes(level)) {
+      return { markdown: `⚠️ \`${base.model}\` 不支持 effort \`${level}\`。可选：${renderEfforts(offered)}` }
+    }
+    const route: ModelRoute = { provider: base.provider, model: base.model, reasoningEffort: level }
+    return applyRoute(store, key, route, offered.length > 0, ports)
+  }
+
+  if (verb === 'use') {
+    const words = [...rest]
+    // Routes carry no spaces, so a second word can only be a level.
+    const requested = words.length >= 2 ? words.pop() : undefined
+    const target = words.join(' ').trim()
+    if (target === '') return { markdown: `用法：\`/${MODEL_COMMAND} use <provider/model 或模型名> [effort]\`` }
+    const catalog = await ports.catalog()
+    const resolved = resolveRouteInput(target, catalog)
+    if ('reason' in resolved) return { markdown: `⚠️ ${resolved.reason}` }
+    const offered = effortsFor(catalog, resolved.route)
+    const levelless = requested === undefined ? undefined : refuseLevelless(catalog, resolved.route)
+    if (levelless !== undefined) return { markdown: levelless }
+    if (requested !== undefined && offered.length > 0 && !offered.includes(requested)) {
+      return { markdown: `⚠️ \`${resolved.route.model}\` 不支持 effort \`${requested}\`。可选：${renderEfforts(offered)}` }
+    }
+    const route = requested === undefined
+      ? withInheritedEffort(resolved.route, catalog, ports.deploymentSelection?.()?.reasoningEffort)
+      : { ...resolved.route, reasoningEffort: requested }
+    return applyRoute(store, key, route, resolved.listed, ports)
   }
 
   return {
-    markdown: `用法：\`/${MODEL_COMMAND}\`、\`/${MODEL_COMMAND} use <provider/model>\`、\`/${MODEL_COMMAND} reset\``,
+    markdown: `用法：\`/${MODEL_COMMAND}\`、\`/${MODEL_COMMAND} use <provider/model> [effort]\`、\`/${MODEL_COMMAND} effort [档位]\`、\`/${MODEL_COMMAND} reset\``,
+  }
+}
+
+/** Record one route and word the reply; shared by `use` and `effort`. */
+async function applyRoute(
+  store: ChatModels,
+  key: string,
+  route: ModelRoute,
+  listed: boolean,
+  ports: ModelCommandPorts,
+): Promise<ModelReply> {
+  const result = await store.set(key, route)
+  if (!result.changed) return { markdown: `🤖 本会话已在使用 \`${formatRoute(route)}\`。` }
+  await ports.release()
+  const advisory = listed ? '' : '\n（目录未列出该路由；宿主目录是建议性的，仍按你给的设置。）'
+  const durability = result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'
+  return {
+    markdown: `🤖 已切换到 \`${formatRoute(route)}\`\n下一条消息起生效，上下文保留。${advisory}${durability}`,
   }
 }

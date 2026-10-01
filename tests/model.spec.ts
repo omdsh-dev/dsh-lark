@@ -6,6 +6,8 @@ import {
   parseRoute,
   resolveRouteInput,
   runModelCommand,
+  serializeRoute,
+  withInheritedEffort,
 } from '../src/model.ts'
 import type { CatalogEntry } from '../src/model.ts'
 import { readMeters, renderStatusCard, STATUS_ACTION } from '../src/status.ts'
@@ -291,5 +293,87 @@ describe('renderStatusCard', () => {
     expect(shown(fresh).some((text) => text.includes('尚未创建'))).toBe(true)
     // An unknown version hides the row rather than printing an empty claim.
     expect(shown(fresh)).not.toContain('版本')
+  })
+})
+
+describe('thinking levels', () => {
+  const reasoning: CatalogEntry[] = [
+    { provider: 'bedrock', id: 'opus', name: 'Opus', efforts: ['off', 'low', 'medium', 'high'] },
+    { provider: 'bedrock', id: 'plain', name: 'Plain', efforts: [] },
+    { provider: 'responses', id: 'plain', name: 'Plain (reasoning)', efforts: ['low', 'medium'] },
+  ]
+  const portsWith = (selection?: { provider?: string; model?: string; reasoningEffort?: string }) => {
+    const { state, ports } = createPorts(reasoning)
+    return { state, ports: { ...ports, deploymentSelection: () => selection } }
+  }
+
+  it('round-trips a level after `#`, and reads a pre-level entry unchanged', () => {
+    expect(parseRoute('bedrock/opus#high')).toEqual({ provider: 'bedrock', model: 'opus', reasoningEffort: 'high' })
+    expect(parseRoute('pi/org/shared-model')).toEqual({ provider: 'pi', model: 'org/shared-model' })
+    expect(serializeRoute({ provider: 'bedrock', model: 'opus', reasoningEffort: 'high' })).toBe('bedrock/opus#high')
+    expect(formatRoute({ provider: 'bedrock', model: 'opus', reasoningEffort: 'high' })).toBe('bedrock/opus · effort high')
+  })
+
+  it('/model use takes an optional level and validates it against the catalog', async () => {
+    const { store, patches } = createStore()
+    const { ports } = portsWith()
+    expect(markdownOf(await runModelCommand('/model use bedrock/opus high', SUBJECT, store, ports)))
+      .toContain('effort high')
+    expect(patches).toEqual([{ chatModels: { chat: 'bedrock/opus#high' } }])
+    expect(markdownOf(await runModelCommand('/model use bedrock/opus ultra', SUBJECT, store, ports)))
+      .toContain('不支持 effort')
+  })
+
+  it('/model use without a level carries the deployment level when the route offers it', async () => {
+    const { store } = createStore()
+    const { ports } = portsWith({ provider: 'bedrock', model: 'plain', reasoningEffort: 'medium' })
+    await runModelCommand('/model use bedrock/opus', SUBJECT, store, ports)
+    expect(store.routeFor('chat')).toEqual({ provider: 'bedrock', model: 'opus', reasoningEffort: 'medium' })
+    await runModelCommand('/model use bedrock/plain', SUBJECT, store, ports)
+    expect(store.routeFor('chat')).toEqual({ provider: 'bedrock', model: 'plain' })
+  })
+
+  it('/model effort changes only the level, from the override or the default', async () => {
+    const { store } = createStore()
+    const { ports, state } = portsWith({ provider: 'bedrock', model: 'opus' })
+    expect(markdownOf(await runModelCommand('/model effort', SUBJECT, store, ports))).toContain('`medium`')
+    await runModelCommand('/model effort low', SUBJECT, store, ports)
+    expect(store.routeFor('chat')).toEqual({ provider: 'bedrock', model: 'opus', reasoningEffort: 'low' })
+    expect(state.releases).toBe(1)
+    expect(markdownOf(await runModelCommand('/model effort max', SUBJECT, store, ports))).toContain('不支持 effort')
+  })
+
+  it('/model effort without a resolvable model says so instead of guessing', async () => {
+    const { store } = createStore()
+    const { ports } = portsWith(undefined)
+    expect(markdownOf(await runModelCommand('/model effort high', SUBJECT, store, ports))).toContain('读不到当前模型')
+  })
+
+  it('carries the level on inheritance only when offered', () => {
+    const route = { provider: 'bedrock', model: 'opus' }
+    expect(withInheritedEffort(route, reasoning, 'high')).toEqual({ ...route, reasoningEffort: 'high' })
+    expect(withInheritedEffort(route, reasoning, 'max')).toEqual(route)
+    expect(withInheritedEffort({ ...route, reasoningEffort: 'low' }, reasoning, 'high').reasoningEffort).toBe('low')
+  })
+
+  it('refuses a level on a listed route that offers none, pointing at one that does', async () => {
+    const { store, patches } = createStore()
+    const { ports } = portsWith({ provider: 'bedrock', model: 'plain' })
+    const viaEffort = markdownOf(await runModelCommand('/model effort medium', SUBJECT, store, ports))
+    expect(viaEffort).toContain('不支持调 effort')
+    expect(viaEffort).toContain('responses/plain')
+    const viaUse = markdownOf(await runModelCommand('/model use bedrock/plain medium', SUBJECT, store, ports))
+    expect(viaUse).toContain('不支持调 effort')
+    expect(patches).toEqual([])
+    await runModelCommand('/model use responses/plain medium', SUBJECT, store, ports)
+    expect(store.routeFor('chat')).toEqual({ provider: 'responses', model: 'plain', reasoningEffort: 'medium' })
+  })
+
+  it('keeps a level advisory when the catalog does not know the levels', async () => {
+    const unknown: CatalogEntry[] = [{ provider: 'bedrock', id: 'mystery', name: 'Mystery' }]
+    const { store } = createStore()
+    const { ports } = createPorts(unknown)
+    await runModelCommand('/model use bedrock/mystery high', SUBJECT, store, ports)
+    expect(store.routeFor('chat')).toEqual({ provider: 'bedrock', model: 'mystery', reasoningEffort: 'high' })
   })
 })

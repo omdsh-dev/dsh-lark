@@ -40,6 +40,7 @@ import type {
   HostApprovalRequest,
   HostDefaultModel,
   HostLlm,
+  HostLlmModel,
   HostLoader,
   HostPermissionPresets,
   HostSessionQuery,
@@ -81,6 +82,7 @@ import {
   modelPickerCard,
   parseRoute,
   runModelCommand,
+  withInheritedEffort,
 } from './model.ts'
 import type { CatalogEntry, ModelActionValue } from './model.ts'
 import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
@@ -922,7 +924,24 @@ export function installBridge(
           return []
         }
       }))
-      return lists.flat().map(model => ({ provider: model.provider, id: model.id, name: model.name }))
+      // Levels come from resolveModelInfo, not the listing, which never carries
+      // them. Unknown stays undefined so validation stays advisory; a model
+      // resolved with no `reasoning` genuinely offers none.
+      const levelsOf = async (model: HostLlmModel): Promise<{ efforts?: readonly string[] }> => {
+        if (typeof llm.resolveModelInfo !== 'function') return {}
+        try {
+          const info = await llm.resolveModelInfo(model.provider, model.id)
+          return { efforts: (info.reasoning?.efforts ?? []).map(effort => String(effort.id)) }
+        } catch {
+          return {}
+        }
+      }
+      return await Promise.all(lists.flat().map(async model => ({
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        ...await levelsOf(model),
+      })))
     } catch {
       return []
     }
@@ -1691,6 +1710,13 @@ export function installBridge(
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
             deploymentRoute,
+            deploymentSelection: () => {
+              try {
+                return modelSelection()
+              } catch {
+                return undefined
+              }
+            },
             release,
           })
         } else if (channelCommand === SESSIONS_COMMAND) {
@@ -2690,11 +2716,19 @@ export function installBridge(
       return { toast: toast('error', TOAST.modelUnreadable) }
     }
     const release = releaseFor(pick.key)
+    const catalog = await modelCatalog()
+    const inherited = (() => {
+      try {
+        return modelSelection().reasoningEffort
+      } catch {
+        return undefined
+      }
+    })()
     const result = route === undefined
       ? await chatModels.reset(pick.key)
-      : await chatModels.set(pick.key, route)
+      : await chatModels.set(pick.key, withInheritedEffort(route, catalog, inherited))
     if (result.changed) await release()
-    const painted = modelPickerCard(pick, await modelCatalog(), chatModels.routeFor(pick.key), deploymentRoute())
+    const painted = modelPickerCard(pick, catalog, chatModels.routeFor(pick.key), deploymentRoute())
     return {
       toast: toast(
         result.changed ? 'success' : 'info',

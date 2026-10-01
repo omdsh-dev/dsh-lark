@@ -86,7 +86,8 @@ Agent 的执行过程会显示在飞书中；需要你参与时，会发送提�
 | `/cd <名称或路径>` | 切换工作区 |
 | `/get <路径>` | 把工作区里的文件发到聊天 |
 | `/model` | 打开模型选择卡片 |
-| `/model use <provider/model>` | 直接切换模型 |
+| `/model use <provider/model> [effort]` | 直接切换模型，可同时指定思考强度；不写时沿用部署默认档位（若该模型支持） |
+| `/model effort [档位]` | 只调本会话的思考强度；不带参数时显示当前档位与可选档位 |
 | `/model reset` | 恢复默认模型 |
 | `/permission` | 打开权限预设卡片 |
 | `/permission <预设名>` | 直接切换权限预设 |

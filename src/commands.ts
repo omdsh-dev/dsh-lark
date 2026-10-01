@@ -68,7 +68,7 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent): 
     `\`/${CD_COMMAND} <路径>\` — 切换本会话的工作区目录`,
     `\`/${WS_COMMAND}\` — 查看可用工作区`,
     `\`/${GET_COMMAND} <路径>\` — 把工作区里的文件发到聊天`,
-    `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
+    `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型（\`/${MODEL_COMMAND} effort <档位>\` 调思考强度）`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
     `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
     `\`/${SESSIONS_COMMAND}\` — 列出可接续的会话，点一行就切过去`,

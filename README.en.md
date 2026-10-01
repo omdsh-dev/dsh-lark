@@ -86,7 +86,8 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | `/cd <name or path>` | Switch this conversation's workspace |
 | `/get <path>` | Send a workspace file to the chat |
 | `/model` | Open the model picker |
-| `/model use <provider/model>` | Switch without opening a card |
+| `/model use <provider/model> [effort]` | Switch without opening a card, optionally with a thinking level; without one, the deployment default's level carries over when the model offers it |
+| `/model effort [level]` | Change only this conversation's thinking level; bare, it shows the current and offered levels |
 | `/model reset` | Back to the deployment default |
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
