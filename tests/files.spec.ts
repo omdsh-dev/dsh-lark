@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, realpathSync } from 'node:fs'
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
@@ -10,6 +10,7 @@ import type { InboundFilePort, InboundOptions } from '../src/files.ts'
 import { collectImages } from '../src/images.ts'
 import type { ImagePort } from '../src/images.ts'
 import { createFakeAttachments, createFakePort, fakeMessage } from './harness.ts'
+import { linkDirectory } from './platform.ts'
 
 /** Workspaces these tests wrote into, removed after each one. */
 const workspaces: string[] = []
@@ -91,8 +92,12 @@ describe('sanitizeFileName', () => {
   it('keeps only the last component of a path, however it escapes', () => {
     expect(sanitizeFileName('../../etc/passwd')).toBe('passwd')
     expect(sanitizeFileName('/etc/shadow')).toBe('shadow')
-    // POSIX `basename` does not split on a backslash, so the separator pass must.
-    expect(sanitizeFileName('C:\\Users\\me\\app.log')).toBe('C:_Users_me_app.log')
+    // `basename` follows the platform: on Windows a backslash IS a separator and
+    // the name is already the last component, while POSIX does not split on it —
+    // so the separator pass is what makes the result safe there. Both answers
+    // keep the file inside its landing directory, which is the point.
+    expect(sanitizeFileName('C:\\Users\\me\\app.log'))
+      .toBe(process.platform === 'win32' ? 'app.log' : 'C:_Users_me_app.log')
   })
 
   it('strips control characters out of the name', () => {
@@ -321,7 +326,10 @@ describe('collectInboundFiles', () => {
     // workspace, which every preset allows: the inbox becomes a link, and the
     // next file the sender names lands wherever it points.
     await mkdir(join(workspace, '.dsh-lark'), { recursive: true })
-    symlinkSync(elsewhere, join(workspace, '.dsh-lark', 'inbox'))
+    // A directory link, which is unprivileged on both platforms — a Windows
+    // junction needs no elevated token, and resolves through `realpath` exactly
+    // as a symlink does, which is what the check under test reads.
+    linkDirectory(elsewhere, join(workspace, '.dsh-lark', 'inbox'))
     const { port, calls } = stageResources({ fk_payload: 'payload' })
     const { options, reports } = stageOptions(workspace)
     const result = await collectInboundFiles(
@@ -348,7 +356,7 @@ describe('collectInboundFiles', () => {
     // A link that stays INSIDE the workspace, so containment clears it and the
     // two spellings of one landing directory become distinguishable.
     await mkdir(join(workspace, 'channel'))
-    symlinkSync(join(workspace, 'channel'), join(workspace, '.dsh-lark'))
+    linkDirectory(join(workspace, 'channel'), join(workspace, '.dsh-lark'))
     const { port, calls } = stageResources({ fk_doc: 'log lines' })
     const { options } = stageOptions(workspace)
     const result = await collectInboundFiles(fileMessage([resource('file', 'fk_doc', 'app.log')]), port, options)

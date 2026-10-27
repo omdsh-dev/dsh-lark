@@ -26,10 +26,10 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
-import { delimiter, dirname, join, resolve, sep } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ownVersion } from './version.ts'
 import { instanceIdentity, refuseInstanceName } from './instance.ts'
@@ -72,11 +72,27 @@ allowBuilds:
 /** The value pnpm parks under `allowBuilds` for a script nobody has judged yet. */
 const PNPM_BUILD_PLACEHOLDER = 'set this to true or false'
 
-/** A top-level key line, which is also where any `allowBuilds` block ends. */
+/**
+ * A top-level key line, which is also where any `allowBuilds` block ends.
+ *
+ * Anchored at column zero on purpose: this is what tells the block parser that a
+ * nested entry's indented `protobufjs:` does not end the block. The reader that
+ * has to tolerate indentation is {@link hasCredentialSection}, and it does so on
+ * its own.
+ */
 const TOP_LEVEL_KEY = /^([A-Za-z_][\w-]*)\s*:(.*)$/
 
 /** One package's decision inside an `allowBuilds` block. */
 const ALLOW_BUILDS_ENTRY = /^(\s+protobufjs\s*:\s*)(.*)$/
+
+/**
+ * What a profile name may contain.
+ *
+ * Stricter than the host's own rule, because this CLI turns the name into a path
+ * component, a unit-file value and a command-line token — see
+ * {@link refuseProfileName}.
+ */
+const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
 /** What the operator asked for, after argument parsing. */
 export type Command =
@@ -123,7 +139,10 @@ export interface ServiceSpec {
  * @returns the command prefix to print.
  */
 export function invocation(scriptPath: string = process.argv[1] ?? ''): string {
-  return scriptPath.includes(`${sep}_npx${sep}`) ? 'npx dsh-lark-channel@latest' : 'dsh-lark-channel'
+  // Either separator, rather than this platform's `sep`: the answer only has to
+  // be right about where the script came from, and a path handed in by a test,
+  // a wrapper or a symlink chain is not obliged to be spelled with `sep`.
+  return /[/\\]_npx[/\\]/.test(scriptPath) ? 'npx dsh-lark-channel@latest' : 'dsh-lark-channel'
 }
 
 /** Usage text, spelled for the way this process was started. */
@@ -264,10 +283,15 @@ export function parseArguments(argv: readonly string[]): Command {
  * absolute path a supervisor can use.
  * @param name - executable name, without a platform extension.
  * @param path - PATH to search; defaults to this process's.
+ * @param platform - platform whose extension rules apply; defaults to this process's.
  * @returns the absolute path, or undefined when no entry holds that executable.
  */
-export function whichSync(name: string, path = process.env.PATH ?? ''): string | undefined {
-  const extensions = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : ['']
+export function whichSync(
+  name: string,
+  path = process.env.PATH ?? '',
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const extensions = platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : ['']
   for (const directory of path.split(delimiter)) {
     if (directory === '') continue
     for (const extension of extensions) {
@@ -321,7 +345,11 @@ export function unitPath(platform: NodeJS.Platform = process.platform): string {
  * @returns true when the section is present.
  */
 export function hasCredentialSection(document: string, namespace: string = ROW_ID): boolean {
-  return new RegExp(`^${namespace}\\s*:`, 'm').test(document)
+  // Indentation and a quoted key are both ordinary YAML spellings of the same
+  // top-level section, and a document carrying either is onboarded: reading only
+  // the column-zero unquoted form sent an already-onboarded bot back to the QR
+  // flow for ten minutes.
+  return new RegExp(`^\\s*['"]?${namespace}['"]?\\s*:`, 'm').test(document)
 }
 
 /**
@@ -338,21 +366,131 @@ export function envCredentials(environment: NodeJS.ProcessEnv = process.env): En
 }
 
 /**
+ * Read one file, or undefined when it is absent or unreadable.
+ * @param path - the file to read.
+ * @returns its contents, or undefined.
+ */
+function readIfPresent(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The entry id one row's config is persisted under.
+ *
+ * The unnamed row keeps the historical id; a named one is the id `add` writes
+ * into the profile's patch layer, which is also the id the config editor edits
+ * when a setting changes.
+ * @param instance - the row's instance name, absent for the unnamed row.
+ * @returns the entry id.
+ */
+function rowIdOf(instance?: string): string {
+  return instance === undefined || instance === '' ? ROW_ID : `${ROW_ID}-${instance}`
+}
+
+/**
+ * Whether one patch operation records credentials for its row.
+ *
+ * Two spellings count, because the channel writes whichever one the deployment
+ * can hold: `appSecretRef` (the secret lives behind a reference) and a non-empty
+ * `appSecret` (no credentials provider is composed, so the secret stays in the
+ * row's own config).
+ * @param block - one patch operation's text.
+ * @param ref - the reference this row's scan would have written.
+ * @returns true when the operation carries a credential for the row.
+ */
+function rowCredentialIn(block: string, ref: string): boolean {
+  if (new RegExp(`appSecretRef\\s*:\\s*['"]?${ref}['"]?\\s*$`, 'm').test(block)) return true
+  return /appSecret\s*:\s*['"]?[^\s'"]+/.test(block)
+}
+
+/**
+ * Whether one profile patch layer records credentials for a row.
+ *
+ * The layer is a YAML sequence of operations, and the row's config is nested
+ * inside whichever operation names its id — sometimes the `insert` that created
+ * the row, sometimes an override appended later by a settings write. So the
+ * layer is split at its list items and only the operation naming this EXACT id
+ * decides: matching the id loosely would read a sibling row's secret as this
+ * row's, and a second bot reported as already onboarded never gets its scan.
+ * @param document - the patch layer's contents.
+ * @param rowId - the entry id this row's config lives under.
+ * @param ref - the reference this row's scan would have written.
+ * @returns true when this row's own operation carries a credential.
+ */
+function rowCredentialInPatch(document: string, rowId: string, ref: string): boolean {
+  // Either spelling of the id: a mapping key in an override operation, or a list
+  // item inside the `insert` that created the row.
+  const idLine = new RegExp(`^\\s*(?:-\\s+)?id:\\s*['"]?${rowId}['"]?\\s*$`, 'm')
+  const blocks: string[] = []
+  let block: string[] = []
+  for (const line of document.split('\n')) {
+    if (/^\s*-\s/.test(line)) {
+      if (block.length > 0) blocks.push(block.join('\n'))
+      block = [line]
+      continue
+    }
+    block.push(line)
+  }
+  if (block.length > 0) blocks.push(block.join('\n'))
+  return blocks.some(candidate => idLine.test(candidate) && rowCredentialIn(candidate, ref))
+}
+
+/**
  * Whether a scan is still needed: credentials exist in the environment (the
- * unit forwards them) or a previous scan persisted them through the host
- * settings service.
+ * unit forwards them) or a previous scan stored them somewhere the next boot
+ * reads.
+ *
+ * Three homes, in the order host versions introduced them, and all three are
+ * asked because a bot that onboarded under any of them is live: the legacy
+ * settings document (and the `.imported` copy a modern host leaves after moving
+ * those sections into the profile), the file-backed credentials provider where
+ * a scan's secret lands behind the row's own reference, and the profile's patch
+ * layer where a modern host persists the row's config when no credentials
+ * provider is composed. Reading only the first is what sent an
+ * already-onboarded named bot back to the QR flow for the whole watch — and
+ * reading the second for a profile that disables the store is the mirror
+ * mistake, answered below.
+ * @param instance - the row's instance name, absent for the unnamed row.
+ * @param profile - the profile whose patch layer to read.
  * @returns true when the bot already has credentials to connect with.
  */
-export function isOnboarded(instance?: string): boolean {
+export function isOnboarded(instance?: string, profile: string = DEFAULT_PROFILE): boolean {
   // The environment pair belongs to the unnamed row; a named one has its own
   // credential and its own settings section, so it is never onboarded by it.
   if (instance === undefined && envCredentials() !== undefined) return true
-  try {
-    const document = readFileSync(join(dshHome(), 'settings.yaml'), 'utf8')
-    return hasCredentialSection(document, instanceIdentity(instance).settingsNamespace)
-  } catch {
-    return false
-  }
+  const identity = instanceIdentity(instance)
+  const home = dshHome()
+  const settings = join(home, 'settings.yaml')
+  if ([settings, `${settings}.imported`].some(
+    path => hasCredentialSection(readIfPresent(path) ?? '', identity.settingsNamespace),
+  )) return true
+  // The reference is the one identifier no sibling row shares, which is what
+  // makes this answer about THIS row rather than about the deployment — and a
+  // profile that disables the store reads none of it, so a secret there says
+  // nothing about whether this profile can authenticate.
+  if (profileReadsCredentialStore(profile)
+    && hasCredentialSection(readIfPresent(join(home, '.credentials.yaml')) ?? '', identity.secretRef)) return true
+  return rowCredentialInPatch(readIfPresent(patchPath(profile)) ?? '', rowIdOf(instance), identity.secretRef)
+}
+
+/**
+ * Whether one profile's composed rows read the harness credential store.
+ *
+ * The shipped `headless` profile deliberately disables the store, so a secret
+ * sitting under `refs` in `$DSH_HOME/.credentials.yaml` authenticates nothing
+ * there: answering "onboarded" from that file starts the bot against a
+ * credential its own process never reads, and the operator gets a service that
+ * comes up and never connects. Headless takes its credentials from the launch
+ * environment, which the environment pair check above already covers.
+ * @param profile - the profile the supervised process will run.
+ * @returns whether a stored reference can authenticate that profile.
+ */
+export function profileReadsCredentialStore(profile: string): boolean {
+  return profile.trim().toLowerCase() !== 'headless'
 }
 
 /**
@@ -383,18 +521,42 @@ function serviceEnvironment(spec: ServiceSpec): ReadonlyArray<readonly [string, 
   return variables
 }
 
-/** Escape a value for a plist text node, where a bare `&` or `<` breaks the XML. */
+/**
+ * Escape a value for a plist text node, where a bare `&` or `<` breaks the XML. */
 function xmlEscape(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
 /**
+ * One unit value's literal text: specifiers escaped, one line only.
+ *
+ * `%` is systemd's specifier sigil (`%i`, `%n`, `%h`…), so a path or a secret
+ * carrying one has to be doubled or systemd substitutes something else for it.
+ * A line break cannot be expressed at all — a unit file is line-oriented, and a
+ * value carrying one would end its own line and start a directive — so it is
+ * refused rather than silently split into two.
+ * @param value - the text to place in a unit line.
+ * @param what - what the value is, for the refusal message.
+ * @returns the text with literal `%` doubled.
+ * @throws when the value carries a line break.
+ */
+function systemdLiteral(value: string, what: string): string {
+  if (/[\r\n]/.test(value)) {
+    throw new Error(`the ${what} carries a line break, which a systemd unit file cannot express`)
+  }
+  return value.replaceAll('%', '%%')
+}
+
+/**
  * Quote a value for a systemd unit. `Environment=` takes a space-separated list
  * of assignments — a PATH with a space in it (Visual Studio Code's directory,
- * routinely) shears apart without this — and `ExecStart` tokenizes the same way.
+ * routinely) shears apart without this — and `ExecStart`, `WorkingDirectory` and
+ * the output paths tokenize the same way.
+ * @param value - the value to quote.
+ * @returns the quoted value, specifiers escaped.
  */
 function systemdQuote(value: string): string {
-  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
+  return `"${systemdLiteral(value, 'value').replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
 /**
@@ -444,14 +606,14 @@ export function systemdUnit(spec: ServiceSpec): string {
     .map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}\n`)
     .join('')
   return `[Unit]
-Description=dsh-lark-channel (profile ${spec.profile})
+Description=${systemdLiteral(`dsh-lark-channel (profile ${spec.profile})`, 'description')}
 After=network-online.target
 
 [Service]
 ExecStart=${systemdQuote(spec.dsh)} --profile ${systemdQuote(spec.profile)}
-WorkingDirectory=${spec.workspace}
-${environment}StandardOutput=append:${logPath()}
-StandardError=append:${logPath()}
+WorkingDirectory=${systemdQuote(spec.workspace)}
+${environment}StandardOutput=append:${systemdQuote(logPath())}
+StandardError=append:${systemdQuote(logPath())}
 Restart=always
 RestartSec=5
 
@@ -460,28 +622,120 @@ WantedBy=default.target
 `
 }
 
-/** Run one command with the operator watching, and fail the CLI when it fails. */
-function must(argv: readonly string[], cwd?: string): void {
+/**
+ * The Windows extensions that are a shell script rather than an executable.
+ *
+ * Node refuses to spawn these without a shell (they need an interpreter named on
+ * a command line), which is the one case that still needs `cmd.exe`.
+ */
+const WINDOWS_SHIM = /\.(?:cmd|bat)$/i
+
+/** What one argument may never carry, because `cmd.exe` reads it as syntax. */
+const CMD_UNSAFE = /[\r\n"%!^&|<>]/
+
+/**
+ * Quote one token for a `cmd.exe` command line, refusing what quoting cannot make safe.
+ *
+ * `%` expands an environment variable and `!` does so under delayed expansion,
+ * `"` ends the quoting, and the rest are separators or redirections: a value
+ * carrying one cannot be handed to a command line at all, so it is refused
+ * loudly rather than escaped into something that means a different path.
+ * @param value - one argument.
+ * @returns the token, quoted when it carries whitespace.
+ * @throws when the token carries a character `cmd.exe` would read as syntax.
+ */
+function quoteWindowsArgument(value: string): string {
+  if (CMD_UNSAFE.test(value)) {
+    throw new Error(`refusing to pass ${JSON.stringify(value)} to cmd.exe: it carries a character a command line cannot quote`)
+  }
+  return /\s/.test(value) ? `"${value}"` : value
+}
+
+/**
+ * One `cmd.exe` command line from an argv array.
+ * @param command - the executable.
+ * @param args - its arguments.
+ * @returns the line to hand `/d /s /c`.
+ */
+export function windowsCommandLine(command: string, args: readonly string[]): string {
+  return [command, ...args].map(quoteWindowsArgument).join(' ')
+}
+
+/**
+ * The file one argv's command names, resolved when it is a bare name.
+ *
+ * What decides whether the platform can execute a command directly is the file
+ * it names, not the word it was spelled with: a bare `npm` on Windows is a
+ * `.cmd` shim that `CreateProcess` refuses, while the same word on POSIX is
+ * whatever PATH holds. So a bare name is resolved through PATH first, and a
+ * command already spelled as a path — absolute or relative — is kept exactly as
+ * typed: resolving that again would let a PATH entry override what the caller
+ * named.
+ *
+ * A name PATH does not hold is returned unresolved, so the spawn reports
+ * `ENOENT` for the word the caller actually typed rather than for a path this
+ * invented.
+ * @param command - the command as the caller spelled it.
+ * @param platform - platform to answer for; defaults to this process's.
+ * @param path - PATH to search; defaults to this process's.
+ * @returns the resolved path, or the command unchanged.
+ */
+export function resolveOperatorCommand(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  path = process.env.PATH ?? '',
+): string {
+  if (platform !== 'win32') return command
+  if (command.includes('/') || command.includes('\\')) return command
+  return whichSync(command, path, platform) ?? command
+}
+
+/**
+ * Spawn one command without a shell, naming the platform's own interpreter.
+ *
+ * `shell: true` would hand `command + ' ' + args.join(' ')` to a shell, which
+ * re-reads every argument as syntax: a workspace path with a space splits in
+ * two, and a `&` in a name starts a second command. The argv array is therefore
+ * kept intact, and only the Windows shim — a `.cmd` the platform will not
+ * execute on its own — goes through `cmd.exe`, quoted by
+ * {@link windowsCommandLine} so the same rules apply to it. Which commands are
+ * shims is decided on the file each name resolves to, not on the name itself
+ * ({@link resolveOperatorCommand}), because a bare `npm` is a shim and
+ * `npm.cmd` written as a path is the same shim.
+ * @param argv - the command and its arguments.
+ * @param options - spawn options, without `shell`.
+ * @returns the spawn result.
+ */
+function spawnOperator(
+  argv: readonly string[],
+  options: { cwd?: string | undefined; stdio: 'inherit' | 'ignore' },
+): ReturnType<typeof spawnSync> {
   const [command, ...args] = argv
   if (command === undefined) throw new Error('empty command')
-  const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
+  const resolved = resolveOperatorCommand(command)
+  if (process.platform !== 'win32' || !WINDOWS_SHIM.test(resolved)) {
+    return spawnSync(resolved, args, options)
+  }
+  return spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', windowsCommandLine(resolved, args)], options)
+}
+
+/** Run one command with the operator watching, and fail the CLI when it fails. */
+function must(argv: readonly string[], cwd?: string): void {
+  const result = spawnOperator(argv, { cwd, stdio: 'inherit' })
   if (result.error !== undefined) throw result.error
-  if (result.status !== 0) throw new Error(`${command} exited ${result.status ?? 'by signal'}`)
+  if (result.status !== 0) throw new Error(`${argv[0] ?? 'command'} exited ${result.status ?? 'by signal'}`)
 }
 
 /** Run one command with the operator watching and report its exit code instead of throwing. */
 function passthrough(argv: readonly string[], cwd?: string): number {
-  const [command, ...args] = argv
-  if (command === undefined) throw new Error('empty command')
-  const result = spawnSync(command, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' })
+  const result = spawnOperator(argv, { cwd, stdio: 'inherit' })
   if (result.error !== undefined) throw result.error
   return result.status ?? 1
 }
 
 /** Run one command and swallow both its output and its failure. */
 function quiet(argv: readonly string[]): void {
-  const [command, ...args] = argv
-  if (command !== undefined) spawnSync(command, args, { stdio: 'ignore' })
+  if (argv[0] !== undefined) spawnOperator(argv, { stdio: 'ignore' })
 }
 
 /** The launchd domain target for the invoking user. */
@@ -514,20 +768,21 @@ function requireDsh(): string {
 }
 
 /**
- * Refuse a profile name that would place the workspace file outside the home.
+ * Refuse a profile name this CLI cannot spell into everything it writes.
  *
- * This function writes before any `dsh` process runs, so it is the first thing
- * to touch disk for a named profile — ahead of the host's own check. The rule
- * is the host's rule (`resolveProfileDir`), not a stricter one, so a name DSH
- * accepts is never rejected here.
+ * A profile name becomes a path component, a `WorkingDirectory` line, an
+ * `ExecStart` argument and a `cmd.exe` token, so the character set is stricter
+ * than the host's own rule on purpose: a space shears a unit line in two, a
+ * quote or a `%` cannot be expressed in one, and `&`/`|` are command syntax on
+ * the one platform that still needs a command line. Refusing here is the only
+ * place that can refuse before anything is written.
  * @param name - the requested profile name.
  * @returns the refusal to report, or undefined when the name is usable.
  */
 function refuseProfileName(name: string): string | undefined {
-  const reserved = name === '' || name === '.' || name === '..' || name === 'node_modules'
-  return reserved || name.includes('/') || name.includes('\\')
-    ? `invalid profile name ${JSON.stringify(name)}`
-    : undefined
+  return PROFILE_NAME.test(name) && name !== 'node_modules'
+    ? undefined
+    : `invalid profile name ${JSON.stringify(name)}: use letters, digits, dot, dash or underscore, starting with a letter or digit`
 }
 
 /** The key a top-level line declares, or undefined when the line declares none. */
@@ -701,7 +956,13 @@ async function bootoutAndWait(): Promise<void> {
 /** Write a unit readable by its owner alone, since it may carry forwarded credentials. */
 function writeUnit(path: string, contents: string): void {
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, contents)
+  // Created with the mode, not narrowed afterwards: the file may carry the app
+  // secret, and `writeFileSync`'s default leaves it world-readable until the
+  // `chmod` below — a window every local user can read, and a permanent one if
+  // this process dies in between.
+  writeFileSync(path, contents, { mode: 0o600 })
+  // Kept for a file that already existed with wider permissions: `mode` applies
+  // only when the file is created.
   chmodSync(path, 0o600)
 }
 
@@ -826,16 +1087,23 @@ async function relayNewOutput(offset: number, filter?: ConsoleFilter): Promise<n
  * dug out of a log file.
  * @param from - byte offset to start relaying at, so earlier runs stay hidden.
  * @param deadline - epoch milliseconds after which to stop waiting.
+ * @param instance - the row's instance name, absent for the unnamed row.
+ * @param profile - the profile whose patch layer the row's config lands in.
  * @returns true when a scan landed, false when the deadline passed first.
  */
-async function relayUntilOnboarded(from: number, deadline: number, instance?: string): Promise<boolean> {
+async function relayUntilOnboarded(
+  from: number,
+  deadline: number,
+  instance?: string,
+  profile: string = DEFAULT_PROFILE,
+): Promise<boolean> {
   let offset = from
   // Only this channel's own lines: the QR code was being buried by the
   // transport library's connection chatter.
   const filter = newConsoleFilter()
   while (Date.now() < deadline) {
     offset = await relayNewOutput(offset, filter)
-    if (isOnboarded(instance)) {
+    if (isOnboarded(instance, profile)) {
       // Give the host a beat to print its connected line, then drain it too.
       await delay(750)
       await relayNewOutput(offset, filter)
@@ -848,6 +1116,11 @@ async function relayUntilOnboarded(from: number, deadline: number, instance?: st
 
 /** The profile's own patch layer, where a deployment's extra rows live. */
 export function patchPath(profile: string): string {
+  // Checked here rather than at each caller: this is the one function that turns
+  // a profile name into a path, and `remove` reaches it without passing the
+  // provisioning check that guards `start`.
+  const refusal = refuseProfileName(profile)
+  if (refusal !== undefined) throw new Error(refusal)
   return join(dshHome(), 'profiles', profile, 'cordis.patch.yml')
 }
 
@@ -933,12 +1206,12 @@ async function addBot(requested: string | undefined, name: string): Promise<void
 
   const from = logSize()
   await restart()
-  if (isOnboarded(name)) {
+  if (isOnboarded(name, profile)) {
     process.stderr.write(`dsh-lark-channel: bot ${name} is live — DM it or @-mention it in a group\n`)
     return
   }
   process.stderr.write(`dsh-lark-channel: scan the QR code below in Feishu to create bot ${name}; Ctrl-C leaves it running\n\n`)
-  const scanned = await relayUntilOnboarded(from, Date.now() + ONBOARDING_WATCH_MS, name)
+  const scanned = await relayUntilOnboarded(from, Date.now() + ONBOARDING_WATCH_MS, name, profile)
   process.stderr.write(scanned
     ? `\ndsh-lark-channel: bot ${name} is live — it has its own settings, credential, and sessions\n`
     : `\ndsh-lark-channel: still waiting for a scan; the bot keeps issuing codes, follow ${logPath()}\n`)
@@ -951,6 +1224,11 @@ async function addBot(requested: string | undefined, name: string): Promise<void
  * @param name - the instance name.
  */
 async function removeBot(requested: string | undefined, name: string): Promise<void> {
+  // Checked before the path is built, exactly as `addBot` does: this function
+  // reads and rewrites the patch layer, and an instance name is what decides
+  // which row inside it is touched.
+  const refusal = refuseInstanceName(name)
+  if (refusal !== undefined) throw new Error(refusal)
   const profile = requested ?? installedService().profile ?? DEFAULT_PROFILE
   const path = patchPath(profile)
   if (!existsSync(path)) throw new Error(`no profile at ${dirname(path)}`)
@@ -1039,13 +1317,26 @@ export function readInstalledService(
       ...workspace === undefined ? {} : { workspace: xmlUnescape(workspace) },
     }
   }
-  // The writer quotes each argument, so the quotes come back off here.
-  const profile = /^ExecStart=.*?--profile\s+["']?([^"'\s]+)["']?/m.exec(document)?.[1]
+  // The writer quotes each argument, so the quotes come back off here. The name
+  // is read by the same character set the writer refused names outside of, which
+  // is what makes this regex the inverse of that writer rather than a guess: a
+  // quoted name cannot contain a quote, and a `dsh` path holding the literal
+  // `--profile ` cannot be mistaken for one.
+  const profile = /^ExecStart=.*?--profile\s+"?([A-Za-z0-9][A-Za-z0-9._-]*)"?/m.exec(document)?.[1]
   const workspace = /^WorkingDirectory=(.*)$/m.exec(document)?.[1]
   return {
     ...profile === undefined ? {} : { profile },
-    ...workspace === undefined ? {} : { workspace: workspace.trim() },
+    ...workspace === undefined ? {} : { workspace: systemdUnquote(workspace) },
   }
+}
+
+/** Undo the quoting and specifier escaping {@link systemdQuote} applies. */
+function systemdUnquote(value: string): string {
+  const trimmed = value.trim()
+  const unquoted = trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2
+    ? trimmed.slice(1, -1).replaceAll('\\"', '"').replaceAll('\\\\', '\\')
+    : trimmed
+  return unquoted.replaceAll('%%', '%')
 }
 
 /** Undo the escaping {@link launchdPlist} applies to a value. */
@@ -1172,7 +1463,7 @@ async function start(profile: string, workspace: string): Promise<void> {
     return
   }
 
-  const onboarded = isOnboarded()
+  const onboarded = isOnboarded(undefined, profile)
   if (logSize() > LOG_TRUNCATE_BYTES) writeFileSync(logPath(), '')
   const from = logSize()
   await superviseService(kind, { dsh, profile, workspace, dshHome: process.env.DSH_HOME, credentials: envCredentials() })
@@ -1188,7 +1479,7 @@ async function start(profile: string, workspace: string): Promise<void> {
   }
 
   process.stderr.write('dsh-lark-channel: scan the QR code below in Feishu; Ctrl-C leaves the bot running\n\n')
-  const scanned = await relayUntilOnboarded(from, Date.now() + ONBOARDING_WATCH_MS)
+  const scanned = await relayUntilOnboarded(from, Date.now() + ONBOARDING_WATCH_MS, undefined, profile)
   process.stderr.write(scanned
     ? '\ndsh-lark-channel: bound — the bot is live; manage it with stop, restart, and status\n'
     : `\ndsh-lark-channel: still waiting for a scan; the bot keeps issuing codes, follow ${logPath()}\n`)
@@ -1237,14 +1528,47 @@ async function restart(): Promise<void> {
  * bot's console at — optionally following new output until interrupted.
  * @param follow - keep relaying as the file grows.
  */
+/**
+ * How far back `logs` looks without following.
+ *
+ * The log is truncated when `start` runs, but a bot left up for months outgrows
+ * that, and reading a multi-gigabyte file to print two hundred lines is how a
+ * diagnostics command turns into an out-of-memory event.
+ */
+const LOG_TAIL_BYTES = 256 * 1024
+
+/**
+ * The last bytes of a file, and whether the window cut a line in half.
+ * @param path - the file to read.
+ * @param maxBytes - how far back to look.
+ * @returns the tail as text, and whether anything before it was left out.
+ */
+function readTail(path: string, maxBytes: number): { text: string; truncated: boolean } {
+  const size = statSync(path).size
+  const from = Math.max(0, size - maxBytes)
+  const handle = openSync(path, 'r')
+  try {
+    const buffer = Buffer.alloc(size - from)
+    const bytesRead = readSync(handle, buffer, 0, buffer.length, from)
+    return { text: buffer.subarray(0, bytesRead).toString('utf8'), truncated: from > 0 }
+  } finally {
+    closeSync(handle)
+  }
+}
+
 async function logs(follow: boolean): Promise<void> {
   if (!existsSync(logPath())) {
     process.stderr.write(`dsh-lark-channel: no log yet at ${logPath()} — has \`${invocation()} start\` run?\n`)
     process.exitCode = 1
     return
   }
-  const lines = readFileSync(logPath(), 'utf8').split('\n')
-  process.stdout.write(lines.slice(Math.max(0, lines.length - 201)).join('\n'))
+  // The tail, not the whole file: the last 201 lines are what a reader came for.
+  const { text, truncated } = readTail(logPath(), LOG_TAIL_BYTES)
+  const lines = text.split('\n')
+  // A window that starts mid-line drops that partial line: it is half a record
+  // whose beginning lies outside the window.
+  const complete = truncated ? lines.slice(1) : lines
+  process.stdout.write(complete.slice(Math.max(0, complete.length - 201)).join('\n'))
   if (!follow) return
   let offset = logSize()
   for (;;) {

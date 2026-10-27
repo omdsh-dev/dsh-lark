@@ -150,8 +150,26 @@ export async function collectImages(
       blocks.push({ type: 'image', attachment: ref })
     } catch (error) {
       // The model must know an image existed even when it cannot be shown one.
-      notes.push(`（一张图片附加失败：${error instanceof Error ? error.message : String(error)}）`)
+      notes.push(`（一张图片附加失败：${withoutHostPaths(error)}）`)
     }
   }
   return { blocks, notes }
+}
+
+/**
+ * A failure detail with the operator's own paths taken out of it.
+ *
+ * This note rides into the model's context and, in a group, onto the room's
+ * screen, while the failures that reach it quote the path they were handed —
+ * which is the deployment's directory layout and nobody else's business. Only
+ * quoted paths and drive-letter paths go: a bare slash is ordinary text in a
+ * media type (`image/png`), and mangling that would hide the real reason.
+ * @param error - the rejection value.
+ * @returns one line naming what went wrong, without a host path.
+ */
+function withoutHostPaths(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error)
+  return detail
+    .replace(/['"][^'"]*[\\/][^'"]*['"]/g, '…')
+    .replace(/[A-Za-z]:\\[^\s'"]*/g, '…')
 }

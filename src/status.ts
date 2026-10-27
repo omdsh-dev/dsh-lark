@@ -120,6 +120,16 @@ export interface StatusFields {
   readonly switched?: boolean | undefined
   /** Whether a turn is running right now. */
   readonly running: boolean
+  /**
+   * Whether the host has archived the session this conversation resolves to.
+   *
+   * Orthogonal to {@link bound} and {@link running}: archiving does not take a
+   * live agent away, and the host's archive gate rejects every step such a
+   * session proposes — so a bound, idle, archived session is exactly the state
+   * this row exists to name. Absent where the deployment composes no archive
+   * set, which is also where the gate does not exist.
+   */
+  readonly archived?: boolean | undefined
   /** Open approval cards waiting in this chat. */
   readonly pendingApprovals: number
   /** The running plugin's version; empty hides the row rather than lying. */
@@ -164,6 +174,7 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     routeIsDefault: fields.routeIsDefault,
     sessionId: fields.sessionId,
     activity: fields.running ? 'running' : fields.bound ? 'idle' : fields.switched === true ? 'switched' : 'unbound',
+    ...fields.archived === true ? { archived: true } : {},
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
     ...fields.preset === undefined ? {} : { preset: fields.preset },

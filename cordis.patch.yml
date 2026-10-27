@@ -33,8 +33,17 @@
         #                            # at most three of them undecided at a time
         # maxSendFileBytes: 20971520
         # hideProcessWhenDone: false # let the platform drop a finished process
-        # denyTools: [ask_user_question, exit_plan_mode]  # unanswerable here; send_file can be listed too
+        # denyTools: []              # tools denied per agent; empty by default — questions and
+        #                            # plan reviews are answered here; send_file can be listed too.
+        #                            # Add 'working_directory' to pin a chat's sandbox to the
+        #                            # directory it was bound to: the tool moves the session's
+        #                            # execution directory, while /cd, the session picker and
+        #                            # send_file all keep reading the bound one.
         # syncSlashCommands: true    # publish commands to the bot's `/` panel
+        # diagnoseSessions: false    # report why /sessions admitted or withheld each candidate
+        # diagnosticsFile: ./logs    # file, or a directory holding dsh-lark-diagnostics.log;
+        #                            # absent keeps reports on the process terminal
+        # diagnosticsLevel: warn     # debug / info / warn / error
         # sessionScope: chat         # chat-thread / chat-sender split it finer
         requireMention: true
         # Authorization narrows; it does not gate. Who can reach the bot at all
@@ -44,11 +53,19 @@
         # senderAllowlist: []   # empty serves anyone who can DM the app
         # groupAllowlist: []    # empty serves any group
         # approvers: []         # empty lets whoever drives a chat approve;
-        #                       # settled cards best-effort name the decider, else show open_id
+        #                       # also gates the plan review (approving one
+        #                       # starts executing the plan); settled cards
+        #                       # best-effort name the decider, else show open_id
 
-    # The invariant companion stays out of the default patch: the shipped
-    # dsh-base/web profiles compose no `invariants` service (it comes from the
-    # host's runtime-diagnostics composition), and a row waiting on the absent
-    # service fails the whole tree at boot. Diagnostic compositions add:
-    #   - id: lark-channel-invariant
-    #     name: 'dsh-lark-channel/invariant'
+    # No extra row is needed for this package's browser half. The `lark-channel`
+    # row above already names the package, and the client module system serves
+    # `<package>/client.js` for every row whose package declares `dsh.client` —
+    # that declaration is the whole registration. A second row spelled
+    # 'dsh-lark-channel/client' would be skipped by the scan (a subpath is not a
+    # package root) while the HOST Loader would still import it, evaluating a
+    # browser bundle that calls `window.__ModuleLoader__.load` in Node and
+    # failing the tree.
+
+    # No invariant row exists any more. DSH removed the `invariants` service and
+    # every `<package>/invariant` subpath, so this package ships no companion and
+    # a diagnostic composition has nothing to add here.

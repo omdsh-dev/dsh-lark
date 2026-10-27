@@ -5,6 +5,7 @@
 
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_BOT_HOPS } from './botchat.ts'
+import type { DiagLevel } from './diag.ts'
 import type { SessionScope } from './session.ts'
 
 /**
@@ -35,7 +36,17 @@ export interface Config {
    * stored moves.
    */
   instance?: string
-  /** Lark/Feishu app id (`cli_…`); absent (with no stored credential) starts first-boot QR registration. */
+  /**
+   * Lark/Feishu app id (`cli_…`); absent (with no stored credential) starts
+   * first-boot QR registration.
+   *
+   * Only a non-empty string names an app. A deployment that derives this from an
+   * environment variable may supply neither: a `!!js` expression whose variable
+   * is unset reaches the plugin as a non-string, and that is treated exactly as
+   * "no app configured" — the registration flow refuses any other value, so
+   * passing one through would answer a missing credential with a failed
+   * registration instead of the code that creates one.
+   */
   appId?: string
   /**
    * Lark/Feishu app secret paired with {@link appId}. A deployment that
@@ -76,15 +87,18 @@ export interface Config {
    */
   chatModels?: Record<string, string>
   /**
-   * Managed state, not configuration: how many times each conversation has
-   * started over with `/new`, keyed by the session id it derives at epoch
-   * zero. Absent is the first session, whose id is unchanged.
+   * Managed state, not configuration, and read-only since `/new` began minting
+   * ids: the epoch each conversation used to run on, keyed by the session id it
+   * derives at epoch zero. Nothing writes it any more; it is still read so a
+   * conversation that was moved by the old counter keeps its `--e<N>` session.
    */
   chatEpochs?: Record<string, string>
   /**
-   * Managed state, not configuration: the session each conversation was
-   * explicitly bound to via /session <id>, keyed by conversation key. An
-   * empty-string value marks automatic derivation (the override was reset).
+   * Managed state, not configuration: the session each conversation currently
+   * runs, keyed by its anchor id — the id it derives at the directory it is in,
+   * before any suffix. Written by `/session <id>` (a session that already
+   * exists) and by `/new` (an id minted for the occasion). An empty-string
+   * value marks "run the derived session" (the pointer was cleared).
    */
   chatSessions?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -205,12 +219,21 @@ export interface Config {
    * Tools chat agents may not call, denied per agent at execution with a
    * reason that redirects the model to the chat.
    *
-   * The default names the two human-interaction tools whose answers cannot
-   * reach this channel: `ctx.userQuestions` admits ONE provider per context,
-   * so when any other UI registered it (the Web app's BFF claims every
-   * agent-owned question) a chat agent's question would wait on a surface its
-   * human is not watching. Asking in the chat is the native equivalent — a
-   * reply is an ordinary message this bridge already turns into the next turn.
+   * Empty by default, because nothing needs denying any more: the two
+   * human-interaction tools this once named — `ask_user_question` and
+   * `exit_plan_mode` — are answered here without shadowing them. A question
+   * races this chat's card against whatever answerer follows (`user-questions`
+   * admits ONE provider per context, so a shadow would take the Web app's panel
+   * away), and a plan review is still answered by this channel's shadowed plan
+   * tool. A deployment that names either one denies it through the guard below,
+   * and the model is told to ask in prose instead.
+   *
+   * `working_directory` is the one a chat is most likely to want here. A
+   * conversation's sandbox is the directory it was bound to, and this channel
+   * resolves what the model sends against that binding, so an agent that moves
+   * its own execution directory can write where a `send_file` will then refuse
+   * to read. Denying the tool keeps the two in step; leaving it available lets
+   * a chat follow the host's own grouping instead.
    */
   denyTools?: string[]
   /**
@@ -251,8 +274,51 @@ export interface Config {
    * the channel may best-effort resolve it from the chat roster and safely
    * falls back to the open id. Set this when an escalation should need a named
    * human — it grants more power than the sandbox allows.
+   *
+   * The plan review counts as an escalation: approving one leaves plan mode and
+   * starts executing the plan, so a press on its card faces this same list.
+   * Ordinary questions do not — they inform a decision the chat may already
+   * make, and answering one has never granted anything.
    */
   approvers?: string[]
+  /**
+   * Report how the session picker (`/sessions`) admits or withholds every
+   * candidate, at warning level so it survives a logger configured above info.
+   *
+   * The picker's rules are silent by construction: a session any one of them
+   * excludes is simply absent from the card, and nothing in the chat tells "the
+   * corpus held nothing" apart from "every candidate tripped a rule". That
+   * makes a short list unattributable, which is the failure this reports: each
+   * withheld session is named with the rule that withheld it, then the counts
+   * at every stage of the derivation.
+   *
+   * Off by default. It is a diagnostic, not an operating mode: it reads the
+   * whole corpus anyway, but the line count scales with the number of withheld
+   * records, so a deployment with hundreds of sessions gets hundreds of lines.
+   */
+  diagnoseSessions?: boolean
+  /**
+   * File this channel's diagnostics are appended to. Absent disables the file
+   * sink, leaving reports on the process's terminal as before.
+   *
+   * This exists because the terminal is the ONLY sink the shipped profiles
+   * provide: no logger exporter is composed, cordis's own default exporter
+   * keeps a bounded in-memory ring, and the one exporter the harness vendors
+   * writes to stdout. A question asked after the bot's window was closed — the
+   * usual case, since the card is read on a phone — then has no record at all.
+   * Naming a file gives the channel a durable sink of its own, independent of
+   * how the host's logging happens to be configured.
+   *
+   * A path ending in an extension is the file; anything else is a directory the
+   * default filename (`dsh-lark-diagnostics.log`) is placed in.
+   */
+  diagnosticsFile?: string
+  /**
+   * Floor for what {@link Config.diagnosticsFile} keeps. `warn` leaves the file
+   * carrying only reports that say something went wrong, which is what a
+   * long-running deployment wants; `debug` traces one interaction in full.
+   */
+  diagnosticsLevel?: DiagLevel
 }
 
 /** Configuration after defaults have been resolved; credentials may still be pending onboarding. */
@@ -288,9 +354,52 @@ export interface ResolvedConfig {
   senderAllowlist: string[]
   groupAllowlist: string[]
   approvers: string[]
+  diagnoseSessions: boolean
+  diagnosticsFile?: string | undefined
+  diagnosticsLevel: DiagLevel
 }
 
+/**
+ * The fields the host's settings service may WRITE.
+ *
+ * The host's write path reads `schema.meta.volatile` — its `volatileForm` and
+ * `isVolatilePath` are what refuse a patch to anything else — and the flag is
+ * what makes this channel's managed state durable instead of memory-only. The
+ * host reads the metadata, not the method that wrote it, so it is set below
+ * rather than through schemastery's `.volatile()` builder.
+ *
+ * The flag must stay METADATA-ONLY, which is why `package.json` pins
+ * `@deepseek-ai/schemastery` to the exact 3.18.1 instead of a range. From the
+ * published 3.18.3 on, the same `meta.volatile` also makes the field PARSE into
+ * a stable reference — the `Volatile` cell DSH's own packages read through
+ * `.get()` — so `config.appId` would stop being a string and every plain read of
+ * the seven fields below would break, starting with the credential check that
+ * decides whether to connect or to onboard. Adopting the reference form is a
+ * deliberate migration across every read of these fields, not a dependency bump.
+ *
+ * Nothing outside this list is volatile on purpose: `cwd`, `workspaceRoots`,
+ * `model` and the switches are read while the agent is being built, so editing
+ * one live is a decision that needs the row to remount — which is exactly what
+ * the host means by leaving a field non-volatile. `chatEpochs` stays on the list
+ * although nothing writes it any more: it is still read as state, and keeping it
+ * writable is what lets an operator repair a stored conversation by hand.
+ */
+const VOLATILE_FIELDS = [
+  'appId',
+  'appSecret',
+  'appSecretRef',
+  'chatWorkspaces',
+  'chatModels',
+  'chatEpochs',
+  'chatSessions',
+] as const
+
 /** Loader-visible configuration schema and defaults. */
+// The annotation is kept for callers, with one cast behind it: schemastery's
+// inferred output types an optional field as required, and
+// `exactOptionalPropertyTypes` refuses the annotation for exactly that
+// difference — a fact about the type rather than about the values, since
+// `resolveConfig` is what supplies every absent one.
 export const Config: z<Config> = z.object({
   instance: z.string(),
   appId: z.string(),
@@ -323,7 +432,18 @@ export const Config: z<Config> = z.object({
   senderAllowlist: z.array(String),
   groupAllowlist: z.array(String),
   approvers: z.array(String),
-})
+  diagnoseSessions: z.boolean().default(false),
+  diagnosticsFile: z.string(),
+  diagnosticsLevel: z.union(['debug', 'info', 'warn', 'error'] as const).default('warn'),
+}) as unknown as z<Config>
+
+// Marked after construction rather than inside the literal: the fluent chain is
+// what gives this object its precise schema type, and a helper call in the middle
+// of it widens the inferred output just enough to stop satisfying `Config`.
+{
+  const dict = (Config as unknown as { dict: Record<string, { meta: object }> }).dict
+  for (const key of VOLATILE_FIELDS) Object.assign(dict[key]!.meta, { volatile: true })
+}
 
 /**
  * Resolve the same defaults for direct callers that bypass Cordis Loader.
@@ -355,5 +475,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     senderAllowlist: config.senderAllowlist ?? [],
     groupAllowlist: config.groupAllowlist ?? [],
     approvers: config.approvers ?? [],
+    diagnoseSessions: config.diagnoseSessions ?? false,
+    diagnosticsLevel: config.diagnosticsLevel ?? 'warn',
   }
 }

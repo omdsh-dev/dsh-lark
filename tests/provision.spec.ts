@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_PROFILE,
@@ -11,6 +11,7 @@ import {
   ensureProfileBuildPolicy,
   hasCredentialSection,
   isOnboarded,
+  profileReadsCredentialStore,
   launchdPlist,
   ownVersion,
   parseArguments,
@@ -26,6 +27,9 @@ import {
   readInstalledService,
   usage,
   newConsoleFilter,
+  patchPath,
+  resolveOperatorCommand,
+  windowsCommandLine,
   withInstanceRow,
   withoutInstanceRow,
 } from '../src/provision.ts'
@@ -61,8 +65,10 @@ describe('parseArguments', () => {
   })
 
   it('reads the profile and workspace of an explicit start', () => {
+    // `resolve`, because a workspace is made absolute as it is parsed: the
+    // assertion is about what was read, not about this machine's drive layout.
     expect(parseArguments(['start', '--profile', 'bot', '--workspace', '/srv/work']))
-      .toMatchObject({ kind: 'start', profile: 'bot', workspace: '/srv/work' })
+      .toMatchObject({ kind: 'start', profile: 'bot', workspace: resolve('/srv/work') })
   })
 
   it('resolves a relative workspace against the invoking directory', () => {
@@ -337,6 +343,99 @@ describe('onboarding detection', () => {
     writeFileSync(join(home, 'settings.yaml'), `${ROW_ID}:\n  appId: cli_x\n`)
     expect(isOnboarded()).toBe(true)
   })
+
+  it('reads the copy a modern host leaves after importing the legacy document', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    // The host renames the document instead of deleting it, so a bot that
+    // onboarded before the profile-backed forms existed is still onboarded.
+    writeFileSync(join(home, 'settings.yaml.imported'), `${ROW_ID}:\n  appId: cli_x\n`)
+    expect(isOnboarded()).toBe(true)
+  })
+
+  it('reads the credential a scan stored behind this row\'s reference', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    expect(isOnboarded()).toBe(false)
+    // The provider's own document, and a sibling row's reference is not this
+    // row's: reporting a bot as onboarded when it is not skips its scan.
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET_OTHER: s\n')
+    expect(isOnboarded()).toBe(false)
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET: s\n')
+    expect(isOnboarded()).toBe(true)
+  })
+
+  it('ignores a stored credential for a profile that disables the store', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    writeFileSync(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  LARK_APP_SECRET: s\n')
+    // The shipped headless profile composes no credential store, so a secret
+    // sitting there authenticates nothing: reporting it onboarded starts a
+    // service that comes up and never connects.
+    expect(isOnboarded(undefined, 'web')).toBe(true)
+    expect(isOnboarded(undefined, 'headless')).toBe(false)
+    // Only the shipped name is special, and only in its own spelling.
+    expect(profileReadsCredentialStore('headless')).toBe(false)
+    expect(profileReadsCredentialStore('HEADLESS')).toBe(false)
+    expect(profileReadsCredentialStore('headless-2')).toBe(true)
+  })
+
+  it('reads a named row out of the profile patch, and only its own operation', () => {
+    const home = mkdtempSync(join(tmpdir(), 'home-'))
+    delete process.env.LARK_APP_ID
+    delete process.env.LARK_APP_SECRET
+    process.env.DSH_HOME = home
+    const patch = patchPath(DEFAULT_PROFILE)
+    mkdirSync(dirname(patch), { recursive: true })
+    // A sibling bot's row carries a secret; this one's does not.
+    writeFileSync(patch, '- insert:\n    - id: lark-channel-other\n      name: \'dsh-lark-channel\'\n'
+      + '      config:\n        instance: other\n        appSecretRef: LARK_APP_SECRET_OTHER\n')
+    expect(isOnboarded('mine')).toBe(false)
+    expect(isOnboarded('other')).toBe(true)
+    // The row's own operation, in the shape a settings write leaves behind.
+    writeFileSync(patch, '- insert:\n    - id: lark-channel-mine\n      name: \'dsh-lark-channel\'\n'
+      + '      config:\n        instance: mine\n')
+    expect(isOnboarded('mine')).toBe(false)
+    writeFileSync(patch, '- id: lark-channel-mine\n  config:\n    appSecretRef: LARK_APP_SECRET_MINE\n')
+    expect(isOnboarded('mine')).toBe(true)
+  })
+})
+
+describe('the Windows command line', () => {
+  it('quotes only what needs it, and refuses what quoting cannot make safe', () => {
+    expect(windowsCommandLine('npm.cmd', ['install', '-g', 'pkg'])).toBe('npm.cmd install -g pkg')
+    expect(windowsCommandLine('C:\\Program Files\\nodejs\\npm.cmd', ['--version']))
+      .toBe('"C:\\Program Files\\nodejs\\npm.cmd" --version')
+    // Every one of these is cmd.exe syntax rather than text, so a command line
+    // carrying it is refused instead of being escaped into a different path.
+    for (const unsafe of ['a&b', 'a|b', 'a>b', 'a<b', 'a^b', 'a%b', 'a!b', 'a"b', 'a\nb', 'a\rb']) {
+      expect(() => windowsCommandLine('npm.cmd', [unsafe])).toThrow()
+    }
+  })
+
+  it('resolves a bare name to the file PATH holds, so a shim is recognized as one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'path-'))
+    const shim = join(dir, 'npm.cmd')
+    writeFileSync(shim, '@echo off\n')
+    // Readable on every host the suite runs on: POSIX wants the execute bit.
+    chmodSync(shim, 0o755)
+    // A bare `npm` IS that shim on Windows, which is why the name alone cannot
+    // decide how to spawn it.
+    expect(resolveOperatorCommand('npm', 'win32', dir)).toBe(shim)
+    // Spelled as a path, it is kept as typed: resolving it again would let PATH
+    // override what the caller named.
+    expect(resolveOperatorCommand('.\\npm.cmd', 'win32', dir)).toBe('.\\npm.cmd')
+    // Nowhere in PATH: the caller's own word survives, so the failure names it.
+    expect(resolveOperatorCommand('nope', 'win32', dir)).toBe('nope')
+    // POSIX executes the word itself and needs no resolution.
+    expect(resolveOperatorCommand('npm', 'linux', dir)).toBe('npm')
+  })
 })
 
 describe('servicePath', () => {
@@ -352,12 +451,14 @@ describe('servicePath', () => {
   })
 
   it('carries the operator\'s PATH through, so the agent still finds its tools', () => {
-    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', '/opt/homebrew/bin:/usr/bin').split(delimiter)
+    // Joined with this platform's own delimiter, because that is what the
+    // function is handed on the machine it runs on.
+    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', ['/opt/homebrew/bin', '/usr/bin'].join(delimiter)).split(delimiter)
     expect(entries).toContain('/opt/homebrew/bin')
   })
 
   it('dedupes and drops empty entries, and always ends up with the system ones', () => {
-    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', '/opt/bin::/usr/bin').split(delimiter)
+    const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', ['/opt/bin', '', '/usr/bin'].join(delimiter)).split(delimiter)
     expect(entries.filter((entry) => entry === '/opt/bin')).toHaveLength(1)
     expect(entries).not.toContain('')
     expect(entries).toContain('/usr/bin')
@@ -375,7 +476,23 @@ describe('unit files', () => {
 
     const unit = systemdUnit(spec)
     expect(unit).toContain(`ExecStart="${spec.dsh}" --profile "${spec.profile}"`)
-    expect(unit).toContain(`WorkingDirectory=${spec.workspace}`)
+    // Quoted like every other value in the file: a workspace path with a space
+    // in it shears apart at the first whitespace otherwise, and the service then
+    // starts in a directory that does not exist.
+    expect(unit).toContain(`WorkingDirectory="${spec.workspace}"`)
+  })
+
+  it('escapes what a unit file reads as syntax, and refuses what it cannot carry', () => {
+    // `%` is systemd's specifier sigil, so a path or a secret carrying one has
+    // to be doubled or systemd substitutes something else for it.
+    const percent = systemdUnit({ ...spec, workspace: '/srv/100%work' })
+    expect(percent).toContain('WorkingDirectory="/srv/100%%work"')
+
+    // A line break cannot be expressed in a line-oriented file at all: it would
+    // end its own line and start a directive, so it is refused rather than
+    // silently split into two.
+    expect(() => systemdUnit({ ...spec, workspace: '/srv/work\nUser=root' })).toThrow(/line break/)
+    expect(() => systemdUnit({ ...spec, profile: 'lark\nUser=root' })).toThrow(/line break/)
   })
 
   it('asks the supervisor to keep the bot up', () => {

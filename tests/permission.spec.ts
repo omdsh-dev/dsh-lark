@@ -15,20 +15,22 @@ import type { HostAgent, HostCommands } from '../src/host.ts'
 /** An agent stub; the command runtime is what actually gets driven. */
 const agent = { id: 's1', session: { id: 's1' }, followup: () => {}, cancel: () => {} } as unknown as HostAgent
 
-/** A command runtime answering with fixed text, recording the lines it ran. */
+/** A command runtime answering with fixed text, recording how it was called. */
 function fakeCommands(replies: Record<string, string>) {
   const ran: string[] = []
+  const calls: { attachments: readonly unknown[]; signal: AbortSignal }[] = []
   const commands: HostCommands = {
     list: () => [],
-    execute: async (_agent, line) => {
+    execute: async (_agent, line, submittedAttachments, signal) => {
       ran.push(line)
+      calls.push({ attachments: submittedAttachments, signal })
       const text = replies[line.trim()]
       return text === undefined
         ? { result: { kind: 'error' as const, text: `unknown ${line}` } }
         : { result: { kind: 'success' as const, text } }
     },
   }
-  return { commands, ran }
+  return { commands, ran, calls }
 }
 
 /** A projection registry answering with one fixed cut, as the host's does. */
@@ -45,23 +47,31 @@ function fakeProjections(values: Record<string, unknown>) {
   }
 }
 
+/** The deployment's table, as the host service publishes it. */
+const table = (entries: Record<string, { sandbox: string; approval: string }>) => ({
+  names: Object.keys(entries),
+  resolve: (name: string) => {
+    const spec = entries[name]
+    if (spec === undefined) throw new Error(`unknown preset ${name}`)
+    return spec
+  },
+})
+
 describe('reading which preset is in force', () => {
-  it('reads the published projection, not a command and not the raw log', () => {
-    // Three ways to answer this question, and only one of them is a read that
-    // stays a read: `/permission` appends to the session log, folding the log
-    // costs the whole log per card, and the projection is the host's own
-    // cached, schema-carrying answer.
-    const { projections, reads } = fakeProjections({
-      permissions: {
-        currentValue: 'danger-full-access',
-        options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
-      },
-    })
-    expect(readPresets(projections, agent)).toEqual({
+  it('reads the preset in force from the projection and the rows from the table', () => {
+    // Two sources, because the host publishes two facts: the `permissions`
+    // projection carries the preset IN FORCE and no options at all, while the
+    // presets a deployment offers live on its own table. Reading the rows off
+    // the projection is what left the picker with no button to draw.
+    const { projections, reads } = fakeProjections({ permissions: { currentValue: 'danger-full-access' } })
+    expect(readPresets(projections, agent, table({
+      'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+      'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+    }))).toEqual({
       current: 'danger-full-access',
       available: [
-        { value: 'workspace-write', name: 'workspace-write' },
-        { value: 'danger-full-access', name: 'danger-full-access' },
+        { value: 'workspace-write', name: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
+        { value: 'danger-full-access', name: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never' },
       ],
     })
     expect(reads).toEqual(['s1'])
@@ -75,25 +85,28 @@ describe('reading which preset is in force', () => {
     expect(readPresets(broken, agent)).toEqual({ available: [] })
   })
 
-  it('keeps what the host published about each preset, and skips what it cannot read', () => {
+  it('keeps what the deployment says about each preset, and offers an unreadable one by name', () => {
     // The host names and explains its own presets, including ones a deployment
-    // added: reducing them to a value leaves a card able to explain exactly
-    // the names this plugin happens to hardcode.
-    const { projections } = fakeProjections({
-      permissions: {
-        currentValue: 'a',
-        options: [
-          { value: 'a', name: 'Confined', description: 'Writes inside the workspace.' },
-          { name: 'b' },
-          { other: 'c' },
-        ],
+    // added: reducing them to a value leaves a card able to explain exactly the
+    // names this plugin happens to hardcode. A name the table lists but will not
+    // resolve is still offered — the deployment says it has that preset.
+    const { projections } = fakeProjections({ permissions: { currentValue: 'a' } })
+    const presets = {
+      names: ['a', 'b', 'c'],
+      resolve: (name: string) => {
+        if (name === 'a') {
+          return { sandbox: 'read-only', approval: 'ask', name: 'Confined', description: 'Writes inside the workspace.' }
+        }
+        if (name === 'b') return { sandbox: 'workspace-write', approval: 'ask' }
+        throw new Error(`unknown preset ${name}`)
       },
-    })
-    expect(readPresets(projections, agent)).toEqual({
+    }
+    expect(readPresets(projections, agent, presets)).toEqual({
       current: 'a',
       available: [
-        { value: 'a', name: 'Confined', description: 'Writes inside the workspace.' },
-        { value: 'b', name: 'b' },
+        { value: 'a', name: 'Confined', description: 'Writes inside the workspace.', sandbox: 'read-only', approval: 'ask' },
+        { value: 'b', name: 'b', sandbox: 'workspace-write', approval: 'ask' },
+        { value: 'c', name: 'c' },
       ],
     })
   })
@@ -101,10 +114,16 @@ describe('reading which preset is in force', () => {
 
 describe('switching the preset', () => {
   it('runs the host command with the chosen name', async () => {
-    const { commands, ran } = fakeCommands({ '/permission danger-full-access': 'preset danger-full-access' })
-    expect(await switchPreset(agent, commands, UNCONFINED_PRESET, AbortSignal.timeout(1000)))
+    const { commands, ran, calls } = fakeCommands({ '/permission danger-full-access': 'preset danger-full-access' })
+    const signal = AbortSignal.timeout(1000)
+    expect(await switchPreset(agent, commands, UNCONFINED_PRESET, signal))
       .toEqual({ ok: true, detail: 'preset danger-full-access' })
     expect(ran).toEqual(['/permission danger-full-access'])
+    // The host's `execute` takes the submission's attachments before the signal:
+    // the signal has to arrive in the signal's own position, or the host reads
+    // `signal.aborted` off an array and every switch fails before it runs.
+    expect(calls[0]!.attachments).toEqual([])
+    expect(calls[0]!.signal).toBe(signal)
   })
 
   it('reports a refusal instead of claiming success', async () => {
@@ -117,16 +136,6 @@ describe('switching the preset', () => {
 })
 
 describe('what a consent card is allowed to claim', () => {
-  /** The deployment's table, as the host service publishes it. */
-  const table = (entries: Record<string, { sandbox: string; approval: string }>) => ({
-    names: Object.keys(entries),
-    resolve: (name: string) => {
-      const spec = entries[name]
-      if (spec === undefined) throw new Error(`unknown preset ${name}`)
-      return spec
-    },
-  })
-
   it('describes a preset by what it does, not by what it is called', () => {
     // A deployment writes its own table. Describing `workspace-write` from the
     // name, when the table made it unconfined, asks a room to authorize one
@@ -228,9 +237,9 @@ describe('a switch cancelled after the command started', () => {
     const reason = new Error('the conversation moved on')
     const commands: HostCommands = {
       list: () => [],
-      execute: async (_agent, _line, signal) => {
+      execute: async (_agent, _line, _submittedAttachments, signal) => {
         await new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
+          signal.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
         })
         return { result: { kind: 'success' as const, text: 'unreachable' } }
       },

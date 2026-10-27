@@ -362,41 +362,35 @@ export function sendFileTool(ports: SendFilePorts): object {
 /** Send one workspace file to the chat. Channel-owned: it needs no agent. */
 export const GET_COMMAND = 'get'
 
+/** What one `/get` line resolved to: bytes to send, or the reply that refuses it. */
+export type GetTarget =
+  | { readonly ok: true; readonly file: OutboundFile; readonly bytes: Buffer }
+  | { readonly ok: false; readonly reply: string }
+
 /**
- * Run one `/get` line: parse the path, clear it, hand it to the caller's send.
+ * Parse one `/get` line, clear the path, and read the bytes.
  *
- * The same {@link resolveOutboundFile} the tool goes through, on purpose. A
- * human typing the command is not a reason to trust a path more — `/get` skips
- * the group approval card because the intent is explicit, not because the
- * boundary moved.
+ * The same {@link resolveOutboundFile} the model's `send_file` goes through, on
+ * purpose: a human typing the path is not a reason to trust it more. Split from
+ * the sending so a caller can gate the send — a group asks its room first, and
+ * what the room is asked about has to be the bytes that were read here.
  * @param line - the complete line, slash included.
  * @param workspace - the conversation's workspace.
  * @param maxBytes - the single-file ceiling.
- * @param send - delivers the cleared file's bytes to the chat.
- * @returns the chat reply, or undefined when the file was sent and speaks for itself.
+ * @returns the cleared file and its bytes, or the chat reply that refuses it.
  */
-export async function runGetCommand(
-  line: string,
-  workspace: string,
-  maxBytes: number,
-  send: (file: OutboundFile, bytes: Buffer) => Promise<void>,
-): Promise<string | undefined> {
+export async function readGetTarget(line: string, workspace: string, maxBytes: number): Promise<GetTarget> {
   const argument = line.trimStart().slice(1 + GET_COMMAND.length).trim()
-  if (argument === '') return `用法：\`/${GET_COMMAND} <路径>\`，把工作区里的一个文件发到这个聊天（相对路径按工作区解析）。`
+  if (argument === '') {
+    return { ok: false, reply: `用法：\`/${GET_COMMAND} <路径>\`，把工作区里的一个文件发到这个聊天（相对路径按工作区解析）。` }
+  }
   const verdict = resolveOutboundFile(argument, workspace, maxBytes)
-  if (!verdict.ok) return `⚠️ ${describeRefusalForChat(verdict.refusal)}`
-  let bytes: Buffer
+  if (!verdict.ok) return { ok: false, reply: `⚠️ ${describeRefusalForChat(verdict.refusal)}` }
   try {
-    bytes = await readOutboundFile(verdict.file)
-  } catch (error) {
     // The path the human typed one line ago, not the canonical one it resolved
     // to: `/get` answers in the chat, and in a group that is a room.
-    return `⚠️ 读取 \`${verdict.file.pathInWorkspace}\` 失败：${describeReadFailure(error, verdict.file)}`
-  }
-  try {
-    await send(verdict.file, bytes)
+    return { ok: true, file: verdict.file, bytes: await readOutboundFile(verdict.file) }
   } catch (error) {
-    return `⚠️ 发送 \`${verdict.file.fileName}\` 失败：${failureDetail(error)}`
+    return { ok: false, reply: `⚠️ 读取 \`${verdict.file.pathInWorkspace}\` 失败：${describeReadFailure(error, verdict.file)}` }
   }
-  return undefined
 }

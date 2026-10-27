@@ -24,7 +24,7 @@
  * @module dsh-lark-channel/plan
  */
 
-import type { HostAgent, HostSessionEvent } from './host.ts'
+import type { HostAgent } from './host.ts'
 
 /** The host tool this module shadows. */
 export const PLAN_TOOL = 'exit_plan_mode'
@@ -46,7 +46,7 @@ const DESCRIPTION = 'Use only in plan mode. Present your plan for the user\'s re
   + 'The user may approve (carry out the plan from your next step) or keep planning — their feedback '
   + 'comes back in the tool result; revise and present again.'
 
-/** The plan service, narrowed to the one call this module makes. */
+/** The plan service, narrowed to the calls this module makes. */
 export interface HostPlanMode {
   /**
    * Switch one agent's plan mode. Public by the service's own contract — the
@@ -56,6 +56,16 @@ export interface HostPlanMode {
    * @returns how the switch landed; mid-turn it queues to the next step.
    */
   set(agent: HostAgent, active: boolean): 'committed' | 'queued' | 'cancelled' | 'noop'
+  /**
+   * Whether plan mode is on for one agent — the service's own answer, which is
+   * authoritative where the session log only records the switches that got it
+   * there. Optional because the contract reaches this plugin as an object
+   * rather than as a dependency range: a host that publishes only the switch
+   * cannot say, and a review then proceeds instead of being refused.
+   * @param agent - the agent whose state is read.
+   * @returns the current state, and whether a switch is queued behind the turn.
+   */
+  get?(agent: HostAgent): { readonly active: boolean; readonly pending?: boolean }
 }
 
 /** What the shadow needs from the bridge to ask, and to switch. */
@@ -79,18 +89,6 @@ export interface PlanReviewPorts {
   ): Promise<{ readonly selected: readonly string[]; readonly custom?: string | undefined }>
   /** The plan service, when this deployment composed one. */
   planMode(): HostPlanMode | undefined
-}
-
-/** Whether plan mode is active, folded from the session log; the last one wins. */
-export function planModeActive(events: readonly HostSessionEvent[]): boolean {
-  let active = false
-  for (const event of events) {
-    if (event.type === 'plan/mode') {
-      const data = (event as { data?: { active?: unknown } }).data
-      if (typeof data?.active === 'boolean') active = data.active
-    }
-  }
-  return active
 }
 
 /**
@@ -165,17 +163,18 @@ export function shadowPlanTool(ports: PlanReviewPorts): object {
       const context = exec as { agent?: HostAgent; signal?: AbortSignal }
       const agent = context.agent
       if (agent === undefined) throw new Error(`${PLAN_TOOL} requires a calling agent (no session to switch)`)
-      // A registry too old to expose the log cannot say otherwise, and
-      // refusing on that basis would deny a review the host would have run.
-      if (agent.session.events !== undefined && !planModeActive(agent.session.events)) {
+      const planMode = ports.planMode()
+      if (planMode === undefined) {
+        throw new Error('no plan-mode service is available to leave plan mode; ask the user to switch the session mode instead')
+      }
+      // The service owns the state, so it is what says whether a review is
+      // meaningful. A host that publishes only the switch cannot answer, and
+      // gets the benefit of the doubt rather than a refusal.
+      if (planMode.get?.(agent).active === false) {
         throw new Error(`${PLAN_TOOL} is only available in plan mode`)
       }
       if (!/^#\s+\S/.test(plan.trim())) {
         throw new Error(`${PLAN_TOOL} requires a non-empty markdown plan starting with a # heading`)
-      }
-      const planMode = ports.planMode()
-      if (planMode === undefined) {
-        throw new Error('no plan-mode service is available to leave plan mode; ask the user to switch the session mode instead')
       }
       const sessionId = agent.session.id
       await ports.publish(sessionId, plan)

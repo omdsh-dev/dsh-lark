@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ChatSessionPicks,
+  ChatSessionPointers,
   offerSessions,
   PICKER_ROWS,
   readTitles,
   sessionActionValue,
   sessionChoices,
   sessionFacts,
+  sessionsPage,
   SESSIONS_ACTION,
+  SESSIONS_PAGE_ROWS,
 } from '../src/sessions.ts'
-import type { HostSessionRecord } from '../src/host.ts'
+import type { SessionChoice, SessionPickerInput } from '../src/sessions.ts'
+import type { HostSessionProjectionCache, HostSessionQuery, HostSessionRecord } from '../src/host.ts'
 
 /** The channel's own marker, as `session.ts` brands ids with. */
 const MARKER = 'lark-'
@@ -23,7 +26,7 @@ function corpus(...rows: { id: string; cwd?: string; createdAt?: number; live?: 
 }
 
 /** The picker input for a chat whose own base is `lark-oc_1`, in `/work`. */
-const HERE = { base: 'lark-oc_1', current: 'lark-oc_1', workspace: '/work', marker: MARKER }
+const HERE: SessionPickerInput = { base: 'lark-oc_1', current: 'lark-oc_1', workspace: '/work', marker: MARKER }
 
 describe('what a conversation may continue', () => {
   it('never offers work an agent delegated to itself', () => {
@@ -32,10 +35,25 @@ describe('what a conversation may continue', () => {
     const records: HostSessionRecord[] = [
       { header: { id: 'session-real', cwd: '/work', createdAt: 10 } },
       { header: { id: 'session-sub', cwd: '/work', createdAt: 20, origin: 'subagent', delegationDepth: 1 } },
-      { header: { id: 'session-forked', cwd: '/work', createdAt: 30, parentSession: 'session-real' } },
     ]
     expect(sessionChoices(records, new Map(), HERE, path => path).map(choice => choice.id))
       .toEqual(['session-real'])
+  })
+
+  it('offers a session that only carries fork lineage, as the Web tree does', () => {
+    // `parentSession` is fork lineage, not delegation: the Web client's
+    // `sessionVisible` reads `origin` alone, so it draws a forked session as an
+    // ordinary row. Treating lineage as delegation hid 4 of the 5 sessions one
+    // chat could see in the Web UI while that surface still listed them.
+    const records: HostSessionRecord[] = [
+      { header: { id: 'session-real', cwd: '/work', createdAt: 10 } },
+      { header: { id: 'session-forked', cwd: '/work', createdAt: 30, parentSession: 'session-real' } },
+      // A depth with no `origin` is not a classification either; the field is a
+      // recursion counter, and the Web tree does not read it for visibility.
+      { header: { id: 'session-deep', cwd: '/work', createdAt: 40, delegationDepth: 2 } },
+    ]
+    expect(sessionChoices(records, new Map(), HERE, path => path).map(choice => choice.id).sort())
+      .toEqual(['session-deep', 'session-forked', 'session-real'])
   })
 
   it('offers its own history and sessions no chat owns, and nothing else', () => {
@@ -117,49 +135,112 @@ describe('reading titles', () => {
   })
 })
 
-describe('the pick a conversation carries', () => {
+describe('the pointer a conversation carries', () => {
   it('records, clears, and persists exactly the changes', async () => {
     const patches: object[] = []
-    const picks = new ChatSessionPicks({ persist: async (patch) => { patches.push(patch); return true } })
+    const pointers = new ChatSessionPointers({ persist: async (patch) => { patches.push(patch); return true } })
 
-    expect(picks.pickFor('chat')).toBeUndefined()
-    expect(await picks.set('chat', 'session-web-ui')).toMatchObject({ changed: true, durable: true })
-    expect(picks.pickFor('chat')).toBe('session-web-ui')
-    expect(await picks.set('chat', 'session-web-ui')).toMatchObject({ changed: false })
-    expect(await picks.set('chat', undefined)).toMatchObject({ changed: true })
-    expect(picks.pickFor('chat')).toBeUndefined()
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBeUndefined()
+    expect(await pointers.set('lark-oc_1--abc', 'session-web-ui')).toMatchObject({ changed: true, durable: true })
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBe('session-web-ui')
+    expect(await pointers.set('lark-oc_1--abc', 'session-web-ui')).toMatchObject({ changed: false })
+    expect(await pointers.set('lark-oc_1--abc', undefined)).toMatchObject({ changed: true })
+    expect(pointers.pointerFor('lark-oc_1--abc')).toBeUndefined()
     expect(patches).toEqual([
-      { chatSessions: { chat: 'session-web-ui' } },
-      { chatSessions: { chat: '' } },
+      { chatSessions: { 'lark-oc_1--abc': 'session-web-ui' } },
+      { chatSessions: { 'lark-oc_1--abc': '' } },
     ])
   })
 
-  it('reads a stored empty entry as no pick at all', () => {
-    // The stored marker for "no pick" and a missing key mean the same thing;
+  it('reads a stored empty entry as no pointer at all', () => {
+    // The stored marker for "no pointer" and a missing key mean the same thing;
     // an empty string reaching the derivation would name a session with no id.
-    const picks = new ChatSessionPicks({ entries: { chat: '', other: 'session-x' } })
-    expect(picks.pickFor('chat')).toBeUndefined()
-    expect(picks.pickFor('other')).toBe('session-x')
+    const pointers = new ChatSessionPointers({ entries: { 'lark-oc_1': '', 'lark-oc_2': 'session-x' } })
+    expect(pointers.pointerFor('lark-oc_1')).toBeUndefined()
+    expect(pointers.pointerFor('lark-oc_2')).toBe('session-x')
   })
 
-  it('says once when picks will not survive a restart', async () => {
+  it('names the anchors pointing at one session', () => {
+    const pointers = new ChatSessionPointers({
+      entries: { 'lark-oc_1--abc': 'session-x', 'lark-oc_1--def': 'session-x', 'lark-oc_2': 'session-y' },
+    })
+    expect(pointers.anchorsPointingAt('session-x')).toEqual(['lark-oc_1--abc', 'lark-oc_1--def'])
+    expect(pointers.anchorsPointingAt('session-z')).toEqual([])
+  })
+
+  it('hands out a detached snapshot, for migrating an older key format', async () => {
+    const pointers = new ChatSessionPointers({ entries: { chat: 'session-x' } })
+    const snapshot = pointers.snapshot()
+    expect([...snapshot]).toEqual([['chat', 'session-x']])
+    await pointers.set('chat', undefined)
+    // The snapshot is a copy: a migration cannot observe later writes through it.
+    expect([...snapshot]).toEqual([['chat', 'session-x']])
+  })
+
+  it('says once when pointers will not survive a restart', async () => {
     const reports: string[] = []
-    const picks = new ChatSessionPicks({ persist: async () => false, report: (line) => reports.push(line) })
-    await picks.set('chat', 'a')
-    await picks.set('chat', 'b')
+    const pointers = new ChatSessionPointers({ persist: async () => false, report: (line) => reports.push(line) })
+    await pointers.set('lark-oc_1', 'a')
+    await pointers.set('lark-oc_1', 'b')
     expect(reports.filter(line => line.includes('in-memory only'))).toHaveLength(1)
   })
 })
 
 describe('the payload a row carries', () => {
   it('accepts only its own well-formed values', () => {
-    const value = { kind: SESSIONS_ACTION, session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p' }
+    const value = { kind: SESSIONS_ACTION, a: 'm1', session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p' }
     expect(sessionActionValue(value)).toEqual(value)
     expect(sessionActionValue({ ...value, owner: 'ou_1' })).toEqual({ ...value, owner: 'ou_1' })
     expect(sessionActionValue({ ...value, kind: 'other' })).toBeUndefined()
     expect(sessionActionValue({ ...value, session: '' })).toBeUndefined()
     expect(sessionActionValue({ ...value, key: undefined })).toBeUndefined()
     expect(sessionActionValue(null)).toBeUndefined()
+  })
+
+  it('refuses a payload that names no rendering', () => {
+    // Without the mark a press cannot be tied to the card that handed it out,
+    // so it cannot be refused once that card has been used — which is the whole
+    // point of a single-use picker.
+    expect(sessionActionValue({
+      kind: SESSIONS_ACTION, session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+    })).toBeUndefined()
+    expect(sessionActionValue({
+      kind: SESSIONS_ACTION, a: '', session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+    })).toBeUndefined()
+  })
+
+  it('carries a page control, and refuses one that names both a row and a page', () => {
+    const page = { kind: SESSIONS_ACTION, a: 'm1', page: 2, key: 'oc_1', chatId: 'oc_1', chatType: 'p2p' }
+    expect(sessionActionValue(page)).toEqual(page)
+    expect(sessionActionValue({ ...page, page: -1 })).toBeUndefined()
+    expect(sessionActionValue({ ...page, page: 1.5 })).toBeUndefined()
+    // A button that names neither is inert; one that names both has no single
+    // subject, and accepting it would authorize a press with two meanings.
+    expect(sessionActionValue({
+      kind: SESSIONS_ACTION, a: 'm1', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+    })).toBeUndefined()
+  })
+
+  it('carries the workspace the row was offered under, and drops a non-string one', () => {
+    // The press is checked against this value: a card outlives the directory it
+    // was drawn in, and `/cd` moves the conversation without repainting it.
+    const value = {
+      kind: SESSIONS_ACTION, a: 'm1', session: 'session-x', key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+      workspace: '/work',
+    }
+    expect(sessionActionValue(value)).toEqual(value)
+    expect(sessionActionValue({ ...value, workspace: 7 })).toBeUndefined()
+  })
+
+  it('accepts a session id this channel did not mint', () => {
+    // The rows a person presses are Web UI sessions named `session-…`, not the
+    // channel's own `lark-…` ids. A switch that required the channel's prefix
+    // refused every real row with "you may not change this conversation".
+    const value = {
+      kind: SESSIONS_ACTION, a: 'm1', session: 'session-13690074-5cbe-4801-9408-0fbe983677e6',
+      key: 'oc_1', chatId: 'oc_1', chatType: 'p2p',
+    }
+    expect(sessionActionValue(value)?.session).toBe('session-13690074-5cbe-4801-9408-0fbe983677e6')
   })
 })
 
@@ -374,9 +455,234 @@ describe('one derivation of the picker', () => {
     const notes: string[] = []
     const offered = await offer(engine([], true), line => notes.push(line))
 
-    expect(offered).toEqual({ rows: [], hidden: 0 })
+    expect(offered.rows).toEqual([])
+    expect(offered.hidden).toBe(0)
     // A picker that silently shows an empty list looks the same as a workspace
     // with no sessions, and only one of those is worth waking someone for.
     expect(notes.join('\n')).toContain('listing sessions failed')
+  })
+
+  it('cannot be paged, and reports what it left out instead', async () => {
+    // A page count derived from a bounded window would move every time a session
+    // was opened on another surface, so the window says what it is.
+    const rows = Array.from({ length: PICKER_ROWS + 6 }, (_, index) => ({
+      id: `session-${index}`,
+      createdAt: 10_000 - index,
+      said: 10_000 - index,
+    }))
+    const offered = await offer(engine(rows))
+
+    expect(offered.complete).toBe(false)
+    expect(offered.hidden).toBeGreaterThan(0)
+    expect(sessionsPage(offered, 3)).toEqual({ rows: offered.rows, page: 0, pages: 1 })
+  })
+})
+
+describe('the picker where the host already folded a row', () => {
+  /** One session as the projection cache holds it. */
+  interface Folded {
+    readonly id: string
+    readonly createdAt: number
+    readonly title?: string
+    readonly turns?: number
+    readonly blank?: boolean
+    /** When a person last prompted it; what "recent" means in the list. */
+    readonly prompted?: number
+    /** The newest turn's opening prompt, as the outline recorded it. */
+    readonly said?: string
+  }
+
+  /**
+   * A cache serving fixed rows, over an engine that FAILS the moment its log is
+   * read: opening a log is the cost this whole rung exists to avoid, so a test
+   * that lets it happen silently is a test that proves nothing.
+   */
+  function folded(entries: readonly Folded[], live: readonly string[] = []) {
+    const attending = new Set(live)
+    const rows: HostSessionRecord[] = entries.map(entry => ({
+      header: { id: entry.id, cwd: '/work', createdAt: entry.createdAt, version: 4, isSeeded: false },
+      live: attending.has(entry.id),
+    }))
+    const asked: string[][] = []
+    const cache = {
+      cachedSnapshot: (meta: { id: string }, keys?: readonly string[]) => {
+        const entry = entries.find(candidate => candidate.id === meta.id)
+        if (entry === undefined) return undefined
+        asked.push([...(keys ?? [])])
+        const values: Record<string, unknown> = {
+          title: entry.title ?? null,
+          sessionStats: { turns: entry.turns ?? 0 },
+          sessionListMetadata: { blank: entry.blank ?? false, lastPromptAt: entry.prompted ?? null },
+        }
+        if ((keys ?? []).includes('turnOutline')) {
+          values.turnOutline = {
+            turns: entry.said === undefined ? [] : [{ turn: 1, seq: 1, prompt: entry.said, response: '' }],
+            draft: '',
+          }
+        }
+        return { asOfSeq: 1, values }
+      },
+    }
+    return {
+      asked,
+      cache,
+      query: {
+        listSessions: async () => rows,
+        listEvents: async () => { throw new Error('the picker opened a log it did not need') },
+        readEvent: async () => { throw new Error('the picker opened a log it did not need') },
+      },
+    }
+  }
+
+  /**
+   * The derivation this rung is driven through: only the two faces the picker
+   * reaches for are named, so an engine standing in for either rung fits.
+   */
+  interface Rung {
+    readonly query: HostSessionQuery
+    readonly cache: HostSessionProjectionCache
+  }
+
+  const offer = (engine: Rung, scope: SessionPickerInput = HERE) => offerSessions({
+    query: engine.query,
+    sources: { cache: engine.cache },
+    scope,
+    canonical: path => path,
+  })
+
+  it('describes the whole corpus, newest first, without opening a log', async () => {
+    const engine = folded([
+      { id: 'session-a', createdAt: 100, prompted: 300, said: '最前面那个' },
+      { id: 'session-b', createdAt: 200, prompted: 100, said: '中间那个' },
+      { id: 'session-c', createdAt: 300, prompted: 200, said: '最后那个' },
+    ])
+    const offered = await offer(engine)
+
+    // Every candidate, not a bounded window of them — and therefore pageable.
+    expect(offered.complete).toBe(true)
+    expect(offered.hidden).toBe(0)
+    expect(offered.rows.map(row => row.id)).toEqual(['session-a', 'session-c', 'session-b'])
+    expect(offered.rows.map(row => row.turns)).toEqual([0, 0, 0])
+  })
+
+  it('reads the outline for the rows a page draws, and only for those', async () => {
+    const engine = folded([
+      { id: 'session-a', createdAt: 100, prompted: 300, said: '最前面那个' },
+      { id: 'session-b', createdAt: 200, prompted: 200, said: '中间那个' },
+      { id: 'session-c', createdAt: 300, prompted: 100, said: '最后那个' },
+    ])
+    const offered = await offer(engine)
+
+    // The cheap pass never asks for the one key whose state grows with the
+    // conversation: a fifty-turn session would otherwise be re-validated for
+    // every candidate in the corpus.
+    expect(engine.asked.every(keys => !keys.includes('turnOutline'))).toBe(true)
+
+    const [drawn] = offered.rows
+    const labelled = offered.label([drawn!])
+    expect(labelled[0]!.lastSaid).toBe('最前面那个')
+    expect(engine.asked.some(keys => keys.includes('turnOutline'))).toBe(true)
+  })
+
+  it('drops what nothing ever happened in, but never the conversation\'s own', async () => {
+    const engine = folded([
+      { id: 'session-never-used', createdAt: 300, blank: true },
+      { id: 'lark-oc_1', createdAt: 200, blank: true },
+      { id: 'session-real', createdAt: 100, turns: 4, said: '聊过' },
+    ])
+    const offered = await offer(engine)
+
+    // The derived id is how a picked conversation comes back, so a quiet one of
+    // its own is always on offer. Anything else nobody ever spoke in is not a
+    // conversation to continue.
+    expect(offered.rows.map(row => row.id)).toEqual(['lark-oc_1', 'session-real'])
+  })
+
+  it('matches a keyword against the cached titles, still without a log', async () => {
+    const engine = folded([
+      { id: 'session-a', createdAt: 300, prompted: 300, title: '部署脚本' },
+      { id: 'session-b', createdAt: 200, prompted: 200, title: '前端样式' },
+    ])
+    const offered = await offer(engine, { ...HERE, keyword: '部署' })
+
+    expect(offered.rows.map(row => row.id)).toEqual(['session-a'])
+  })
+
+  it('falls back to the log rung when a header cannot witness a stored row', async () => {
+    // A listing older than the format-generation field cannot address a cache
+    // record, and guessing at one would bind a row to the wrong log.
+    const entries = [{ id: 'session-a', createdAt: 100, prompted: 300, said: '说了' }]
+    const engine = folded(entries)
+    const unaddressable = {
+      ...engine,
+      query: {
+        ...engine.query,
+        listSessions: async () => [{ header: { id: 'session-a', cwd: '/work', createdAt: 100 }, live: false }],
+        listEvents: async () => [
+          { sessionId: 'session-a', seq: 0, type: 'turn/start', time: 300 },
+          { sessionId: 'session-a', seq: 1, type: 'user/message', time: 300 },
+        ],
+        readEvent: async () => ({
+          events: [{
+            seq: 1,
+            type: 'user/message',
+            time: 300,
+            data: { source: { kind: 'user' }, content: [{ type: 'text', text: '从日志里读出来的' }] },
+          }],
+        }),
+      },
+    }
+    const offered = await offer(unaddressable)
+
+    expect(offered.complete).toBe(false)
+    expect(offered.rows[0]!.lastSaid).toBe('从日志里读出来的')
+  })
+})
+
+describe('how the picker pages', () => {
+  /** A complete derivation over `count` rows, all distinct and none current. */
+  function complete(count: number) {
+    return {
+      rows: Array.from({ length: count }, (_, index) => ({
+        id: `session-${index}`,
+        createdAt: 10_000 - index,
+        live: false,
+        own: false,
+        current: false,
+      })),
+      hidden: 0,
+      complete: true,
+      label: (rows: readonly SessionChoice[]) => rows,
+    }
+  }
+
+  it('draws at most one page worth, and reports how many there are', () => {
+    const offered = complete(SESSIONS_PAGE_ROWS * 2)
+    const first = sessionsPage(offered, 0)
+
+    expect(first.rows).toHaveLength(SESSIONS_PAGE_ROWS)
+    expect(first.pages).toBe(2)
+    expect(first.page).toBe(0)
+    expect(sessionsPage(offered, 1).rows).toHaveLength(SESSIONS_PAGE_ROWS)
+  })
+
+  it('clamps a page past the end onto the last one', () => {
+    const offered = complete(SESSIONS_PAGE_ROWS + 1)
+    const page = sessionsPage(offered, 99)
+
+    expect(page.page).toBe(page.pages - 1)
+    expect(page.rows.length).toBeGreaterThan(0)
+  })
+
+  it('keeps the conversation\'s own row on the first page, wherever it sorted', () => {
+    const offered = { ...complete(SESSIONS_PAGE_ROWS * 2), rows: [
+      ...complete(SESSIONS_PAGE_ROWS * 2).rows.slice(0, 3),
+      { id: 'lark-oc_1', createdAt: 1, live: false, own: true, current: true },
+      ...complete(SESSIONS_PAGE_ROWS * 2).rows.slice(3),
+    ] }
+    const first = sessionsPage(offered, 0)
+
+    expect(first.rows[0]!.id).toBe('lark-oc_1')
+    expect(sessionsPage(offered, 1).rows.some(row => row.id === 'lark-oc_1')).toBe(false)
   })
 })

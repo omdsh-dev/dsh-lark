@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostAgentHandle } from '../src/host.ts'
-import { ConversationSessions, conversationKey, sessionIdFor } from '../src/session.ts'
+import { ConversationSessions, conversationKey, sessionIdFor, SessionRefusedError } from '../src/session.ts'
 import type { SessionLadder, SessionScope } from '../src/session.ts'
 import { fakeMessage } from './harness.ts'
 
 /** One rung the ladder was asked for, in call order. */
 interface LadderCall {
-  readonly rung: 'lookup' | 'resume' | 'create'
+  readonly rung: 'admit' | 'lookup' | 'resume' | 'create'
   readonly sessionId: string
 }
 
@@ -14,8 +14,12 @@ interface LadderCall {
 interface LadderBehavior {
   /** Session ids the host already runs an agent for, so `lookup` hits. */
   live?: string[]
+  /** Session ids the store's admission point refuses before any rung is asked. */
+  refuseAdmit?: string[]
   /** Session ids `resume` loads; every other id rejects as unstored. */
   resumable?: string[]
+  /** Session ids `resume` refuses outright, as an archive landing mid-acquisition is refused. */
+  refuse?: string[]
   /** Reject `create` instead of producing an agent. */
   failCreate?: boolean
   /** Reject every produced agent's `dispose`. */
@@ -51,12 +55,21 @@ function createFakeLadder(behavior: LadderBehavior = {}) {
   }
 
   const ladder: SessionLadder = {
+    admit(sessionId) {
+      calls.push({ rung: 'admit', sessionId })
+      if (behavior.refuseAdmit?.includes(sessionId) === true) {
+        throw new SessionRefusedError(`这个会话已被归档（fake）：${sessionId}`)
+      }
+    },
     lookup(sessionId) {
       calls.push({ rung: 'lookup', sessionId })
       return behavior.live?.includes(sessionId) === true ? handleFor(sessionId) : undefined
     },
     async resume(sessionId) {
       calls.push({ rung: 'resume', sessionId })
+      if (behavior.refuse?.includes(sessionId) === true) {
+        throw new SessionRefusedError(`这个会话已被归档（fake）：${sessionId}`)
+      }
       if (behavior.resumable?.includes(sessionId) !== true) throw new Error(`no stored session (fake): ${sessionId}`)
       return handleFor(sessionId)
     },
@@ -248,6 +261,55 @@ describe('conversation sessions', () => {
       await sessions.close()
     })
 
+    it('refuses an archived id before any rung is asked', async () => {
+      const sessionId = sessionIdFor('oc_chat_1')
+      const host = createFakeLadder({ resumable: [sessionId], refuseAdmit: [sessionId] })
+      const sessions = new ConversationSessions('chat', host.ladder)
+
+      await expect(sessions.acquire(fakeMessage())).rejects.toThrow('已被归档')
+      // Admission is the broadest point: a refused id is never looked up,
+      // resumed, or created, so nothing can come into being under it.
+      expect(host.asked('admit')).toEqual([sessionId])
+      expect(host.asked('lookup')).toEqual([])
+      expect(host.asked('resume')).toEqual([])
+      expect(host.asked('create')).toEqual([])
+      await sessions.close()
+    })
+
+    it('ends the walk on a refusal that landed mid-acquisition', async () => {
+      const sessionId = sessionIdFor('oc_chat_1')
+      const host = createFakeLadder({ resumable: [sessionId], refuse: [sessionId] })
+      const sessions = new ConversationSessions('chat', host.ladder)
+
+      await expect(sessions.acquire(fakeMessage())).rejects.toThrow('已被归档')
+      expect(host.asked('resume')).toEqual([sessionId])
+      // A refusal is not "nothing is stored here": creating would write over the
+      // session this channel just declined to open, under the id it named.
+      expect(host.asked('create')).toEqual([])
+      expect(host.disposals).toEqual([])
+      await sessions.close()
+    })
+
+    it('refuses a session whose binding is already live', async () => {
+      // The case admission exists for: this conversation already drives the id,
+      // so no rung is ever consulted for it again — and the binding would keep
+      // being handed back to a host that rejects the session's every step.
+      const sessionId = sessionIdFor('oc_chat_1')
+      const host = createFakeLadder()
+      const sessions = new ConversationSessions('chat', host.ladder)
+      await sessions.acquire(fakeMessage())
+
+      host.behavior.refuseAdmit = [sessionId]
+      await expect(sessions.acquire(fakeMessage())).rejects.toThrow('已被归档')
+      expect(host.asked('admit')).toEqual([sessionId, sessionId])
+      // Nothing else was asked a second time: the refusal ended the acquisition
+      // before the bound handle could be handed back.
+      expect(host.asked('lookup')).toEqual([sessionId])
+      expect(host.asked('resume')).toEqual([sessionId])
+      expect(host.asked('create')).toEqual([sessionId])
+      await sessions.close()
+    })
+
     it('propagates the create failure when resume failed too', async () => {
       const host = createFakeLadder({ failCreate: true })
       const sessions = new ConversationSessions('chat', host.ladder)
@@ -416,6 +478,7 @@ describe('a release still tearing down', () => {
       },
     })
     const ladder: SessionLadder = {
+      admit: () => {},
       lookup: (sessionId) => (live.includes(sessionId) ? handles.get(sessionId) : undefined),
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => {
@@ -458,6 +521,7 @@ describe('a release whose walk is still running', () => {
     let releaseCreate = (): void => {}
     const created: string[] = []
     const ladder: SessionLadder = {
+      admit: () => {},
       lookup: (sessionId) => live.get(sessionId),
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => {
@@ -517,6 +581,7 @@ describe('a release whose walk is still running', () => {
     let releaseDispose = (): void => {}
     const held = new Promise<void>((resolve) => { releaseDispose = resolve })
     const ladder: SessionLadder = {
+      admit: () => {},
       lookup: () => undefined,
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => ({
@@ -552,6 +617,7 @@ describe('closing while a walk is still running', () => {
     let finishCreate = (): void => {}
     const held = new Promise<void>((resolve) => { finishCreate = resolve })
     const ladder: SessionLadder = {
+      admit: () => {},
       lookup: () => undefined,
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => {
@@ -585,6 +651,7 @@ describe('closing while a walk is still running', () => {
     let finishDispose = (): void => {}
     const held = new Promise<void>((resolve) => { finishDispose = resolve })
     const ladder: SessionLadder = {
+      admit: () => {},
       lookup: () => undefined,
       resume: async () => { throw new Error('no stored session') },
       create: async (sessionId) => ({

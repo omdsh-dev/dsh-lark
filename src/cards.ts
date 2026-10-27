@@ -70,9 +70,16 @@ function isCopy(value: Line): value is Copy {
   return typeof value === 'object'
 }
 
-/** Join our copy to a value from elsewhere, in each language's own punctuation. */
+/**
+ * Join our copy to a value from elsewhere, in each language's own punctuation.
+ *
+ * The value is substituted through a FUNCTION, which is what keeps `$&`, `` $` ``
+ * and `$'` literal: a string replacement would read them as replacement patterns
+ * and rewrite this module's own copy — a tool name or a model route carrying one
+ * would come back as `%s`, or duplicate the sentence around it.
+ */
 function fill(copy: { readonly zh: string; readonly en: string }, value: string): Copy {
-  return { zh: copy.zh.replace('%s', value), en: copy.en.replace('%s', value) }
+  return { zh: copy.zh.replace('%s', () => value), en: copy.en.replace('%s', () => value) }
 }
 
 /**
@@ -446,9 +453,48 @@ function contextReading(context: { readonly used: number; readonly window?: numb
 
 /** Cut a string to a budget, reporting what was left out. */
 function clip(value: string, max: number): { readonly shown: string; readonly hidden: number } {
-  return value.length <= max
+  // Cut and counted by CODE POINT: a slice by UTF-16 code unit splits a
+  // surrogate pair into a lone half, and counts a character as two, so the
+  // "N characters truncated" note would be wrong for any emoji or CJK
+  // extension character in a path or a command.
+  const points = [...value]
+  return points.length <= max
     ? { shown: value, hidden: 0 }
-    : { shown: value.slice(0, max), hidden: value.length - max }
+    : { shown: points.slice(0, max).join(''), hidden: points.length - max }
+}
+
+/**
+ * How long a decider's name may be on a card.
+ *
+ * The name comes from the platform's callback or from a chat roster this channel
+ * does not own, so its length is not this channel's to assume: an oversized
+ * value pushes the card toward the platform's own limit, and a card the platform
+ * refuses is a decision nobody can read back. Matches the bound the bridge
+ * already applies where it resolves a name, so both layers agree.
+ */
+const DECIDER_MAX_CHARS = 64
+
+/**
+ * One decider's name, as a card may print it.
+ * @param name - the name the platform or the roster gave.
+ * @returns the name, clipped to {@link DECIDER_MAX_CHARS} code points.
+ */
+function deciderName(name: string): string {
+  return clip(name, DECIDER_MAX_CHARS).shown
+}
+
+/**
+ * One entry of a literal table, by its own key only.
+ *
+ * `table[key] ?? fallback` is not enough for a string key: `'constructor'`
+ * finds `Object.prototype.constructor`, which is truthy, so the fallback never
+ * fires and the reader goes on to use a function as if it were a table row.
+ * @param table - the literal table.
+ * @param key - the key read off a value from elsewhere.
+ * @returns the entry, or undefined when the table declares no such key.
+ */
+function ownValue<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined
 }
 
 /** How much of a pending call's arguments an approval card shows. */
@@ -456,6 +502,35 @@ const COMMAND_MAX_CHARS = 600
 
 /** How much of a model's justification an approval card shows. */
 const REASON_MAX_CHARS = 300
+
+/**
+ * How much of a model's question a card carries, and how much of one option.
+ *
+ * Every other model-authored block here is clipped — a command to 600, a reason
+ * to 300 — because an oversized card is refused by the platform, and a question
+ * whose card never lands is answered empty, which the model reads exactly like a
+ * human who declined. The option ceiling bounds the card's structure the same
+ * way: one row per option means the count is size too.
+ */
+const QUESTION_MAX_CHARS = 600
+const QUESTION_OPTION_LABEL_MAX_CHARS = 80
+const QUESTION_OPTION_DESCRIPTION_MAX_CHARS = 200
+const QUESTION_MAX_OPTIONS = 20
+const QUESTION_HEADER_MAX_CHARS = 120
+
+/**
+ * One string from elsewhere, cut to a budget with an ellipsis.
+ *
+ * For a place that cannot carry a truncation notice of its own — a button label,
+ * a dropdown entry — so the reader still sees that something was left out.
+ * @param value - the text.
+ * @param max - the budget, in code points.
+ * @returns the text, or its clipped form with an ellipsis.
+ */
+function clippedText(value: string, max: number): string {
+  const clipped = clip(value, max)
+  return clipped.hidden === 0 ? value : `${clipped.shown}…`
+}
 
 /** Every string this module says, in the languages it says them. */
 const TRUNCATED = { zh: '已截断 %s 个字符', en: '%s characters truncated' }
@@ -480,11 +555,20 @@ const APPROVAL = {
   summary: { zh: '需要授权：%s', en: 'Approval needed: %s' },
   closed: { zh: '这条授权已结束，按钮不再可用。', en: 'This request is closed; its buttons no longer work.' },
   decidedBy: { zh: '%s · 决定人：', en: '%s · decided by ' },
+  // The same question is offered on more than one surface, and the one that
+  // answers first wins. A card the OTHER surface answered must say so: the room
+  // would otherwise read a decision it never made, or look for who pressed a
+  // button nobody here pressed.
+  decidedElsewhere: { zh: '%s · 已在网页端决定', en: '%s · decided in the web app' },
 }
 const QUESTION = {
   title: { zh: '需要你确认', en: 'A decision is needed' },
   context: { zh: '助手需要一个决定才能继续', en: 'The assistant needs your answer to continue' },
   answered: { zh: '已作答', en: 'Answered' },
+  // The same question is offered on more than one surface, and the one that
+  // answers first wins. A card the OTHER surface answered must say so: the room
+  // would otherwise read a decision it never made.
+  answeredInWeb: { zh: '已在网页端作答', en: 'Answered in the web app' },
   cancelled: { zh: '这个提问已取消', en: 'Question cancelled' },
   answer: { zh: '你的回答', en: 'Your answer' },
   replyWithOptions: {
@@ -503,6 +587,12 @@ const QUESTION = {
     en: 'Submit once you have picked; if none fit, just reply — your next message is the answer.',
   },
   dropped: { zh: '助手已不再等待这个回答。', en: 'The assistant is no longer waiting on this.' },
+  // The card's own ceiling, said out loud: a model that offered more options
+  // than a card can carry should not read the trimmed set as the whole question.
+  droppedOptions: {
+    zh: '（还有 %s 个选项超出卡片上限，未显示；可以直接回复你的选择。）',
+    en: '(%s more options were past the card limit and are not shown — reply with your choice instead.)',
+  },
 }
 
 /**
@@ -556,12 +646,12 @@ export function approvalCard(input: {
 const UNCONFINED_LABEL = 'danger-full-access'
 
 /** How one approval ended, in the words and colour the settled card uses. */
-const APPROVAL_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+const APPROVAL_OUTCOME = {
   'allowed-once': { state: 'success', title: { zh: '已允许执行一次', en: 'Allowed once' } },
   rejected: { state: 'danger', title: { zh: '已拒绝执行', en: 'Rejected' } },
   cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
   unavailable: { state: 'neutral', title: { zh: '无法作答', en: 'Could not be answered' } },
-}
+} satisfies Record<string, { readonly state: CardState; readonly title: Copy }>
 
 /**
  * The card an approval is replaced with once decided — no live buttons, and
@@ -573,13 +663,22 @@ export function settledApprovalCard(input: {
   readonly toolName: string
   readonly outcome: string
   readonly decidedBy?: string | undefined
+  /** Whether another surface answered, so no press happened here. */
+  readonly decidedElsewhere?: boolean | undefined
 }): object {
-  const settled = APPROVAL_OUTCOME[input.outcome] ?? APPROVAL_OUTCOME.cancelled!
+  // Looked up by own key: `APPROVAL_OUTCOME['constructor']` finds something on
+  // the prototype chain, and a fallback written as `?? cancelled` never fires
+  // for it — the card would then read a field off a function and throw.
+  const settled = ownValue(APPROVAL_OUTCOME, input.outcome) ?? APPROVAL_OUTCOME.cancelled
   // Who decided, named rather than withheld: with approvals open to a room,
-  // the room should see whose press granted the escalation.
-  const context = input.decidedBy === undefined || input.decidedBy === ''
-    ? input.toolName
-    : join(fill(APPROVAL.decidedBy, input.toolName), input.decidedBy)
+  // the room should see whose press granted the escalation. When the decision
+  // came from the other surface there is no name to give, and naming the wrong
+  // one would be worse than naming none — the card says where it came from.
+  const context = input.decidedElsewhere === true
+    ? fill(APPROVAL.decidedElsewhere, input.toolName)
+    : input.decidedBy === undefined || input.decidedBy === ''
+      ? input.toolName
+      : join(fill(APPROVAL.decidedBy, input.toolName), deciderName(input.decidedBy))
   return card(settled.state, join(settled.title, `：${input.toolName}`, `: ${input.toolName}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
@@ -653,12 +752,12 @@ export function fileApprovalCard(input: {
  * A request nobody answered in time is presented as withdrawn, because from the
  * room's side that is what it was.
  */
-const FILE_SEND_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
+const FILE_SEND_OUTCOME = {
   'allowed-once': { state: 'success', title: { zh: '已允许发送', en: 'Send allowed' } },
   rejected: { state: 'danger', title: { zh: '已拒绝发送', en: 'Send rejected' } },
   cancelled: { state: 'neutral', title: { zh: '请求已撤回', en: 'Request withdrawn' } },
   unavailable: { state: 'neutral', title: { zh: '无法发送', en: 'Could not be sent' } },
-}
+} satisfies Record<string, { readonly state: CardState; readonly title: Copy }>
 
 /**
  * The card a file approval is replaced with once decided — no live buttons, and
@@ -680,7 +779,7 @@ export function settledFileApprovalCard(input: {
   readonly outcome: string
   readonly decidedBy?: string | undefined
 }): object {
-  const settled = FILE_SEND_OUTCOME[input.outcome] ?? FILE_SEND_OUTCOME.cancelled!
+  const settled = ownValue(FILE_SEND_OUTCOME, input.outcome) ?? FILE_SEND_OUTCOME.cancelled
   const path = clip(input.path, COMMAND_MAX_CHARS)
   // One line rather than the live card's two rows: a settled card carries no
   // labelled blocks, and the middot is the separator every other context line
@@ -692,7 +791,7 @@ export function settledFileApprovalCard(input: {
   // able to tell what was allowed.
   const context = input.decidedBy === undefined || input.decidedBy === ''
     ? where
-    : join(fill(APPROVAL.decidedBy, where), input.decidedBy)
+    : join(fill(APPROVAL.decidedBy, where), deciderName(input.decidedBy))
   return card(settled.state, join(settled.title, `：${path.shown}`, `: ${path.shown}`), [
     ...heading(settled.state, settled.title, context),
     ...footer(APPROVAL.closed),
@@ -714,32 +813,50 @@ export function questionCard(input: {
   /** The callback payload the submit button carries, for a multiple choice. */
   readonly submit?: object | undefined
 }): object {
+  // Clipped before it becomes card structure, and clipped here rather than at
+  // each layout below so every shape a question can take is bounded once.
+  const options = input.options.slice(0, QUESTION_MAX_OPTIONS).map(option => ({
+    label: clippedText(option.label, QUESTION_OPTION_LABEL_MAX_CHARS),
+    ...option.description === undefined || option.description === ''
+      ? {}
+      : { description: clippedText(option.description, QUESTION_OPTION_DESCRIPTION_MAX_CHARS) },
+  }))
+  const droppedOptions = input.options.length - options.length
+  const question = clip(input.question, QUESTION_MAX_CHARS)
   // Bare labels fit a button row, which is the most obviously clickable shape
   // available; the moment any option needs a sentence to justify it, the whole
   // set becomes rows so the choices stay visually parallel.
-  const explained = input.options.some(
-    option => option.description !== undefined && option.description !== '',
-  )
-  const title = input.header ?? QUESTION.title
+  const explained = options.some(option => option.description !== undefined && option.description !== '')
+  // A header is a title, not content: clipped with an ellipsis rather than with
+  // a notice line of its own, which would sit above the question it introduces.
+  const title: Line = input.header === undefined
+    ? QUESTION.title
+    : clippedText(input.header, QUESTION_HEADER_MAX_CHARS)
   return card('info', isCopy(title) ? title : { zh: title, en: title }, [
     ...heading('info', title, QUESTION.context),
-    line(input.question, SIZE.body, '12px 20px 0px 20px'),
-    ...input.options.length === 0
+    line(question.shown, SIZE.body, '12px 20px 0px 20px'),
+    ...question.hidden === 0
+      ? []
+      : [line(fill(TRUNCATED, String(question.hidden)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
+    ...options.length === 0
       ? []
       : input.multiSelect === true && input.submit !== undefined
-        ? [multipleChoice(input.options, input.submit)]
+        ? [multipleChoice(options, input.submit)]
         : explained
-          ? input.options.map((option, index) => optionRow(option, input.valueFor(index)))
+          ? options.map((option, index) => optionRow(option, input.valueFor(index)))
           // The first option carries the emphasis: by the tool's own convention
           // a recommendation is listed first, so a flat row of identical
           // buttons would throw away a signal the model already gave.
-          : [actions(input.options.map((option, index) => ({
+          : [actions(options.map((option, index) => ({
             label: option.label,
             value: input.valueFor(index),
             kind: index === 0 ? 'primary' as const : 'default' as const,
           })))],
+    ...droppedOptions === 0
+      ? []
+      : [line(fill(QUESTION.droppedOptions, String(droppedOptions)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
     ...footer(
-      input.options.length === 0
+      options.length === 0
         ? QUESTION.replyOnly
         : input.multiSelect === true && input.submit !== undefined
           ? QUESTION.replyWithChoices
@@ -750,6 +867,10 @@ export function questionCard(input: {
 
 /**
  * The card a question is replaced with once answered.
+ *
+ * `elsewhere` names the surface that answered when it was not this chat. The
+ * same question is offered on both, and the card would otherwise read as a
+ * decision taken by whoever is reading it.
  * @param input - the question asked, and how it ended.
  * @returns a schema 2.0 card object.
  */
@@ -758,17 +879,30 @@ export function settledQuestionCard(input: {
   readonly header?: string | undefined
   readonly answer?: string | undefined
   readonly cancelled?: boolean | undefined
+  /** Whether another surface answered, so no press happened here. */
+  readonly elsewhere?: boolean | undefined
 }): object {
   const state: CardState = input.cancelled === true ? 'neutral' : 'success'
-  const title = input.cancelled === true ? QUESTION.cancelled : QUESTION.answered
+  const title = input.cancelled === true
+    ? QUESTION.cancelled
+    : input.elsewhere === true ? QUESTION.answeredInWeb : QUESTION.answered
   const answer = clip(input.answer ?? '', REASON_MAX_CHARS)
-  const asked = input.header ?? QUESTION.title
+  // Clipped on the same terms as the live card: this is the record of the same
+  // question, and a record that outgrew the platform's card ceiling would leave
+  // the room with nothing at all.
+  const asked: Line = input.header === undefined
+    ? QUESTION.title
+    : clippedText(input.header, QUESTION_HEADER_MAX_CHARS)
+  const question = clip(input.question, QUESTION_MAX_CHARS)
   const summary = isCopy(asked)
     ? join(title, `：${asked.zh}`, `: ${asked.en}`)
     : join(title, `：${asked}`, `: ${asked}`)
   return card(state, summary, [
     ...heading(state, title, asked),
-    line(input.question, SIZE.body, '12px 20px 0px 20px'),
+    line(question.shown, SIZE.body, '12px 20px 0px 20px'),
+    ...question.hidden === 0
+      ? []
+      : [line(fill(TRUNCATED, String(question.hidden)), SIZE.foot, '2px 20px 0px 20px', 'grey')],
     ...input.cancelled === true || input.answer === undefined || input.answer === ''
       ? []
       : [quoted(QUESTION.answer, answer.shown, 'grey-50', answer.hidden)],
@@ -794,6 +928,20 @@ const MODEL = {
   },
   summary: { zh: '模型：%s', en: 'Model: %s' },
 }
+/**
+ * What this channel tells a chat whose session the host has archived.
+ *
+ * One string for both surfaces: the refusal a message draws and the status
+ * row that warns about it say the same thing, so the card can never promise a
+ * route the drive path then refuses. Markdown-free on purpose — the card
+ * renders it through `plain_text`, which shows backticks and asterisks
+ * literally.
+ */
+export const ARCHIVED_SESSION_NOTICE: Copy = {
+  zh: '这个会话已被归档，无法继续。请在网页端恢复它，或发 /new 开一个新会话。',
+  en: 'This session is archived, so it cannot run. Restore it in the web UI, or send /new for a new one.',
+}
+
 const STATUS = {
   title: { zh: '本会话状态', en: 'This conversation' },
   subtitle: { zh: '你的下一条消息会怎么跑', en: 'What your next message will do' },
@@ -801,6 +949,7 @@ const STATUS = {
   model: { zh: '模型', en: 'Model' },
   session: { zh: '会话', en: 'Session' },
   activity: { zh: '当前', en: 'Activity' },
+  archived: { zh: '归档', en: 'Archived' },
   version: { zh: '版本', en: 'Version' },
   preset: { zh: '权限', en: 'Permissions' },
   presetOpen: { zh: '不沙箱，且不再弹审批卡', en: 'no sandbox, and no approval cards' },
@@ -918,6 +1067,13 @@ export function statusCard(input: {
   readonly routeIsDefault: boolean
   readonly sessionId: string
   readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
+  /**
+   * Whether the host archived this session. Rendered as its own row rather
+   * than folded into {@link activity}: the two are orthogonal facts, and the
+   * activity vocabulary answers "what is the agent doing" — which stays true
+   * of an archived session that still holds a live, idle agent.
+   */
+  readonly archived?: boolean | undefined
   readonly pendingApprovals: number
   readonly version: string
   /** The permission preset in force, as the deployment defines it. */
@@ -930,6 +1086,10 @@ export function statusCard(input: {
       ...field(STATUS.workspace, input.workspace, input.workspaceIsDefault ? STATUS.isDefault : undefined, true),
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
       ...field(STATUS.activity, STATUS[input.activity]),
+      // Named where it changes what happens next, which is the whole point of
+      // this card: an archived session answers every message with a refusal,
+      // so a row reading "Idle" alone would be the card's one lie.
+      ...input.archived === true ? field(STATUS.archived, ARCHIVED_SESSION_NOTICE) : [],
       ...input.preset === undefined
         ? []
         // Named where someone looks for it: a session that stopped asking
@@ -992,6 +1152,24 @@ const SESSIONS = {
     zh: '还有 %s 个更早的会话，/sessions <关键词> 可按标题过滤',
     en: '%s older ones — /sessions <keyword> filters by title',
   },
+  previous: { zh: '上一页', en: 'Previous' },
+  next: { zh: '下一页', en: 'Next' },
+  switched: { zh: '已接续会话', en: 'Session continued' },
+  spent: { zh: '这张卡片已经选过了', en: 'This card has already been used' },
+  gone: { zh: '这个会话已不再可接续', en: 'That session is no longer offered' },
+  moved: { zh: '会话已移动', en: 'The conversation moved' },
+  decidedBy: { zh: '%s 里的对话 · 选择人：', en: 'Conversations in %s · chosen by ' },
+  // The row a settled pick keeps says what happened to it, in the same slot a
+  // settled current row states that it is the one in use.
+  continued: { zh: '已接续', en: 'Continued' },
+  received: {
+    zh: '你的下一条消息会接续这个会话；要换一个，发一次 /sessions。',
+    en: 'Your next message continues it — send /sessions again to pick another.',
+  },
+  closed: {
+    zh: '这张卡片已经结束，按钮不再可用。',
+    en: 'This card is closed; its buttons no longer work.',
+  },
   justNow: { zh: '刚刚', en: 'just now' },
   minutes: { zh: '%s 分钟前', en: '%s min ago' },
   hours: { zh: '%s 小时前', en: '%s h ago' },
@@ -1046,7 +1224,11 @@ function agoLabel(age: number): Copy {
 export function sessionsCard(input: {
   readonly rows: readonly SessionCardRow[]
   readonly workspace: string
+  /** Older ones the card does not draw; zero or absent when it pages instead. */
   readonly hidden?: number | undefined
+  /** The zero-based page drawn, and how many there are; both absent when it does not page. */
+  readonly page?: number | undefined
+  readonly pages?: number | undefined
   /** The keyword the list was narrowed by, so an empty one says which emptiness. */
   readonly keyword?: string | undefined
   /** The clock the relative labels are read against; injectable for tests. */
@@ -1054,6 +1236,8 @@ export function sessionsCard(input: {
   /** False when the deployment composes no query service at all. */
   readonly canList?: boolean | undefined
   readonly valueFor: (sessionId: string) => object
+  /** Payload for a page control; absent leaves the card unpaged. */
+  readonly pageValueFor?: ((page: number) => object) | undefined
 }): object {
   const now = input.now ?? Date.now()
   /**
@@ -1062,23 +1246,43 @@ export function sessionsCard(input: {
    * instead of offering a press, the same way every settled row here does.
    */
   const rowFor = (row: SessionCardRow): object => {
-    const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
-    const notes = [
-      row.when === undefined ? undefined : agoLabel(now - row.when),
-      row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
-      row.live && !row.current ? SESSIONS.elsewhere : undefined,
-    ].filter((note): note is Copy => note !== undefined)
-    const detail = notes.length === 0
-      ? undefined
-      : { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') }
+    const text = sessionRowText(row, now)
     return row.current
-      ? settledRow(label, detail, SESSIONS.inUse, INK.info.token)
-      : optionRow({ label, description: detail }, input.valueFor(row.id))
+      ? settledRow(text.label, text.detail, SESSIONS.inUse, INK.info.token)
+      : optionRow({ label: text.label, description: text.detail }, input.valueFor(row.id))
   }
 
   /** A cluster's quiet heading; nothing is drawn for a cluster with no rows. */
   const group = (heading: Copy, rows: readonly SessionCardRow[]): object[] =>
     rows.length === 0 ? [] : [line(heading, SIZE.label, '16px 20px 2px 20px', 'grey'), ...rows.map(rowFor)]
+
+  /**
+   * The page strip, drawn only where the list is actually paged: a card whose
+   * rows are the whole list has nothing to turn to, and a control that cannot
+   * move would be a button for a no-op.
+   */
+  const pager = (): object[] => {
+    const page = input.page
+    const pages = input.pages
+    if (page === undefined || pages === undefined || pages <= 1 || input.pageValueFor === undefined) return []
+    return [
+      // Built rather than filled from a `%s / %s` template, because `fill`
+      // substitutes only the first placeholder — the shape `workspacesCard`'s
+      // page strip already uses.
+      line(
+        { zh: `第 ${page + 1} / ${pages} 页`, en: `Page ${page + 1} of ${pages}` },
+        SIZE.label,
+        '14px 20px 0px 20px',
+        'grey',
+      ),
+      ...page > 0
+        ? [optionRow({ label: SESSIONS.previous }, input.pageValueFor(page - 1))]
+        : [],
+      ...page < pages - 1
+        ? [optionRow({ label: SESSIONS.next }, input.pageValueFor(page + 1))]
+        : [],
+    ]
+  }
 
   const here = input.rows.filter(row => row.own)
   const elsewhere = input.rows.filter(row => !row.own)
@@ -1098,6 +1302,7 @@ export function sessionsCard(input: {
           ? [line(SESSIONS.none, SIZE.body, '14px 20px 0px 20px', 'grey')]
           : []
       : grouped,
+    ...pager(),
     ...input.hidden === undefined || input.hidden <= 0
       ? []
       : [line(fill(SESSIONS.more, String(input.hidden)), SIZE.label, '10px 20px 0px 20px', 'grey')],
@@ -1106,17 +1311,213 @@ export function sessionsCard(input: {
 }
 
 /**
+ * Every string the workspace picker says.
+ *
+ * The footer names `/cd` explicitly: the picker can only offer directories this
+ * channel already knows, and a directory nobody has used with the host yet has
+ * no row — so the typed form is not a leftover, it is the only way to reach a
+ * new project.
+ */
+const WORKSPACES = {
+  title: { zh: '工作区', en: 'Workspaces' },
+  context: { zh: '本会话在 %s', en: 'This conversation is in %s' },
+  current: { zh: '当前', en: 'Current' },
+  isDefault: { zh: '默认', en: 'Default' },
+  empty: {
+    zh: '这里还没有可用的工作区，用 `/cd <绝对路径>` 指定一个。',
+    en: 'No workspaces to offer yet — name one with `/cd <absolute path>`.',
+  },
+  elsewhere: { zh: '管理面板正在使用', en: 'Open in the console' },
+  previous: { zh: '上一页', en: 'Previous' },
+  next: { zh: '下一页', en: 'Next' },
+  position: { zh: '第 %s / %s 页', en: 'Page %s of %s' },
+  foot: {
+    zh: '点一行切换到这个目录；新目录用 `/cd <绝对路径>`。',
+    en: 'Press a row to switch there; reach a new directory with `/cd <absolute path>`.',
+  },
+  summary: { zh: '工作区', en: 'Workspaces' },
+}
+
+/** One row of the workspace picker, as the bridge resolves it. */
+export interface WorkspaceCardRow {
+  readonly path: string
+  readonly name: string
+  readonly isDefault: boolean
+  readonly current: boolean
+}
+
+/**
+ * The workspace picker: which directory this conversation runs in, and where
+ * else it could.
+ *
+ * Ids are carried by the buttons and never printed, exactly as the session
+ * picker does it: a full path is miserable to transcribe on the phone this is
+ * mostly used from. The current row states itself instead of offering a press,
+ * so the card always says where the conversation is — which is why that row is
+ * pinned to the first page rather than left wherever it sorted.
+ * @param input - the rows, the page they were taken from, and each row's payload.
+ * @returns a schema 2.0 card object.
+ */
+export function workspacesCard(input: {
+  readonly rows: readonly WorkspaceCardRow[]
+  readonly page: number
+  readonly pages: number
+  readonly current: string
+  readonly valueFor: (choice: { readonly path?: string; readonly page?: number }) => object
+}): object {
+  /**
+   * One directory as a pressable row: the name a reader recognizes, then the
+   * full path that tells two directories of one name apart.
+   */
+  const rowFor = (row: WorkspaceCardRow): object => {
+    const notes = [
+      ...row.current ? [WORKSPACES.current] : [],
+      ...row.isDefault ? [WORKSPACES.isDefault] : [],
+    ]
+    const detail: Line = {
+      zh: [row.path, ...notes.map(note => note.zh)].join(' · '),
+      en: [row.path, ...notes.map(note => note.en)].join(' · '),
+    }
+    return row.current
+      ? settledRow(row.name, detail, WORKSPACES.current, INK.info.token)
+      : optionRow({ label: row.name, description: detail }, input.valueFor({ path: row.path }))
+  }
+
+  /**
+   * The page strip. Drawn only where there is more than one page, so a
+   * deployment with a handful of workspaces reads as a plain list rather than
+   * as a list with controls that do nothing.
+   */
+  const pager = (): object[] => {
+    if (input.pages <= 1) return []
+    const controls = [
+      ...input.page > 0
+        ? [optionRow({ label: WORKSPACES.previous }, input.valueFor({ page: input.page - 1 }))]
+        : [],
+      ...input.page < input.pages - 1
+        ? [optionRow({ label: WORKSPACES.next }, input.valueFor({ page: input.page + 1 }))]
+        : [],
+    ]
+    return [
+      line(
+        {
+          zh: `第 ${input.page + 1} / ${input.pages} 页`,
+          en: `Page ${input.page + 1} of ${input.pages}`,
+        },
+        SIZE.label,
+        '14px 20px 0px 20px',
+        'grey',
+      ),
+      ...controls,
+    ]
+  }
+
+  return card('info', WORKSPACES.summary, [
+    ...heading('info', WORKSPACES.title, fill(WORKSPACES.context, workspaceLabel(input.current))),
+    ...input.rows.length === 0
+      ? [line(WORKSPACES.empty, SIZE.body, '14px 20px 0px 20px', 'grey')]
+      : input.rows.map(rowFor),
+    ...pager(),
+    ...footer(WORKSPACES.foot),
+  ])
+}
+
+/**
+ * The label and the fact line one session row shows.
+ *
+ * Shared with the settled card so a chosen conversation is named by exactly the
+ * words the row that chose it carried: a picker and its own record must not be
+ * able to disagree about which conversation was picked.
+ * @param row - the row as the bridge resolved it.
+ * @param now - the clock the relative label is read against.
+ * @returns the label, and the fact line when there is one.
+ */
+function sessionRowText(row: SessionCardRow, now: number): { readonly label: Line; readonly detail?: Copy | undefined } {
+  const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
+  const notes = [
+    row.when === undefined ? undefined : agoLabel(now - row.when),
+    row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
+    row.live && !row.current ? SESSIONS.elsewhere : undefined,
+  ].filter((note): note is Copy => note !== undefined)
+  return {
+    label,
+    ...notes.length === 0
+      ? {}
+      : { detail: { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') } },
+  }
+}
+
+/**
+ * One rendered line in each language, for a summary that lives outside the card
+ * and therefore carries no localization of its own.
+ * @param value - our copy, or text from elsewhere shown as it arrived.
+ * @returns the same words, once per language.
+ */
+function bothWays(value: Line): Copy {
+  return isCopy(value) ? { zh: value.zh, en: value.en } : { zh: value, en: value }
+}
+
+/**
+ * The card a session pick is replaced with once chosen.
+ *
+ * No live buttons, and the choice legible from the ink alone — the same shape
+ * every single-use card here settles into. The row is kept rather than dropped
+ * for the reason the question card keeps its answer: a label is clipped, and a
+ * reader has to be able to confirm which conversation they landed on.
+ * @param input - the row chosen, the workspace, who pressed, and why nothing was.
+ * @returns a schema 2.0 card object.
+ */
+export function settledSessionsCard(input: {
+  /** The row the press landed on; absent when nothing was chosen. */
+  readonly picked?: SessionCardRow | undefined
+  readonly workspace: string
+  /** Who chose, when the conversation is a room's rather than one person's. */
+  readonly decidedBy?: string | undefined
+  /** Why nothing was chosen, when the press could not land. */
+  readonly refusal?: 'spent' | 'gone' | 'moved' | undefined
+  /** The clock the relative label is read against; injectable for tests. */
+  readonly now?: number | undefined
+}): object {
+  const state: CardState = input.refusal === undefined ? 'success' : 'neutral'
+  const title = input.refusal === undefined ? SESSIONS.switched : SESSIONS[input.refusal]
+  const where = workspaceLabel(input.workspace)
+  // Who chose is named rather than withheld, the way a settled approval names
+  // its decider: where anyone in a room may drive the conversation, the room
+  // should see whose press moved it.
+  const context = input.decidedBy === undefined || input.decidedBy === ''
+    ? fill(SESSIONS.context, where)
+    : join(fill(SESSIONS.decidedBy, where), deciderName(input.decidedBy))
+  const text = input.picked === undefined ? undefined : sessionRowText(input.picked, input.now ?? Date.now())
+  const named = text === undefined ? { zh: '', en: '' } : bothWays(text.label)
+  return card(state, { zh: `${title.zh}：${named.zh}`, en: `${title.en}: ${named.en}` }, [
+    ...heading(state, title, context),
+    ...text === undefined
+      ? []
+      // The CARD's own ink, never another state's: a card declares only the one
+      // colour pair it uses, so a row borrowing `INK.info.token` into a card
+      // that declares `success` or `neutral` renders nothing and fails the
+      // whole card at the platform.
+      : [settledRow(text.label, text.detail, SESSIONS.continued, INK[state].token)],
+    ...footer(input.refusal === undefined ? SESSIONS.received : SESSIONS.closed),
+  ])
+}
+
+/**
  * A workspace as a subtitle names it: the last two path segments.
  *
  * A whole absolute path in a subtitle is longer than the title, wraps on a
  * phone, and puts the operator's home directory on a group's screen — while
- * the part that identifies the directory is its tail.
+ * the part that identifies the directory is its tail. Split on BOTH separators,
+ * because a Windows path's tail is behind backslashes: a POSIX-only split left
+ * `F:\myProject\deepseek` on the screen in full, login name and all.
  * @param path - the workspace directory.
  * @returns the short form.
  */
 function workspaceLabel(path: string): string {
-  const parts = path.split('/').filter(part => part !== '')
-  return parts.length <= 2 ? path : parts.slice(-2).join('/')
+  const parts = path.split(/[\\/]/).filter(part => part !== '')
+  // The root is never part of the name: `/home/alice` is `alice`, not
+  // `/home/alice`, and `C:\repo` is `repo`.
+  return parts.length <= 2 ? parts[parts.length - 1] ?? path : parts.slice(-2).join('/')
 }
 
 /** Every toast this channel raises, in the languages it raises them. */
@@ -1137,6 +1538,10 @@ export const TOAST = {
   sessionSwitched: { zh: '已切过去，下一条消息接续', en: 'Switched — your next message continues it' },
   sessionOwn: { zh: '已回到这个聊天自己的会话', en: "Back on this chat's own session" },
   sessionGone: { zh: '这个会话已经不在可接续列表里了', en: 'That session is no longer on offer here' },
+  sessionCardSpent: { zh: '这张卡片已经选过了', en: 'This card has already been used' },
+  workspaceSwitched: { zh: '已切换工作区，下一条消息在新目录', en: 'Workspace switched — your next message runs there' },
+  workspaceSame: { zh: '本会话已经在这个目录', en: 'This conversation already runs there' },
+  workspaceRefused: { zh: '这个目录不能用作工作区', en: 'That directory cannot be a workspace' },
   presetFailed: { zh: '切换失败，看操作台日志', en: 'The switch failed; see the operator console' },
   presetQueued: {
     zh: '已记下，当前这轮任务结束后生效',

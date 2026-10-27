@@ -17,6 +17,7 @@
  * @module dsh-lark-channel/questions
  */
 
+import { randomUUID } from 'node:crypto'
 import {
   questionCard as buildQuestionCard,
   settledQuestionCard as buildSettledQuestionCard,
@@ -27,6 +28,20 @@ export const QUESTION_ACTION = 'dsh-lark-channel/question'
 
 /** How long a question waits for its human before the tool gives up. */
 export const QUESTION_TIMEOUT_MS = 30 * 60 * 1000
+
+/**
+ * One press of a question button, as the authorization check needs it.
+ *
+ * The chat is what makes a press this question's own: a card can be forwarded
+ * and its payload travels with it, so nothing inside the payload can say where
+ * the press happened.
+ */
+export interface QuestionClick {
+  /** The chat the press arrived in. */
+  readonly chatId: string
+  /** Who pressed, when the callback named them. */
+  readonly operatorId?: string | undefined
+}
 
 /** One choice the model offered. */
 export interface QuestionOption {
@@ -47,10 +62,39 @@ export interface AskedQuestion {
 /** One answer, in the shape the host's own tool returns. */
 export interface QuestionAnswer {
   readonly id: string
-  /** Labels the human chose; empty when they typed instead or declined. */
-  readonly selected: string[]
+  /**
+   * Labels the human chose; empty when they typed instead or declined.
+   *
+   * Read-only because an answer that arrived from another surface is the host's
+   * own value: this channel reads it into a card and hands it straight back, so
+   * nothing here may write to it.
+   */
+  readonly selected: readonly string[]
   /** Free text the human typed, when they did. */
-  readonly custom?: string
+  readonly custom?: string | undefined
+}
+
+/**
+ * One question batch as this channel tracks it while both surfaces are live.
+ *
+ * `decided` is set the instant the other surface claims the batch, so the loop
+ * working through its questions can stop before it opens a card for a question
+ * that has already been answered elsewhere.
+ */
+export interface ChatQuestionBatch {
+  /** The conversation whose cards this batch owns. */
+  readonly sessionId: string
+  /**
+   * The question ids this batch opened cards for.
+   *
+   * A batch is what a settlement belongs to. A model writes question ids and
+   * reuses them across batches, so matching a settlement against every open
+   * card of a conversation by id alone would settle an older batch's card with
+   * a newer batch's answers; this set is the batch's own membership.
+   */
+  readonly questionIds: readonly string[]
+  /** Whether another surface has already answered the batch. */
+  decided: boolean
 }
 
 /** Card payload carried by one option choice, or by a submitted set of them. */
@@ -115,13 +159,19 @@ export function questionCard(question: AskedQuestion, id: string): object {
  */
 export function settledQuestionCard(
   question: AskedQuestion,
-  outcome: { readonly answer?: string | undefined; readonly cancelled?: boolean },
+  outcome: {
+    readonly answer?: string | undefined
+    readonly cancelled?: boolean
+    /** Whether another surface answered, so no press happened in this chat. */
+    readonly elsewhere?: boolean | undefined
+  },
 ): object {
   return buildSettledQuestionCard({
     question: question.question,
     header: question.header,
     answer: outcome.answer,
     cancelled: outcome.cancelled,
+    ...outcome.elsewhere === true ? { elsewhere: true } : {},
   })
 }
 
@@ -133,6 +183,19 @@ export interface QuestionPorts {
   update(messageId: string, card: object): Promise<void>
   /** Operator console line. */
   report(line: string): void
+  /**
+   * Whether one press may settle a question that carries approver semantics.
+   *
+   * Asked only for the questions this store was told to gate
+   * ({@link ChatQuestions.ask}'s `requiresApprover`), and answered by the same
+   * rule an approval click faces: a question that releases a plan is an
+   * escalation of sorts, and a deployment that named approvers has said who may
+   * grant it. Absent means the deployment composes no such rule, and every press
+   * the chat admits counts.
+   * @param click - who pressed, and where.
+   * @returns the refusal for the operator log, or undefined when the press counts.
+   */
+  refuseApprover?(click: QuestionClick): string | undefined
 }
 
 /** One question waiting for its human. */
@@ -140,6 +203,24 @@ interface Pending {
   readonly sessionId: string
   readonly chatId: string
   readonly question: AskedQuestion
+  /**
+   * Whether this question carries approver semantics.
+   *
+   * Read at press time, because the rule it names can only be answered by the
+   * deployment: a plan review releases a plan the model then executes, which is
+   * the one question here that grants something rather than merely informing.
+   */
+  readonly requiresApprover: boolean
+  /**
+   * The card this question is on, once a send named one.
+   *
+   * One id, because a send that rejects is the only way to get a second card —
+   * and such a send never names the card it may have rendered. The retry's own
+   * card is therefore the one this question knows, and it is repainted on every
+   * settle. A first attempt that rendered a card and still rejected leaves one
+   * card this store cannot name; the retry is still the right trade, because a
+   * rare duplicate beats a question nobody was ever asked.
+   */
   messageId?: string | undefined
   settled: boolean
   settle(answer: QuestionAnswer): void
@@ -153,7 +234,6 @@ interface Pending {
  */
 export class ChatQuestions {
   private readonly pending = new Map<string, Pending>()
-  private counter = 0
 
   constructor(private readonly ports: QuestionPorts) {}
 
@@ -176,15 +256,30 @@ export class ChatQuestions {
     readonly question: AskedQuestion
     readonly signal?: AbortSignal | undefined
     readonly timeoutMs?: number | undefined
+    /**
+     * Whether a press must also satisfy the deployment's approver rule.
+     *
+     * Set for the questions that grant something — the plan review releases the
+     * plan the model then executes — so a deployment that narrowed who may
+     * approve an escalation gets the same narrowing here. Ordinary questions
+     * leave it off: they inform a decision the chat is already allowed to make.
+     */
+    readonly requiresApprover?: boolean | undefined
   }): Promise<QuestionAnswer> {
-    this.counter += 1
-    const id = `q${this.counter}`
+    // A turn that was already cancelled must not be asked: `AbortSignal` does
+    // not replay for a listener added late, so without this the card would go
+    // out, the tool would park for its whole timeout, and a press in that
+    // window would decide a turn nobody is running. The sibling askers in
+    // `bridge.ts` guard the same way, for the same reason.
+    if (input.signal?.aborted === true) return { id: input.question.id, selected: [] }
+    const id = `q-${randomUUID()}`
     let settle!: (answer: QuestionAnswer) => void
     const answered = new Promise<QuestionAnswer>((resolve) => { settle = resolve })
     const entry: Pending = {
       sessionId: input.sessionId,
       chatId: input.chatId,
       question: input.question,
+      requiresApprover: input.requiresApprover === true,
       settled: false,
       settle,
     }
@@ -203,16 +298,44 @@ export class ChatQuestions {
     )
     timer.unref?.()
 
+    /**
+     * Send one card, remember it, and repaint it at once when the question
+     * settled while the send was in flight.
+     *
+     * Shared by the first attempt and its retry: the retry used to skip this
+     * repaint, so a question settled during a slow second send left a freshly
+     * rendered card offering a press that could no longer decide anything.
+     */
+    const post = async (): Promise<void> => {
+      const messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
+      entry.messageId = messageId
+      if (!entry.settled) return
+      // Settled while the card was in flight; paint what the platform just
+      // rendered so no live buttons are left behind. Caught like the repaint in
+      // `finish`: this runs off no caller's await, and an unhandled rejection
+      // here is a process-level fault for one failed card.
+      void this.ports.update(messageId, settledQuestionCard(input.question, { cancelled: true }))
+        .catch((error: unknown) => {
+          this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
+        })
+    }
+
     try {
-      entry.messageId = await this.ports.send(input.chatId, questionCard(input.question, id))
-      if (entry.settled) {
-        // Settled while the card was in flight; paint what the platform just
-        // rendered so no live buttons are left behind.
-        void this.ports.update(entry.messageId, settledQuestionCard(input.question, { cancelled: true }))
-      }
+      await post()
     } catch (error) {
-      this.ports.report(`lark-channel: sending a question card failed: ${String(error)}`)
-      this.finish(id, { id: input.question.id, selected: [] }, false)
+      // One retry, because a card send fails transiently far more often than it
+      // fails permanently. A question that still cannot be delivered answers
+      // empty — the host's answer shape carries no error channel, and putting
+      // this channel's words into the human's answer would be worse than the
+      // silence — so the operator gets the reason here, which is the only place
+      // that can hold it.
+      this.ports.report(`lark-channel: sending a question card failed, retrying once: ${String(error)}`)
+      try {
+        await post()
+      } catch (retry: unknown) {
+        this.ports.report(`lark-channel: sending a question card failed again, so no answer was asked for: ${String(retry)}`)
+        this.finish(id, { id: input.question.id, selected: [] }, false)
+      }
     }
 
     try {
@@ -227,11 +350,35 @@ export class ChatQuestions {
   /**
    * Answer by clicking an option.
    * @param value - the parsed card action.
+   * @param click - who pressed, and the chat the press arrived in.
+   * @param chosen - option positions a form submission carried, when it did.
    * @returns whether it settled a live question.
    */
-  answerByClick(value: QuestionActionValue, chosen?: readonly string[]): object | undefined {
+  answerByClick(value: QuestionActionValue, click: QuestionClick, chosen?: readonly string[]): object | undefined {
     const entry = this.pending.get(value.id)
     if (entry === undefined || entry.settled) return undefined
+    // The press has to arrive in the chat the card was published to. A card can
+    // be forwarded and its payload travels with it, so the chat is the one
+    // check a forwarded press cannot satisfy — and without it a press in another
+    // room would answer a question this room was asked.
+    if (click.chatId !== entry.chatId) {
+      this.ports.report(
+        `lark-channel: ignored a question click from chat ${click.chatId}; the card was published to ${entry.chatId}`,
+      )
+      return undefined
+    }
+    // A question that grants something also faces the deployment's approver
+    // rule, which is the same narrowing an approval click meets. Asked here
+    // rather than at the dispatch site because the chat check above is the only
+    // other thing this press has to satisfy, and both belong to the store that
+    // owns the pending entry.
+    if (entry.requiresApprover) {
+      const refusal = this.ports.refuseApprover?.(click)
+      if (refusal !== undefined) {
+        this.ports.report(`lark-channel: rejected a question click: ${refusal}`)
+        return undefined
+      }
+    }
     if (value.option === SUBMIT_OPTION) return this.answerBySubmission(value.id, entry, chosen ?? [])
     const option = (entry.question.options ?? [])[value.option]
     if (option === undefined) return undefined
@@ -257,8 +404,15 @@ export class ChatQuestions {
    */
   private answerBySubmission(id: string, entry: Pending, chosen: readonly string[]): object | undefined {
     const options = entry.question.options ?? []
-    const picked = [...new Set(chosen)]
-      .map(index => options[Number(index)])
+    // Read as positions and only as positions: `Number('')` is 0 and
+    // `Number('0x1')` is 1, so a non-canonical entry would otherwise select the
+    // FIRST option — the approve label, on a plan card — while this method's
+    // contract says an unreadable submission is refused rather than answered.
+    const positions = chosen
+      .map(position => (/^(?:0|[1-9][0-9]*)$/.test(position) ? Number(position) : Number.NaN))
+      .filter(position => Number.isSafeInteger(position))
+    const picked = [...new Set(positions)]
+      .map(position => options[position])
       .filter((option): option is QuestionOption => option !== undefined)
       .map(option => option.label)
     if (picked.length === 0) return undefined
@@ -295,13 +449,59 @@ export class ChatQuestions {
   }
 
   /**
+   * Retire this chat's cards for one batch because another surface answered it.
+   *
+   * The same question is offered in the chat and on whatever surface the host
+   * asks besides it — the Web app's panel, in the deployment this was built for
+   * — and the first answer is the one the tool receives. When the other one
+   * wins, the card left here can no longer decide anything, so it is settled
+   * into the answer that actually arrived rather than left inviting a press that
+   * would be discarded.
+   *
+   * `run.decided` is set FIRST: the batch loop shares this object and must stop
+   * before it opens a card for a question the other surface has already
+   * answered. A batch claimed mid-flight therefore has fewer cards than
+   * questions, which is correct — the remaining ones were never shown.
+   *
+   * Only this batch's own cards are touched: membership is the ids the batch
+   * opened, not every card the conversation happens to hold. A model reuses
+   * question ids, so matching a settlement against the conversation at large
+   * would settle an older batch's card with this batch's answers.
+   * @param run - the batch being offered, marked decided by this call.
+   * @param answers - the answers the other surface gave, by question id.
+   */
+  settleElsewhere(run: ChatQuestionBatch, answers: readonly QuestionAnswer[]): void {
+    run.decided = true
+    const own = new Set(run.questionIds)
+    for (const [id, entry] of this.pending) {
+      if (entry.sessionId !== run.sessionId || entry.settled) continue
+      // Only the cards THIS batch opened. Another batch's card in the same
+      // conversation is a different request, and closing it here would paint
+      // answers nobody gave it onto a question that is still waiting.
+      if (!own.has(entry.question.id)) continue
+      const settled = answers.find(candidate => candidate.id === entry.question.id)
+        ?? { id: entry.question.id, selected: [] }
+      this.finish(id, settled, false, shownAnswer(settled), true, true)
+    }
+  }
+
+  /**
    * Settle one question exactly once and repaint its card.
    * @param repaint - false when the caller paints the card itself, which a
    * click does through its own response — the only repaint path that cannot
    * fail silently, since the patch API reports business errors in a body the
    * SDK discards rather than by rejecting.
+   * @param elsewhere - whether another surface gave this answer, so the card
+   * names where it came from instead of implying a press happened here.
    */
-  private finish(id: string, answer: QuestionAnswer, cancelled: boolean, shown?: string, repaint = true): boolean {
+  private finish(
+    id: string,
+    answer: QuestionAnswer,
+    cancelled: boolean,
+    shown?: string,
+    repaint = true,
+    elsewhere = false,
+  ): boolean {
     const entry = this.pending.get(id)
     if (entry === undefined || entry.settled) return false
     entry.settled = true
@@ -309,7 +509,9 @@ export class ChatQuestions {
     if (repaint && entry.messageId !== undefined) {
       const card = settledQuestionCard(
         entry.question,
-        cancelled ? { cancelled: true } : { answer: shown ?? '' },
+        cancelled
+          ? { cancelled: true }
+          : { answer: shown ?? '', ...elsewhere ? { elsewhere: true } : {} },
       )
       void this.ports.update(entry.messageId, card).catch((error: unknown) => {
         this.ports.report(`lark-channel: repainting a settled question failed: ${String(error)}`)
@@ -320,116 +522,10 @@ export class ChatQuestions {
 }
 
 /**
- * The shadow tool definition, declared structurally like every other host
- * contract here so the package keeps building against two published packages
- * alone — the host's `defineTool` would drag its whole runtime closure into
- * this repository to construct one object.
- *
- * Both schemas are therefore written in their COMPILED form: real JSON Schema
- * with `required` as an array on each object. `defineTool` exists to perform
- * exactly that conversion from a per-property spec, and a definition written in
- * the spec form is rejected by the registry — which is the contract that
- * matters, and which validates this at registration.
- *
- * The schema mirrors the host's own `ask_user_question` so a model that learned
- * the tool from any other surface calls this one the same way. Arguments are
- * normalized rather than rejected: a question with a slightly-off shape is
- * still worth asking, where a schema error would just fail the turn.
- * @param ask - asks one question and resolves with its answer.
- * @returns the definition to register in an agent's scope.
+ * How one settled answer reads on its card.
+ * @param answer - the answer that arrived.
+ * @returns the labels joined for display, or the typed text when it chose none.
  */
-export function shadowQuestionTool(
-  ask: (questions: readonly AskedQuestion[], agentSessionId: string | undefined) => Promise<QuestionAnswer[]>,
-): object {
-  return {
-    name: 'ask_user_question',
-    description:
-      'Ask the user a concise question when you need confirmation, a choice, or missing information '
-      + 'before proceeding. Each question needs a stable id that is echoed in the answer. Offer options '
-      + 'when the choice is between known alternatives; the user may also answer in their own words.',
-    parameters: {
-      type: 'object',
-      required: ['questions'],
-      properties: {
-        questions: {
-          type: 'array',
-          description: 'Questions to ask the user before continuing.',
-          items: {
-            type: 'object',
-            additionalProperties: true,
-            required: ['id', 'question'],
-            properties: {
-              id: { type: 'string', description: 'Stable id for this question; echoed in the answer.' },
-              question: { type: 'string', description: 'The specific question to ask.' },
-              header: { type: 'string', description: 'Optional short heading.' },
-              options: {
-                type: 'array',
-                description: 'Optional choices to show the user.',
-                items: {
-                  type: 'object',
-                  additionalProperties: true,
-                  required: ['label'],
-                  properties: {
-                    label: { type: 'string', description: 'Short user-facing option label.' },
-                    description: { type: 'string', description: 'One sentence on the tradeoff.' },
-                  },
-                },
-              },
-              multi_select: { type: 'boolean', description: 'Whether several options may be chosen.' },
-            },
-          },
-        },
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['answers'],
-        properties: {
-          answers: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['id', 'selected'],
-              properties: {
-                id: { type: 'string' },
-                selected: { type: 'array', items: { type: 'string' } },
-                custom: { type: 'string' },
-              },
-            },
-          },
-        },
-      },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
-    },
-    async execute(args: unknown, exec: unknown): Promise<{ answers: QuestionAnswer[] }> {
-      // Total by construction. Without `defineTool`'s validating wrapper this
-      // body IS the validation, and a malformed call must degrade to asking
-      // nothing rather than throwing inside the model's turn.
-      const supplied = (args as { questions?: unknown } | null | undefined)?.questions
-      const raw = (Array.isArray(supplied) ? supplied : []).filter(
-        (entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null,
-      )
-      const questions: AskedQuestion[] = raw.map(entry => ({
-        id: String(entry.id ?? ''),
-        question: String(entry.question ?? ''),
-        ...typeof entry.header === 'string' ? { header: entry.header } : {},
-        ...Array.isArray(entry.options)
-          ? {
-              options: entry.options
-                .filter((option): option is Record<string, unknown> => typeof option === 'object' && option !== null)
-                .map(option => ({
-                  label: String(option.label ?? ''),
-                  ...typeof option.description === 'string' ? { description: option.description } : {},
-                })),
-            }
-          : {},
-        ...typeof entry.multi_select === 'boolean' ? { multiSelect: entry.multi_select } : {},
-      }))
-      const sessionId = (exec as { agent?: { session?: { id?: string } } }).agent?.session?.id
-      return { answers: await ask(questions, sessionId) }
-    },
-  }
+function shownAnswer(answer: QuestionAnswer): string {
+  return answer.selected.length > 0 ? answer.selected.join('、') : answer.custom ?? ''
 }

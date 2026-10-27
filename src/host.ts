@@ -10,17 +10,30 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 
-/** The live session a host agent drives; only the identity is read here. */
+/**
+ * The live session a host agent drives; only the identity is read here.
+ *
+ * The log is deliberately absent: a plugin that folds state out of raw events
+ * duplicates a rule the owning service already publishes, and DSH deprecates
+ * the synchronous event reads that made it possible.
+ */
 export interface HostSession {
   /** The session id shared by the agent registry and session log. */
   readonly id: string
-  /**
-   * The session log, which several host services fold their own state out of
-   * rather than mirroring it. Read-only here: this plugin folds plan mode from
-   * it to know whether a plan review is even meaningful.
-   */
-  readonly events?: readonly HostSessionEvent[]
 }
+
+/**
+ * Why an active agent driver was cancelled, as the host records it.
+ *
+ * A structured cause, not a label: the host switches on `kind` when it writes
+ * the turn's end reason and refuses an unrecognized value there, so a bare
+ * string aborts the turn and then throws while the reason is being recorded.
+ */
+export type HostCancelCause =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'hook'; readonly reason: string }
+  | { readonly kind: 'disposed' }
 
 /** Durable metadata for one stored image, from {@link HostAttachments.saveImage}. */
 export interface HostImageRef {
@@ -107,6 +120,17 @@ export interface HostSessionRecord {
     readonly delegationDepth?: number
     /** The session this one was forked from, when it was forked at all. */
     readonly parentSession?: string
+    /**
+     * The Session format generation this log was written in.
+     *
+     * A projection-cache record is bound to the generation that folded it, so a
+     * header that cannot name one cannot witness a cache row either. Absent on a
+     * listing older than the field, which reads as "no cache read" rather than as
+     * a wrong one.
+     */
+    readonly version?: number
+    /** Whether the log carries a fork-inherited prefix; the cache binds to it. */
+    readonly isSeeded?: boolean
   }
   /** Whether an agent currently drives this id. */
   readonly live?: boolean
@@ -183,8 +207,9 @@ export interface HostAgent {
   /**
    * Clear queued work and abort the active turn. A no-op when nothing is
    * active, so a chat may offer it unconditionally.
+   * @param cause - the structured reason the host records on the turn's end.
    */
-  cancel(cause: string): void
+  cancel(cause: HostCancelCause): void
   /**
    * Resolve once the agent has no driver or maintenance task running.
    * Optional here because the contract reaches this plugin as an object rather
@@ -320,8 +345,19 @@ export interface HostCommands {
    * Run one complete slash-command line. Resolves `undefined` when the syntax
    * or the name does not resolve, which is what distinguishes an unknown
    * command from one that ran and failed.
+   * @param agent - the agent whose session the command runs against.
+   * @param line - the complete line, slash included.
+   * @param submittedAttachments - images and staged file receipts the
+   * submission carried, in order; empty for a plain invocation, which is the
+   * only kind this channel submits.
+   * @param signal - cancellation for the execution.
    */
-  execute(agent: HostAgent, line: string, signal: AbortSignal): Promise<HostCommandExecution | undefined>
+  execute(
+    agent: HostAgent,
+    line: string,
+    submittedAttachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<HostCommandExecution | undefined>
 }
 
 /** The `systemPrompt` assembler, as this plugin's per-agent composition uses it. */
@@ -353,9 +389,25 @@ export interface HostAgentPresets {
   /**
    * The standing scope key a reader with no agent resolves this preset's
    * registrations in — the view that holds its tools, since a roster keeps
-   * every model-facing row off the global layer.
+   * every model-facing row off the global layer. Handed over outright, with no
+   * lease to return; a host that publishes this alone predates
+   * {@link acquireScope}. Read only through {@link standingScopeFor}.
    */
-  standingKeyFor(id?: string): Promise<unknown>
+  standingKeyFor?(id?: string): Promise<unknown>
+  /**
+   * The same standing scope key, lent as a revision lease the caller disposes
+   * once its scoped read is over. A host publishing this returns the key on the
+   * lease rather than on its own promise, and publishes no `standingKeyFor`.
+   */
+  acquireScope?(id?: string): Promise<StandingScopeLease>
+}
+
+/** One preset's standing view, lent for as long as a reader needs it. */
+export interface StandingScopeLease {
+  /** The scope key every scoped read passes to the tool registry. */
+  readonly key: unknown
+  /** Returns the lease; absent when the host handed the key over outright. */
+  [Symbol.asyncDispose]?(): Promise<void>
 }
 
 /** One workspace record (subset of the host `Workspace` entity). */
@@ -389,7 +441,10 @@ export interface HostWorkspaceRegistry {
   list?(): readonly HostWorkspace[]
   /**
    * Sessions the operator archived: the host's own "hide this from every
-   * grouping surface". Optional for the same reason as {@link list}.
+   * grouping surface". Optional for the same reason as {@link list}. A chat
+   * whose session is in this set is refused rather than restored: lifting an
+   * archive is the operator's decision, and the host's admission gate is what
+   * enforces it.
    */
   readonly archivedSessionIds?: readonly string[]
 }
@@ -428,21 +483,83 @@ export interface HostLoader {
   await(): Promise<unknown>
 }
 
-/** One registered namespace's owner scope (subset of the host `SettingsScope`). */
-export interface HostSettingsScope {
-  /** The resolved value: schema defaults, then composition base, then the user document. */
-  get(): unknown
-  /** Deep-merge a patch into the user section and persist it through the provider. */
-  update(patch: object): Promise<unknown>
+/**
+ * One Loader row's live settings, as the host's `describe()` publishes it.
+ *
+ * The namespace is the row's own `id:` in the profile's configuration tree, and
+ * `value` is that row's effective config projected onto the fields its schema
+ * marks volatile. A row with no volatile field is absent from the list.
+ */
+export interface HostSettingsDescriptor {
+  /** The row's configuration-tree id, which is the namespace every write names. */
+  readonly ns: string
+  /** The row's effective config, volatile fields only. */
+  readonly value?: unknown
+  /**
+   * The part of that config the USER document itself supplies, when published.
+   *
+   * The difference between this and {@link HostSettingsDescriptor.value} is what
+   * tells a secret a deployment injected from one this plugin's onboarding
+   * wrote: migration must move the second and leave the first with its owner.
+   * Optional because an older seam publishes the effective value alone.
+   */
+  readonly user?: unknown
+  /** Monotonic revision, for a caller that wants to fence its write. */
+  readonly revision?: number
 }
 
-/** The `settings` user-settings service (subset of `SettingsProvider`). */
+/**
+ * The `settings` service (subset of the host `SettingsForms`).
+ *
+ * Writes go to the PROFILE's patch document and only touch fields the row's own
+ * schema marks volatile; the host refuses anything else. This channel therefore
+ * keeps its managed state on those fields, and a deployment whose row declares
+ * none gets an in-memory channel with one line saying so (see
+ * `settings-store.ts`).
+ */
 export interface HostSettings {
+  /** Every configurable row's live volatile config, in tree order. */
+  describe(options?: unknown): readonly HostSettingsDescriptor[]
+  /** Deep-merge one patch into a row's section and persist it. */
+  update(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  /** Replace a row's section outright, keeping the inherited base underneath. */
+  replace(ns: string, section: object, expectedRevision?: number): Promise<void>
+}
+
+/** One projection block, as either cache face serves it. */
+export interface HostProjectionBlock {
+  /** The log position the served values have folded through at least. */
+  readonly asOfSeq: number
+  /** Whole values per projection key; a key with no usable row is absent. */
+  readonly values: Record<string, unknown>
+}
+
+/**
+ * The `sessionProjectionCache` service (subset).
+ *
+ * The host folds every registered projection over each session log anyway, and
+ * checkpoints the result durably. Reading those rows back is the one way to
+ * label a session without opening its log at all: the values are as stale as
+ * the last checkpoint and never wrong, which is the same bargain the host's own
+ * session list makes.
+ */
+export interface HostSessionProjectionCache {
   /**
-   * Register a namespace schema; the registration is an effect on the calling
-   * fiber. Duplicate namespaces and stored sections the schema rejects fail loud.
+   * The stored rows bound to one listed header's lifecycle.
+   * @param meta - the listed header; its format generation and lineage are the identity witness.
+   * @param keys - the projection keys the caller needs.
+   * @returns the block, or undefined when no usable row exists for this lifecycle.
    */
-  register(ns: string, schema: unknown, options?: { base?: unknown }): HostSettingsScope
+  cachedSnapshot(
+    meta: {
+      readonly id: string
+      readonly createdAt: number
+      readonly cwd?: string | undefined
+      readonly version?: number | undefined
+      readonly isSeeded?: boolean | undefined
+    },
+    keys?: readonly string[],
+  ): HostProjectionBlock | undefined
 }
 
 /**
@@ -460,6 +577,16 @@ export interface HostSessionProjections {
    * @returns the cut, keyed by projection, and the log position it answers for.
    */
   snapshot(session: HostSession): { readonly asOfSeq: number; readonly values: Record<string, unknown> }
+  /**
+   * Read only the cells this registry already materialized for one session,
+   * without folding history: the live face of the same rows the persisted cache
+   * serves to a listing. Optional because a deployment may compose a registry
+   * older than this read; a row then falls back to the stored rows or to the log.
+   * @param session - the attached session whose cached cells are inspected.
+   * @param keys - the projection keys the caller needs.
+   * @returns the lowest common cached cut, or undefined when no cell exists.
+   */
+  cachedSnapshot?(session: HostSession, keys?: readonly string[]): HostProjectionBlock | undefined
 }
 
 /** Whole-session token totals, as the host's `tokenUsage` projection reports them. */
@@ -526,6 +653,16 @@ export interface TurnStartData {
  */
 export interface UserMessageEventData {
   readonly id?: string
+  /**
+   * Where the message came from. A prompt minted by a browser client carries
+   * `rpcId`; this channel's own chat input and the host's synthetic context
+   * (skill catalogs, job notices, goal rounds) do not. That field is what lets
+   * the bridge mirror a browser prompt into a chat without echoing the chat's
+   * own input back to the person who typed it.
+   */
+  readonly source?: { readonly kind?: string; readonly rpcId?: string } | undefined
+  /** The model-facing blocks the prompt was recorded with. */
+  readonly content?: readonly { readonly type?: string; readonly text?: string }[] | undefined
 }
 
 /** The `assistant/chunk` payload fields this plugin streams. */
@@ -537,6 +674,31 @@ export interface AssistantChunkData {
    * deltas are raw JSON fragments reported through `tool/call` instead.
    */
   readonly chunk: { readonly type: string; readonly text?: string }
+}
+
+/**
+ * One ordered publication of an agent's live model output.
+ *
+ * Live output left the session log when `assistant/chunk` was retired: the loop
+ * now publishes it per agent, as a `start`, a series of `chunk`s, and one `end`.
+ * This channel translates each `chunk` frame back into {@link AssistantChunkData}
+ * so its renderers keep consuming one shape regardless of which host carried the
+ * text.
+ */
+export type AssistantStreamFrame =
+  | { readonly type: 'start'; readonly attemptId: string; readonly turn: number }
+  | { readonly type: 'chunk'; readonly attemptId: string; readonly chunk: AssistantChunkData['chunk'] }
+  | { readonly type: 'end'; readonly attemptId: string }
+
+/**
+ * The `agent/assistant-stream` payload fields this channel reads.
+ *
+ * Structural only: the agent's live session id names the conversation whose
+ * renderer receives the frame, and a frame that names no session is not ours.
+ */
+export interface AssistantStreamPayload {
+  readonly agent?: { readonly session?: { readonly id?: string } } | undefined
+  readonly frame?: AssistantStreamFrame | undefined
 }
 
 /** The `tool/result` payload fields a thinking process reports. */
@@ -680,6 +842,40 @@ export function assistantText(data: AssistantMessageData): string {
 }
 
 /**
+ * Read the standing scope one preset's registrations live in.
+ *
+ * Two host shapes publish this: `standingKeyFor` hands the key over outright,
+ * and its successor `acquireScope` lends the same key as a revision lease. One
+ * composition reads through here so the same deployment works on either, and
+ * the lease a newer host lends comes back to the caller, which owns releasing
+ * it for as long as it reads through the key.
+ * @param presets - the host preset roster.
+ * @param presetId - the resolved preset whose standing view is wanted.
+ * @returns the key and any lease the caller must dispose, or undefined when the
+ * host publishes neither reader.
+ */
+export async function standingScopeFor(
+  presets: HostAgentPresets,
+  presetId: string,
+): Promise<StandingScopeLease | undefined> {
+  if (presets.acquireScope !== undefined) return await presets.acquireScope(presetId)
+  if (presets.standingKeyFor !== undefined) return { key: await presets.standingKeyFor(presetId) }
+  return undefined
+}
+
+/**
+ * Render one recorded user prompt as the plain text a chat can read back.
+ * @param data - the `user/message` payload.
+ * @returns the prompt's text blocks joined in order, empty when it carries none.
+ */
+export function userText(data: UserMessageEventData): string {
+  return (data.content ?? [])
+    .filter(block => block.type === 'text' && block.text !== undefined && block.text !== '')
+    .map(block => block.text as string)
+    .join('')
+}
+
+/**
  * Render a failed turn's reason as one operator-readable line.
  * @param data - the closed turn payload.
  * @returns the error detail, empty when the turn did not fail.
@@ -692,6 +888,64 @@ export function turnErrorDetail(data: TurnEndData): string {
 
 /** Closed outcome of a host approval question; `'allowed-once'` is the only grant. */
 export type HostApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
+/** One choice a structured question offers, as the model wrote it. */
+export interface HostUserQuestionOption {
+  /** User-facing label the answer echoes back. */
+  readonly label: string
+  /** Optional extra context a capable UI renders beside the label. */
+  readonly description?: string | undefined
+}
+
+/** One question of a host structured-question request. */
+export interface HostUserQuestionItem {
+  /** Stable caller-provided identity, echoed in the answer. */
+  readonly id: string
+  /** The question to display. */
+  readonly question: string
+  /** Optional short heading the asker grouped it under. */
+  readonly header?: string | undefined
+  /** Optional supporting detail kept out of the option labels. */
+  readonly detail?: string | undefined
+  /** Choices offered, when the asker named any. */
+  readonly options?: readonly HostUserQuestionOption[] | undefined
+  /** Whether more than one option may be selected. Defaults to single-select. */
+  readonly multiSelect?: boolean | undefined
+}
+
+/**
+ * One structured question the host asks through its own answerer waterfall.
+ *
+ * The host's `ask_user_question` tool raises this whatever presentation answers
+ * it, so the channel's card and the Web app's panel are two offers of the SAME
+ * question rather than two tools with one name.
+ */
+export interface HostUserQuestionRequest {
+  /** The questions to display, in ask order. */
+  readonly questions: readonly HostUserQuestionItem[]
+  /** The agent the question is asked on behalf of; absent when the asker named none. */
+  readonly agent?: { readonly session: { readonly id: string } } | undefined
+  /** Cancellation lifetime of the pending question. */
+  readonly signal?: AbortSignal | undefined
+  /** Foreground-wait facts; present only for the opt-in timed tool. */
+  readonly wait?: { readonly callId: string; readonly timed?: boolean } | undefined
+}
+
+/** One answered question, in the shape the host's tool returns. */
+export interface HostUserQuestionAnswerItem {
+  /** The answered question's own id. */
+  readonly id: string
+  /** Labels chosen; empty when the human typed instead or skipped it. */
+  readonly selected: readonly string[]
+  /** Free text the human typed, when they did. */
+  readonly custom?: string | undefined
+}
+
+/** The answer to one structured-question request, as the waterfall returns it. */
+export interface HostUserQuestionAnswer {
+  /** One item per question asked. */
+  readonly answers: readonly HostUserQuestionAnswerItem[]
+}
 
 /** Readonly same-process permission question (subset of `ApprovalRequest`). */
 export interface HostApprovalRequest {
@@ -731,5 +985,26 @@ declare module '@deepseek-ai/cordis' {
       request: HostApprovalRequest,
       next: () => Promise<HostApprovalOutcome>,
     ): Promise<HostApprovalOutcome>
+    /**
+     * Ask composed answerers for structured user input. Return an answer to
+     * claim the request or call `next()` to delegate. Scope-filtered dispatch:
+     * an agent-scoped listener receives only that agent.
+     *
+     * Unlike `approval/request`, a chain nobody claims REJECTS: the innermost
+     * answerer throws rather than resolving a fail-closed outcome, so a listener
+     * that delegates and waits must treat rejection as "another surface will
+     * decide, or none will" rather than as an answer.
+     * @mode waterfall
+     */
+    'user-questions/request'(
+      request: HostUserQuestionRequest,
+      next: () => Promise<HostUserQuestionAnswer>,
+    ): Promise<HostUserQuestionAnswer>
+    /**
+     * One ordered publication of an agent's live model output. Agent-scoped:
+     * a listener receives only the agents whose frames reach its scope, and the
+     * payload's agent names the session whose renderer should read the frame.
+     */
+    'agent/assistant-stream'(payload: AssistantStreamPayload): void
   }
 }

@@ -9,13 +9,13 @@
  * @module dsh-lark-channel/commands
  */
 
-import type { HostAgent, HostCommands } from './host.ts'
+import type { HostAgent, HostCancelCause, HostCommands } from './host.ts'
 import { GET_COMMAND } from './outbound-file.ts'
 import { SESSIONS_COMMAND } from './sessions.ts'
 import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
-import { NEW_COMMAND } from './epoch.ts'
+import { NEW_COMMAND } from './new-session.ts'
 
 /** Cancel the running turn. Not a host command: cancellation is an agent method. */
 export const STOP_COMMAND = 'stop'
@@ -24,8 +24,12 @@ export const STOP_COMMAND = 'stop'
 export const HELP_COMMAND = 'help'
 
 
-/** The cause recorded when a chat cancels its own turn. */
-const CANCEL_CAUSE = 'user'
+/**
+ * The cause recorded when a chat cancels its own turn. The host reads the
+ * `kind` off this object when it writes the turn's end reason, so a label here
+ * would abort the turn and then throw while recording why.
+ */
+const CANCEL_CAUSE: HostCancelCause = { kind: 'user' }
 
 /** Leading slash plus the command name, the only part this module parses. */
 const COMMAND_LINE = /^\/([a-zA-Z][\w-]*)/
@@ -66,11 +70,11 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent): 
   const own = [
     `\`/${STOP_COMMAND}\` — 停止当前任务`,
     `\`/${CD_COMMAND} <路径>\` — 切换本会话的工作区目录`,
-    `\`/${WS_COMMAND}\` — 查看可用工作区`,
+    `\`/${WS_COMMAND}\` — 选择工作区，点一行即切换`,
     `\`/${GET_COMMAND} <路径>\` — 把工作区里的文件发到聊天`,
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
-    `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
+    `\`/${NEW_COMMAND}\` — 开一个新会话（全新 id），清空上下文`,
     `\`/${SESSIONS_COMMAND}\` — 列出可接续的会话，点一行就切过去`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]
@@ -110,7 +114,9 @@ export async function runCommandLine(
   if (commands === undefined) {
     return { reply: `⚠️ 本部署没有组合命令运行时，\`/${name}\` 无法执行。`, resolved: false }
   }
-  const execution = await commands.execute(agent, trimmed, signal)
+  // The host's `execute` takes the submission's attachments between the line and
+  // the signal; a chat's own command carries none, but the array has to be there.
+  const execution = await commands.execute(agent, trimmed, [], signal)
   if (execution === undefined) {
     return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent)}`, resolved: false }
   }

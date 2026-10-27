@@ -331,7 +331,10 @@ export function createStreamRenderer(
 
   const track = (settling: Promise<void>): void => {
     closing.add(settling)
-    void settling.finally(() => closing.delete(settling))
+    // `finally` re-throws what it passed through, so a settlement that rejected
+    // would leave an unhandled rejection on this detached chain — and the
+    // rejection is already reported where the turn was closed.
+    void settling.finally(() => closing.delete(settling)).catch(() => {})
   }
 
   /** The card's authoritative content: everything committed, plus this step's text. */

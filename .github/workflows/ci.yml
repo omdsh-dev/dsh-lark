@@ -10,13 +10,26 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      # Both platforms, because this package's behavior is platform-shaped: it
+      # writes a launchd plist or a systemd unit, spawns a Windows shim through
+      # cmd.exe, and splits paths the way the host does. A suite that only ever
+      # ran on Linux would keep its POSIX assumptions green while the Windows
+      # paths went untested.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to the commit each tag resolves to, not to the tag: a tag can be
+      # moved under a running build, and a workflow holding `contents: read` and
+      # an npm token is exactly where that matters. The comment keeps the tag
+      # legible so an update is a one-line change per action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -26,3 +39,9 @@ jobs:
 
       - run: pnpm typecheck
       - run: pnpm test
+
+      # The published artifacts are what a deployment installs, and nothing
+      # above builds them: `typecheck` emits types, `test` runs from source. A
+      # bundling or declaration regression would otherwise reach the registry
+      # through the release workflow's own `prepare` step.
+      - run: pnpm build

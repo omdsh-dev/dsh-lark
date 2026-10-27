@@ -107,6 +107,24 @@ function presetFor(instance?: string): Pick<RegisterAppRequest, 'source' | 'appP
 const EXPIRED_CODE = 'expired_token'
 
 /**
+ * The app id a deployment actually configured, or undefined when it configured
+ * none.
+ *
+ * The value arrives from configuration, where a deployment may have derived it
+ * from an unset environment variable — and a `!!js` expression that evaluates to
+ * nothing reaches the plugin as a non-string rather than as `undefined`. The
+ * registration flow refuses anything but a non-empty string (`appId must be a
+ * non-empty string`), so handing it one turns "no app is configured, scan this
+ * code to create one" into "registration failed" — the wrong instruction, on
+ * the one boot where the operator has to act.
+ * @param value - whatever configuration supplied.
+ * @returns the usable id, or undefined when there is none.
+ */
+export function configuredAppId(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
  * Shortest gap between two issued codes.
  *
  * A code that ran its course already took its full validity window, so this
@@ -199,8 +217,12 @@ export interface OnboardingRun {
   readonly persist: (app: OnboardedApp) => Promise<boolean>
   /** Continue with live credentials (connect the channel). */
   readonly onCredentials: (app: OnboardedApp) => void
-  /** An existing app to re-authorize, when the deployment configured an id but no secret. */
-  readonly appId?: string | undefined
+  /**
+   * An existing app to re-authorize, when the deployment configured an id but
+   * no secret. Whatever configuration supplied: only a non-empty string names
+   * an app, and {@link configuredAppId} is what decides that.
+   */
+  readonly appId?: unknown
   /** This row's instance name, which names the app it creates. */
   readonly instance?: string | undefined
   /** Overrides {@link REISSUE_FLOOR_MS}, so a test need not wait out a real one. */
@@ -227,10 +249,11 @@ export function beginOnboarding(run: OnboardingRun): void {
     const { signal } = controller
 
     /** Drive one code to a scan, or to the reason it produced none. */
-    const issue = async (round: number): Promise<Awaited<ReturnType<RegisterAppPort>>> =>
-      register({
+    const issue = async (round: number): Promise<Awaited<ReturnType<RegisterAppPort>>> => {
+      const existing = configuredAppId(appId)
+      return register({
         ...presetFor(run.instance),
-        ...appId === undefined || appId === '' ? {} : { appId },
+        ...existing === undefined ? {} : { appId: existing },
         signal,
         onQRCodeReady({ url, expireIn }) {
           const minutes = String(Math.round(expireIn / 60))
@@ -249,6 +272,7 @@ export function beginOnboarding(run: OnboardingRun): void {
           })
         },
       })
+    }
 
     void (async () => {
       for (let round = 0; !signal.aborted; round++) {

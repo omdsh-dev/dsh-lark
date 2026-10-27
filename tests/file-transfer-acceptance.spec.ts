@@ -15,7 +15,7 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
 import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NormalizedMessage } from '@larksuite/channel'
 import { Config } from '../src/config.ts'
@@ -171,7 +171,10 @@ describe('file transfer · inbound files belong to the workspace', () => {
 
     await harness.fake.emitMessage(fakeMessage({ content: `/cd ${second}`, messageId: 'om_cd' }))
     await vi.waitFor(() => {
-      expect(harness.fake.sent.map((message) => JSON.stringify(message.input)).join()).toContain(second)
+      // Searched in the spelling this actually holds, which is JSON: a Windows
+      // separator arrives escaped there, so the raw path could never match.
+      expect(harness.fake.sent.map((message) => JSON.stringify(message.input)).join())
+        .toContain(JSON.stringify(second).slice(1, -1))
     })
 
     await harness.fake.emitMessage(
@@ -179,8 +182,8 @@ describe('file transfer · inbound files belong to the workspace', () => {
     )
     await consumed(harness, 1, 1)
 
-    expect((await landedFiles(first)).map((path) => path.split('/').pop())).toEqual(['before.log'])
-    expect((await landedFiles(second)).map((path) => path.split('/').pop())).toEqual(['after.log'])
+    expect((await landedFiles(first)).map((path) => basename(path))).toEqual(['before.log'])
+    expect((await landedFiles(second)).map((path) => basename(path))).toEqual(['after.log'])
     await harness.dispose()
   })
 
@@ -202,7 +205,7 @@ describe('file transfer · inbound files belong to the workspace', () => {
     )
     await consumed(harness, 1, 1)
 
-    const landed = (await landedFiles(workspace)).map((path) => path.split('/').pop())
+    const landed = (await landedFiles(workspace)).map((path) => basename(path))
     expect(landed.sort()).toEqual(['new.log', 'old.log'])
     await harness.dispose()
   })
@@ -252,7 +255,9 @@ describe('file transfer · a hostile name cannot leave the inbox', () => {
     const landed = await landedFiles(workspace)
     expect(landed).toHaveLength(1)
     const path = landed[0]!
-    const name = path.split('/').pop()!
+    // `basename`, not `split('/')`: the landing path is built with `join`, so on
+    // Windows it separates with `\` and the split would hand back the whole path.
+    const name = basename(path)
 
     // The properties that matter, and that hold on every platform: the name
     // carries no separator of either family, and the bytes sit under the inbox
@@ -266,7 +271,7 @@ describe('file transfer · a hostile name cannot leave the inbox', () => {
     await harness.dispose()
   })
 
-  // Exact names, only where POSIX `basename` makes the outcome deterministic.
+  // Exact names, only where both platforms agree on what `basename` yields.
   // A backslash path is deliberately absent: `basename` does not treat `\` as a
   // separator off Windows, so the name it yields is platform-dependent —
   // safe either way, which is what the case above pins.
@@ -280,7 +285,7 @@ describe('file transfer · a hostile name cannot leave the inbox', () => {
     await harness.fake.emitMessage(withFiles(harness, [{ fileKey: 'fk_n', fileName: hostile, bytes: 'x' }]))
     await consumed(harness, 0, 1)
 
-    expect((await landedFiles(workspace))[0]!.split('/').pop()).toBe(expected)
+    expect(basename((await landedFiles(workspace))[0]!)).toBe(expected)
     await harness.dispose()
   })
 })

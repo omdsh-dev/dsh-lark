@@ -42,3 +42,19 @@ export function clickMark(): string {
 export function marked<T extends object>(value: T): T & { readonly a: string } {
   return { a: clickMark(), ...value }
 }
+
+/**
+ * Stamp every button of ONE rendering with that rendering's mark.
+ *
+ * {@link marked} gives each button its own mark, which is what keeps a redrawn
+ * card pressable. A card whose controls are jointly single-use needs the
+ * opposite: the mark has to name the RENDERING, so a press anywhere on that
+ * card is recognizably the same card and the first pick can retire all of it.
+ * Each button's payload still differs by its own fields, so the redelivery
+ * check is unaffected.
+ * @returns a stamper bound to one rendering.
+ */
+export function cardMarker(): <T extends object>(value: T) => T & { readonly a: string } {
+  const mark = clickMark()
+  return value => ({ a: mark, ...value })
+}

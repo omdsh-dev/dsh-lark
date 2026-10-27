@@ -297,35 +297,45 @@ export async function collectInboundFiles(
   // canonical are two different directories whenever a link sits between them,
   // and a proof taken on one of them says nothing about the other.
   let directory: string
+  const container = canonicalPathOf(options.workspace) ?? resolve(options.workspace)
+  // The chain is created one level at a time, and each level is PROVEN inside
+  // the workspace before the next one exists. `mkdir(recursive)` cannot do that:
+  // it follows a link and builds the whole chain inside whatever it points at,
+  // and a proof taken afterwards cannot undo what has already been made — a
+  // `.dsh-lark/inbox` pointing elsewhere took `mkdir` with it, and the sender's
+  // next file landed in the link's target under a name the sender chose. What
+  // this walk creates is remembered, so a failure removes exactly that.
+  const created: string[] = []
   try {
-    // The transport streams into an existing directory; it does not make one.
-    await mkdir(requested, { recursive: true })
-    // And the directory it just made has to be PROVEN inside the workspace
-    // rather than merely spelled that way. The sanitizer cannot see a symlink —
-    // it judges one name, while `resolve` and `join` fold `..` and then answer
-    // "inside the workspace" for a path whose own components lead anywhere at
-    // all: a `.dsh-lark/inbox` pointing elsewhere takes `mkdir` with it, and
-    // the sender's next file lands in the link's target under a name the sender
-    // chose. So containment is asked of the filesystem and not of the string,
-    // the same way outbound refuses to trust a path it has not canonicalized
-    // (ADR 0004) — and a write earns that question at least as much as a read.
-    //
-    // The canonical form is then KEPT and joined onto, because a proof is only
-    // worth anything on the path the bytes actually travel: writing through
-    // `requested` after canonicalizing it would leave the same link free to be
-    // swapped in between the check and the download, and the check would have
-    // been about a directory nothing was written to.
-    const landing = realpathSync(requested)
-    const container = canonicalPathOf(options.workspace) ?? resolve(options.workspace)
-    if (!isWithinContainer(landing, container)) {
-      throw new Error('the inbox directory does not resolve inside the workspace')
+    let parent = container
+    for (const part of [CHANNEL_DIRECTORY, INBOX_DIRECTORY, basename(requested)]) {
+      const candidate = join(parent, part)
+      try {
+        await mkdir(candidate)
+        created.push(candidate)
+      } catch (error) {
+        // Already there: another message's landing, or a directory an operator
+        // made. Every other failure is this attempt's to report.
+        if ((error as { code?: unknown } | null)?.code !== 'EEXIST') throw error
+      }
+      const canonical = realpathSync(candidate)
+      if (!isWithinContainer(canonical, container)) {
+        throw new Error(`${CHANNEL_DIRECTORY}/${INBOX_DIRECTORY} does not resolve inside the workspace`)
+      }
+      // The canonical form is then KEPT and joined onto, because a proof is only
+      // worth anything on the path the bytes actually travel: writing through
+      // the spelled path after canonicalizing it would leave the same link free
+      // to be swapped in between the check and the download, and the check would
+      // have been about a directory nothing was written to.
+      parent = canonical
     }
-    directory = landing
+    directory = parent
   } catch (error) {
     const detail = failureDetail(error)
     // Nothing was downloaded, so whatever this attempt did create is an empty
-    // directory nobody was promised — including one made through a link.
-    await discardDirectory(requested)
+    // directory nobody was promised. Deepest first, and `rmdir` rather than a
+    // recursive remove: a level holding anything refuses to go.
+    for (const path of created.reverse()) await discardDirectory(path)
     options.report(`lark-channel: could not create the inbox directory ${requested}: ${detail}`)
     return {
       landed: [],

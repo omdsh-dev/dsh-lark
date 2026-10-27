@@ -18,6 +18,7 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
+  ARCHIVED_SESSION_NOTICE,
   sessionsCard,
   fileApprovalCard as buildFileApprovalCard,
   QUESTION_SELECT,
@@ -25,9 +26,12 @@ import {
   settledApprovalCard as buildSettledApprovalCard,
   settledFileApprovalCard as buildSettledFileApprovalCard,
   settledPermissionCard,
+  settledSessionsCard,
   toast,
   TOAST,
+  workspacesCard,
 } from './cards.ts'
+import type { SessionCardRow } from './cards.ts'
 import type { ResolvedConfig } from './config.ts'
 import type {
   HostAgent,
@@ -42,6 +46,7 @@ import type {
   HostLlm,
   HostLoader,
   HostPermissionPresets,
+  HostSessionProjectionCache,
   HostSessionQuery,
   HostSessionEvent,
   HostSessionProjections,
@@ -50,29 +55,50 @@ import type {
   HostSystemPrompt,
   HostTools,
   HostUserMessage,
+  HostUserQuestionAnswer,
+  HostUserQuestionItem,
+  HostUserQuestionRequest,
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
-import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
+import type { AssistantStreamPayload } from './host.ts'
+import { standingScopeFor } from './host.ts'
+import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent, userText } from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
-import { refuseApprovalClick, refuseMessage } from './authorization.ts'
-import { marked } from './clicks.ts'
+import { refuseApproverOnly, refuseApprovalClick, refuseMessage } from './authorization.ts'
+import {
+  cardMarker,
+  marked,
+} from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
-import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
 import {
-  ChatSessionPicks,
+  CD_COMMAND,
+  ChatWorkspaces,
+  runWorkspaceCommand,
+  workspaceActionValue,
+  workspaceChoices,
+  workspacePage,
+  WORKSPACE_ACTION,
+  WS_COMMAND,
+} from './workspace.ts'
+import type { WorkspaceActionValue } from './workspace.ts'
+import {
+  ChatSessionPointers,
+  EMPTY_OFFER,
   offerSessions,
   sessionActionValue,
+  sessionsPage,
   SESSIONS_ACTION,
   SESSIONS_COMMAND,
 } from './sessions.ts'
-import type { OfferedSessions, SessionActionValue } from './sessions.ts'
-import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
+import type { FactSources, OfferedSessions, SessionActionValue, SessionChoice, SessionOffer } from './sessions.ts'
+import { legacyEpochOf } from './epoch.ts'
+import { NEW_COMMAND, isFreshSessionId, runNewCommand } from './new-session.ts'
 import {
   ChatModels,
   formatRoute,
@@ -85,11 +111,11 @@ import {
 import type { CatalogEntry, ModelActionValue } from './model.ts'
 import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
 import type { StatusFields } from './status.ts'
-import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue, shadowQuestionTool } from './questions.ts'
+import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
 import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
 import type { PermissionActionValue, PresetOption } from './permission.ts'
-import type { AskedQuestion, QuestionAnswer } from './questions.ts'
+import type { AskedQuestion, ChatQuestionBatch, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
@@ -99,7 +125,7 @@ import {
   describeReadFailure,
   GET_COMMAND,
   readOutboundFile,
-  runGetCommand,
+  readGetTarget,
   SEND_FILE_TOOL,
   sendFileTool,
 } from './outbound-file.ts'
@@ -107,13 +133,15 @@ import type { OutboundFile, SendFilePorts } from './outbound-file.ts'
 import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
-import { ConversationSessions, conversationKey, SESSION_PREFIX, sessionIdFor } from './session.ts'
+import { ConversationSessions, conversationKey, SESSION_PREFIX, sessionIdFor, SessionRefusedError } from './session.ts'
 import type { ConversationSubject, SessionLadder } from './session.ts'
 import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
 import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strangerNotice } from './botchat.ts'
 import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
 import type { BotSelf } from './presence.ts'
 import { canonicalPathOf } from './containment.ts'
+import { createFileDiag } from './diag.ts'
+import type { DiagSink } from './diag.ts'
 import { instanceIdentity } from './instance.ts'
 import {
   isUnconfined,
@@ -185,6 +213,18 @@ interface ChatBinding {
   /** `p2p` or a group kind; approvals in a group are judged as the room. */
   readonly chatType: string
   readonly renderer: OutboundRenderer
+}
+
+/**
+ * The chat facts one outbound-file gate needs.
+ *
+ * Narrower than {@link ChatBinding} on purpose: `/get` runs before any agent
+ * exists, so it has a chat to ask but no renderer to hand over.
+ */
+interface GateChat {
+  readonly chatId: string
+  /** `p2p` or a group kind; approvals in a group are judged as the room. */
+  readonly chatType: string
 }
 
 /**
@@ -283,6 +323,17 @@ const BACKGROUND_DRAIN_ROUNDS = 3
  */
 const BACKGROUND_DRAIN_MS = 5_000
 
+/**
+ * A promise that never settles, used to drop a losing branch out of a race.
+ *
+ * An approval is offered on two surfaces at once and the first answer wins. A
+ * branch that FAILS must not decide, and returning `undefined` from its
+ * rejection handler would settle the race immediately with nothing — refusing a
+ * question the other surface can still answer. Dropping out is expressed as a
+ * promise that never settles.
+ */
+const NEVER_SETTLES = new Promise<never>(() => {})
+
 interface PendingApproval {
   readonly chatId: string
   readonly chatType: string
@@ -303,6 +354,15 @@ interface PendingApproval {
   state: 'sending' | 'open' | 'settled'
   outcome?: HostApprovalOutcome | undefined
   decidedBy?: string | undefined
+  /**
+   * Whether the decision came from another surface rather than a press here.
+   *
+   * The same question is offered in the chat AND to whatever answerer follows
+   * this listener — the Web app's, in the deployment this was built for — and
+   * whichever decides first wins. When the other one wins, the card must not
+   * credit a press that never happened.
+   */
+  decidedElsewhere?: boolean | undefined
   settle(outcome: HostApprovalOutcome): void
   /** Detaches the abort listener, so a settled question leaks no handler. */
   removeAbort?: (() => void) | undefined
@@ -375,10 +435,22 @@ function approvalCard(
  * @param decidedBy - who pressed, when a person did. Named rather than
  * withheld: with approvals open to a room, the room should see whose press
  * granted the escalation.
+ * @param decidedElsewhere - whether another surface answered instead, in which
+ * case there is no press here to name.
  * @returns a Feishu card object for `updateCard`.
  */
-function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?: string): object {
-  return buildSettledApprovalCard({ toolName, outcome, decidedBy })
+function settledCard(
+  toolName: string,
+  outcome: HostApprovalOutcome,
+  decidedBy?: string,
+  decidedElsewhere?: boolean,
+): object {
+  return buildSettledApprovalCard({
+    toolName,
+    outcome,
+    ...decidedBy === undefined ? {} : { decidedBy },
+    ...decidedElsewhere === true ? { decidedElsewhere: true } : {},
+  })
 }
 
 /**
@@ -496,6 +568,57 @@ const TIMEOUT_MINUTES = Math.round(QUESTION_TIMEOUT_MS / 60_000)
 const MAX_PENDING_FILE_SENDS = 3
 
 /**
+ * How much of one form submission a question card will carry into an answer.
+ *
+ * The chosen set arrives beside the button's own value, so its size is the
+ * platform's and its strings are whoever submitted them: a set far larger than
+ * the options the model offered, or one entry long enough to make the settled
+ * card oversized, buys nothing and can cost the click its response. Bounded
+ * rather than validated: a position past the offered options is already refused
+ * by the store, so the only thing to keep out here is bulk.
+ */
+const MAX_QUESTION_SUBMISSIONS = 64
+
+/** The longest one submitted position is read as. A position is a small integer. */
+const MAX_QUESTION_FIELD_CHARS = 12
+
+/**
+ * How many per-key entries one bridge remembers for its own bookkeeping.
+ *
+ * The sets and caches below exist to say a thing ONCE per key — a `.gitignore`
+ * hint per directory, a bot's identity per chat, one workspace lookup per
+ * directory — and a process serving a busy tenant for months would otherwise
+ * accumulate one entry per key for its whole life. The cap is far above any
+ * working set; a "said once" set that reaches it is cleared, which costs at most
+ * a repeated notice and never a wrong answer, and the lookup cache evicts its
+ * oldest entry, which costs a re-resolve.
+ */
+const KEYED_STATE_MAX = 512
+
+/**
+ * Remember one key in a "said once" set, keeping the set bounded.
+ * @param keys - the set of keys already announced.
+ * @param key - the key to remember.
+ */
+function rememberOnce(keys: Set<string>, key: string): void {
+  if (keys.size >= KEYED_STATE_MAX) keys.clear()
+  keys.add(key)
+}
+
+/**
+ * The longest speaker name one group message carries into the model's prompt.
+ *
+ * A display name is its owner's own text and rides the prompt as a line prefix,
+ * so it is folded to one bounded line: a name carrying a newline would add a
+ * line to the prompt and let its owner put words in another speaker's mouth,
+ * which is the misattribution the transport's batch window is closed to prevent.
+ */
+const SPEAKER_LABEL_MAX_CHARS = 64
+
+/** The longest decider name a settled card records. */
+const DECIDER_NAME_MAX_CHARS = 64
+
+/**
  * How many unclaimed reply targets may wait for their `user/message` event. A
  * target is claimed within one turn ordinarily; the cap only matters when an
  * agent dies between accepting a followup and starting its turn.
@@ -560,13 +683,37 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 }
 
 /**
+ * One host question, in the shape this channel's card machinery takes.
+ *
+ * The host's `detail` and its presentation `intent` have no card affordance
+ * here, so a question carrying either is shown as its own text and options — the
+ * tool that raises them is shadowed by this channel rather than answered through
+ * the waterfall, so neither reaches this path in a composed deployment.
+ * @param item - one question of the host's request.
+ * @returns the question to hand the card store.
+ */
+function askedQuestionOf(item: HostUserQuestionItem): AskedQuestion {
+  return {
+    id: item.id,
+    question: item.question,
+    ...item.header === undefined ? {} : { header: item.header },
+    ...item.options === undefined ? {} : {
+      options: item.options.map(option => ({
+        label: option.label,
+        ...option.description === undefined ? {} : { description: option.description },
+      })),
+    },
+    ...item.multiSelect === undefined ? {} : { multiSelect: item.multiSelect },
+  }
+}
+
+/**
  * Compose the parts of a chat agent's world this channel owns: the tools it
- * must not call, the one tool this channel adds, and the prompt sentence that
+ * must not call, the tools this channel adds, and the prompt sentence that
  * tells the model what to do instead. Every registration is scoped to this one
  * agent.
  * @param agentCtx - the agent's scope context, inside creation `setup`.
  * @param config - resolved plugin configuration.
- * @param askQuestions - how a question reaches this agent's chat, when it can.
  * @param planReview - how a plan is reviewed in this agent's chat, when it can be.
  * @param sendFiles - how an artifact reaches this agent's chat, when it may.
  * @param self - the bot account this agent speaks as.
@@ -574,7 +721,6 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 function composeChatAgent(
   agentCtx: Context,
   config: ResolvedConfig,
-  askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
   planReview: PlanReviewPorts | undefined,
   sendFiles: SendFilePorts | undefined,
   self: BotSelf,
@@ -582,17 +728,21 @@ function composeChatAgent(
   const tools = agentCtx.get('tools') as HostTools | undefined
   const denied = new Set(config.denyTools)
 
-  // Shadow the host's question tool for THIS agent: its answer would otherwise
-  // surface on whichever UI claimed the single `userQuestions` provider, while
-  // the person who asked is here. Registered before the guard so a deployment
-  // that also denies the name still denies it — configuration wins.
-  const shadowed = askQuestions !== undefined
-    && !denied.has(QUESTION_TOOL)
-    && tools?.register !== undefined
-  if (shadowed) tools?.register?.(shadowQuestionTool(askQuestions))
-  // A registry too old to shadow leaves the host's GUI-only tool in place;
-  // denying it keeps the model from asking where no one is watching.
-  if (!shadowed && askQuestions !== undefined) denied.add(QUESTION_TOOL)
+  // The host's own `ask_user_question` is NOT shadowed. Its answer used to have
+  // to come from whichever UI claimed the single `userQuestions` provider, so a
+  // chat whose human was right here replaced the tool to answer it locally. The
+  // bridge now answers `user-questions/request` instead, which is the same
+  // question raised once for every presentation: the model keeps the tool the
+  // deployment composed, the Web app keeps its panel, and this channel adds a
+  // card beside it rather than in place of it. Shadowing here would put the tool
+  // back to one answerer and take the panel away from the browser.
+  //
+  // A deployment that denies the name still denies it through the guard below,
+  // and that refusal is what keeps a model from asking where nobody is watching.
+  if (denied.has(QUESTION_TOOL)) agentCtx.logger.warn(
+    '%s is denied by configuration: questions in this channel have no card and no panel',
+    QUESTION_TOOL,
+  )
 
   // The plan tool is shadowed for the same reason and on the same terms: its
   // review reaches for that same single-provider seam. Only worth registering
@@ -686,7 +836,7 @@ export function chatUserMessage(
   inbound: CollectedFiles,
 ): HostUserMessage {
   const spoken = msg.chatType === 'group'
-    ? `${msg.senderName ?? msg.senderId}: ${msg.content}`
+    ? `${speakerLabel(msg)}: ${msg.content}`
     : msg.content
   // Only an agent's message carries the baton note: a human reads everything
   // said in their own chat, mention or not.
@@ -706,6 +856,28 @@ export function chatUserMessage(
     content: Object.freeze(content),
     source: Object.freeze({ kind: 'user' } as const),
   })
+}
+
+/**
+ * The speaker label one group message carries into the model's prompt.
+ *
+ * A member sets their own display name, so it is folded to one bounded line
+ * before it rides the text: whitespace runs (newlines included) and control
+ * characters collapse to a single space, the label is capped, and a name that
+ * leaves nothing usable falls back to the open id — which is the one fact about
+ * the speaker that is not theirs to write.
+ * @param msg - the inbound message.
+ * @returns the label, never empty.
+ */
+function speakerLabel(msg: NormalizedMessage): string {
+  const name = (msg.senderName ?? '').replace(/[\s\u0000-\u001f\u007f]+/g, ' ').trim()
+  // Cut by code point, so a name of emoji or CJK extension characters is not
+  // split into a lone surrogate on its way into the prompt.
+  const points = [...name]
+  const bounded = points.length <= SPEAKER_LABEL_MAX_CHARS
+    ? name
+    : `${points.slice(0, SPEAKER_LABEL_MAX_CHARS - 1).join('')}…`
+  return bounded === '' ? msg.senderId : bounded
 }
 
 /**
@@ -729,7 +901,40 @@ export function installBridge(
     readonly quotaWindowMs?: number
     readonly quotaLimit?: number
   },
+  startupNotices: readonly string[] = [],
 ): void {
+  /**
+   * The channel's durable diagnostic sink, when the deployment named a file.
+   *
+   * Absent means the terminal stays the only record, which is the previous
+   * behaviour — a report about a short card is then readable only while the
+   * window that ran the bot is still open.
+   */
+  const diag: DiagSink = config.diagnosticsFile === undefined
+    ? () => {}
+    : createFileDiag(
+      {
+        file: config.diagnosticsFile,
+        ...config.cwd === undefined ? {} : { cwd: config.cwd },
+        level: config.diagnosticsLevel,
+      },
+      reason => notify(reason),
+    )
+  /**
+   * An operator line that also reaches the diagnostic file.
+   *
+   * Managed state that could not be persisted used to be reported to the
+   * terminal alone, which is the one record nobody reads after the fact: a
+   * deployment whose session state silently stopped being durable left nothing
+   * in this file to say so.
+   */
+  const report = (line: string): void => {
+    notify(line)
+    diag('warn', line)
+  }
+  // Why managed state will not be durable, when the deployment said so during
+  // bootstrap — before this file existed to hear it.
+  for (const line of startupNotices) report(line)
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
@@ -767,24 +972,19 @@ export function installBridge(
   const defaultCwd = resolve(config.cwd ?? process.cwd())
 
   /** Which directory each conversation runs in, and the session id that pair owns. */
-  const chatEpochs = new ChatEpochs({
-    entries: config.chatEpochs,
-    persist: persistState,
-    report: notify,
-  })
-
   const chatWorkspaces = new ChatWorkspaces({
     defaultPath: defaultCwd,
     entries: config.chatWorkspaces,
     roots: config.workspaceRoots,
     persist: persistState,
-    report: notify,
+    report,
     // Every session id this row derives carries its own prefix, so two bots
     // invited to one group drive two agents rather than fighting over one.
     sessionPrefix: instanceIdentity(config.instance).sessionPrefix,
-    // A conversation that started over derives a further id; one that never
-    // did derives exactly what it always did.
-    epochOf: baseId => chatEpochs.epochOf(baseId),
+    // Read-only: nothing advances the counter any more, but a conversation the
+    // old `/new` moved is still on its `--e<N>` session, and that id is the
+    // only pointer to the thread it is in.
+    epochOf: baseId => legacyEpochOf(config.chatEpochs, baseId),
     // The host registry's listing, read fresh per use: every workspace this
     // human already uses with the host is a `/cd` destination worth offering.
     known: () => {
@@ -802,19 +1002,20 @@ export function installBridge(
   const chatModels = new ChatModels({
     entries: config.chatModels,
     persist: persistState,
-    report: notify,
+    report,
   })
 
   /**
-   * Which session each conversation was told to continue, when it was told at
-   * all. A pick overrides the derivation; `/cd` and `/new` clear it, because
-   * both of them ARE a change of session and a pick that survived them would
-   * quietly win over what the person just asked for.
+   * Which session each conversation-and-directory currently runs, when it was
+   * told at all: `/sessions` points it at a session that already exists, and
+   * `/new` points it at an id minted for the occasion. Keyed by the anchor id,
+   * so each directory keeps its own thread and a `/cd` back returns to the
+   * session that directory was left on.
    */
-  const chatSessionPicks = new ChatSessionPicks({
+  const sessionPointers = new ChatSessionPointers({
     entries: config.chatSessions,
     persist: persistState,
-    report: notify,
+    report,
   })
 
   /**
@@ -827,17 +1028,61 @@ export function installBridge(
   const pathBySession = new Map<string, string>()
   const routeBySession = new Map<string, HostAgentOptions>()
   /**
-   * The session one conversation is on: its pick, or what it derives to.
+   * The id one conversation derives at the directory it is in, before any
+   * suffix. What a session minted for that conversation is minted under, and
+   * what its pointer is keyed by — which is what keeps one directory's thread
+   * untouched by starting over in another.
+   * @param key - the conversation key.
+   * @returns the anchor id.
+   */
+  const anchorOf = (key: string): string => chatWorkspaces.baseSessionIdFor(key)
+
+  /**
+   * The session one conversation is on: its pointer, or what it derives to.
    *
    * The one answer to that question, because every caller that answered it
    * itself was one edit away from answering it differently — and a caller that
-   * reads the derived id while the conversation is on a picked one reads
+   * reads the derived id while the conversation is on a pointed-at one reads
    * another session's state, or writes to it.
    * @param key - the conversation key.
    * @returns the session id in force right now.
    */
   const sessionIdOf = (key: string): string =>
-    chatSessionPicks.pickFor(key) ?? chatWorkspaces.sessionIdFor(key)
+    sessionPointers.pointerFor(anchorOf(key)) ?? chatWorkspaces.sessionIdFor(key)
+
+  /**
+   * Adopt pointers recorded against a bare conversation key onto its anchor.
+   *
+   * Before the pointer was keyed by anchor, `/sessions` recorded it against the
+   * conversation key and `/cd` cleared it, so one stored entry served whichever
+   * directory the chat happened to be in. Re-keying keeps a conversation on the
+   * session it was already continuing and retires the old entry — which is also
+   * what stops that entry from following the chat into another directory.
+   * `set` records in memory before it awaits storage, so the moves are visible
+   * to the first message; only the writes are in flight.
+   */
+  const adoptLegacyPointers = (): Promise<unknown>[] => {
+    const writes: Promise<unknown>[] = []
+    try {
+      for (const [key, sessionId] of sessionPointers.snapshot()) {
+        // An anchor carries the channel's session prefix; a bare conversation key
+        // does not, so the two formats are told apart without guessing.
+        if (key.startsWith(SESSION_PREFIX)) continue
+        writes.push(sessionPointers.set(anchorOf(key), sessionId))
+        writes.push(sessionPointers.set(key, undefined))
+      }
+    } catch (error: unknown) {
+      // A stored entry this code cannot read costs the migration, never the
+      // installation: this runs inside `installBridge`, where a synchronous
+      // throw leaves a connected transport with no handlers and a chat that
+      // answers nothing.
+      report(`lark-channel: migrating the stored session pointers failed: ${failureDetail(error)}`)
+    }
+    return writes
+  }
+  void Promise.all(adoptLegacyPointers()).catch((error: unknown) => {
+    report(`lark-channel: adopting the stored session pointers failed: ${failureDetail(error)}`)
+  })
 
   const sessionIdForKey = (key: string): string => {
     const id = sessionIdOf(key)
@@ -869,6 +1114,12 @@ export function installBridge(
         notify(`lark-channel: workspace lookup failed for ${path}: ${String(error)}`)
         return undefined
       })
+      // Bounded: the oldest lookup is the one dropped, and dropping it costs a
+      // re-resolve rather than a wrong answer.
+      if (workspaceRecords.size >= KEYED_STATE_MAX) {
+        const oldest = workspaceRecords.keys().next().value
+        if (oldest !== undefined) workspaceRecords.delete(oldest)
+      }
       workspaceRecords.set(path, pending)
     }
     return pending
@@ -966,26 +1217,98 @@ export function installBridge(
     send: async (chatId, card) => (await port.send(chatId, { card })).messageId,
     update: async (messageId, card) => { await port.updateCard(messageId, card) },
     report: notify,
+    // The approver rule a question that GRANTS something faces. Read through
+    // `authorization` at press time, so a deployment that narrowed approvals
+    // narrows the plan review with the same list — and a deployment that named
+    // no approvers keeps the ordinary rule, where whoever may drive the chat may
+    // answer it. The chat itself is already checked by the store.
+    refuseApprover: click => refuseApproverOnly(authorization, click),
   })
 
   /**
-   * Ask this agent's chat, one question at a time. Sequential on purpose: two
-   * open cards in one conversation would leave a typed answer ambiguous.
+   * One structured-question batch, offered on both surfaces at once.
+   *
+   * The chat card and the answerer behind this listener — the Web app's panel,
+   * in the deployment this was built for — are two presentations of the SAME
+   * request, so neither takes the question away from the other: whichever
+   * answer arrives first is the answer the tool receives.
+   *
+   * The trailing answerer REJECTS instead of resolving a fail-closed outcome,
+   * which is where this differs from an approval. A deployment with no browser
+   * attached therefore throws rather than handing back something to compare, and
+   * that branch has to drop out of the race: treating the throw as an answer
+   * would refuse a question the card on screen can still take. Dropping out is
+   * expressed as a promise that never settles, the same shape the approval
+   * listener uses for its fail-closed value.
+   *
+   * Racing is also why the batch may stop early: see {@link askInChat}.
+   * @param binding - the chat the question is offered in.
+   * @param sessionId - the session the question belongs to.
+   * @param request - the host's request, as the tool raised it.
+   * @param next - the answerer chain behind this listener.
+   * @returns the first answer to arrive.
    */
-  const askQuestions = async (
-    asked: readonly AskedQuestion[],
-    sessionId: string | undefined,
-  ): Promise<QuestionAnswer[]> => {
-    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
-    if (binding === undefined || sessionId === undefined) {
-      // No chat to ask in — answer empty rather than hang the turn.
-      return asked.map(question => ({ id: question.id, selected: [] }))
+  const askOnBothSurfaces = async (
+    binding: ChatBinding,
+    sessionId: string,
+    request: HostUserQuestionRequest,
+    next: () => Promise<HostUserQuestionAnswer>,
+  ): Promise<HostUserQuestionAnswer> => {
+    const run: ChatQuestionBatch = {
+      sessionId,
+      // The batch's own membership: a settlement this channel reports back is
+      // matched against the cards this batch opened, never against every card
+      // the conversation holds.
+      questionIds: request.questions.map(item => item.id),
+      decided: false,
     }
+    const viaChat = askInChat(run, binding, request)
+    // Rejection is the chain reporting that nobody claimed the question, so the
+    // Web branch drops out rather than failing the whole ask.
+    const viaWeb = next().then(
+      answer => ({ from: 'web' as const, answer }),
+      () => NEVER_SETTLES,
+    )
+    const winner = await Promise.race([
+      viaChat.then(answer => ({ from: 'chat' as const, answer })),
+      viaWeb,
+    ])
+    if (winner.from === 'chat') return winner.answer
+    // The Web app answered first. Retire the chat's cards for this batch, saying
+    // where the answer came from instead of waiting for a press that would be
+    // discarded.
+    questions.settleElsewhere(run, winner.answer.answers)
+    return winner.answer
+  }
+
+  /**
+   * Ask this chat one batch, one card at a time.
+   *
+   * Sequential on purpose: two open cards in one conversation would leave a
+   * typed answer ambiguous. The batch stops the moment another surface claims
+   * it — the Web panel answers all questions at once, so asking the next one
+   * would leave a card with nothing left to decide.
+   * @param run - the batch's own state, shared with the retirement path.
+   * @param binding - the chat the cards go to.
+   * @param request - the host's request.
+   * @returns one answer per question actually asked.
+   */
+  const askInChat = async (
+    run: ChatQuestionBatch,
+    binding: ChatBinding,
+    request: HostUserQuestionRequest,
+  ): Promise<HostUserQuestionAnswer> => {
     const answers: QuestionAnswer[] = []
-    for (const question of asked) {
-      answers.push(await questions.ask({ sessionId, chatId: binding.chatId, question }))
+    for (const item of request.questions) {
+      if (run.decided) break
+      answers.push(await questions.ask({
+        sessionId: run.sessionId,
+        chatId: binding.chatId,
+        question: askedQuestionOf(item),
+        ...request.signal === undefined ? {} : { signal: request.signal },
+      }))
     }
-    return answers
+    return { answers }
   }
 
   /**
@@ -1010,6 +1333,10 @@ export function installBridge(
         chatId: binding.chatId,
         question: planReviewQuestion(heading),
         ...signal === undefined ? {} : { signal },
+        // Approving a plan leaves plan mode and starts executing it, so the
+        // press is a grant rather than an answer: a deployment that named
+        // approvers has said who may make it.
+        requiresApprover: true,
       })
       return { selected: answer.selected, ...answer.custom === undefined ? {} : { custom: answer.custom } }
     },
@@ -1058,16 +1385,21 @@ export function installBridge(
     const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
     const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
     // A roster keeps every tool off the global layer, so its standing key is
-    // the view that can describe this agent's calls.
-    const toolScope = presets === undefined || presetId === undefined
+    // the view that can describe this agent's calls. A host that lends that key
+    // as a revision lease keeps the lease here: the presenter below reads
+    // through it for as long as this composition lives, so it is given back
+    // with the plugin fiber rather than at the end of this call.
+    const standing = presets === undefined || presetId === undefined
       ? undefined
-      : await presets.standingKeyFor(presetId)
+      : await standingScopeFor(presets, presetId)
+    const releaseStanding = standing?.[Symbol.asyncDispose]
+    if (releaseStanding !== undefined) ctx.effect(() => () => releaseStanding())
     return {
       ...presetId === undefined ? {} : { presetId },
-      presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
+      presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, standing?.key),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+        composeChatAgent(agentCtx, config, planReview, sendFilePorts, botSelf())
       },
     }
   }
@@ -1093,39 +1425,98 @@ export function installBridge(
 
   const agents = ctx.agents as DurableAgentRegistry
 
+  /**
+   * Why the last resume of one session id was rejected.
+   *
+   * The ladder's `resume` can only return a handle or throw, so the rejection
+   * travels to the `create` rung — the one place a pointed-at id lands and the
+   * only place with a human to tell — through this map rather than through the
+   * signature. Entries are removed as they are reported, and a minted id never
+   * gets one: `/new` names a session nothing has run, so its rejection is the
+   * ordinary answer rather than a failure worth keeping.
+   */
+  const resumeFailure = new Map<string, string>()
+
+  /**
+   * Refuse one id the host has archived, in the chat's own words.
+   *
+   * Archiving is another surface's deliberate decision — the workspace registry
+   * hides such a session from every grouping surface, and the host's archive
+   * gate rejects every step it proposes. Restoring it here would overrule that
+   * decision silently, to a chat that asked for nothing of the kind, and
+   * opening an agent under it anyway would write over the session being
+   * refused; so the refusal is terminal and reported instead.
+   *
+   * Asked by the ladder's admission point on every acquisition AND by the
+   * resume rung. The rung alone is not enough: it is never reached for a
+   * conversation whose binding is already live, and that is precisely the case
+   * this channel created by driving a session another surface then archived.
+   * @param sessionId - the session about to be driven.
+   * @throws {SessionRefusedError} always, when the id is archived.
+   */
+  const refuseArchived = (sessionId: string): void => {
+    if (!archivedSessions().has(sessionId)) return
+    report(`lark-channel: refused the archived session ${sessionId}`)
+    throw new SessionRefusedError(ARCHIVED_SESSION_NOTICE.zh)
+  }
+
   const ladder: SessionLadder = {
+    admit: (sessionId) => { refuseArchived(sessionId) },
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
       // An agent another owner published is theirs to dispose.
       return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
     },
     resume: async (sessionId) => {
+      // The walk's own guard, narrower than admission: an archive that landed
+      // while this acquisition was already under way is caught here, before a
+      // log is opened and an agent made under an id the gate will refuse.
+      refuseArchived(sessionId)
       const composition = await compositionFor(sessionId)
-      const handle = await agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
-        setup: composition.setup,
-      })
-      // Resuming publishes too. A chat that already has a durable session
-      // NEVER takes the create rung again, so publishing only from there froze
-      // the panel at whatever this channel offered the day that session began:
-      // every command added afterwards existed, worked when typed, and was
-      // invisible to everyone who reached for `/`.
-      publishSlashPanel(handle.agent)
-      return handle
+      try {
+        const handle = await agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
+          setup: composition.setup,
+        })
+        // Resuming publishes too. A chat that already has a durable session
+        // NEVER takes the create rung again, so publishing only from there froze
+        // the panel at whatever this channel offered the day that session began:
+        // every command added afterwards existed, worked when typed, and was
+        // invisible to everyone who reached for `/`.
+        publishSlashPanel(handle.agent)
+        return handle
+      } catch (error: unknown) {
+        // Kept for the create rung, which is where a pointed-at id lands and the
+        // only place that can report the reason to a human. The registry's
+        // rejection is otherwise lost: this signature returns a handle, not a
+        // result, so the ladder's next rung sees only that it failed.
+        //
+        // A minted id is expected to be absent — `/new` names a session nothing
+        // has run — so its rejection is not a failure worth keeping.
+        if (!isFreshSessionId(sessionId)) resumeFailure.set(sessionId, failureDetail(error))
+        throw error
+      }
     },
     create: async (sessionId) => {
-      // A picked session is one this conversation was told to CONTINUE, so it
-      // exists — reaching this rung under a picked id means the resume failed,
-      // and creating one here would start an empty session under the id of the
-      // conversation someone asked to carry on with. The pick is retired so the
-      // next message lands on this conversation's own session rather than
-      // failing the same way forever.
-      const picking = chatSessionPicks.keysPicking(sessionId)
-      if (picking.length > 0) {
-        for (const key of picking) await chatSessionPicks.set(key, undefined)
-        notify(`lark-channel: ${sessionId} could not be resumed; retired the pick held by ${picking.join(', ')}`)
-        throw new Error('这个会话打不开了（日志可能已损坏或版本不兼容），已回到本聊天自己的会话。再发一条消息即可继续。')
+      // A pointed-at session that was NOT minted here is one this conversation
+      // was told to CONTINUE, so it exists — reaching this rung under it means
+      // the resume failed, and creating one would start an empty session under
+      // the id of the conversation someone asked to carry on with. The pointer
+      // is retired so the next message lands on this conversation's own session
+      // rather than failing the same way forever.
+      const pointing = sessionPointers.anchorsPointingAt(sessionId)
+      if (pointing.length > 0 && !isFreshSessionId(sessionId)) {
+        for (const anchor of pointing) await sessionPointers.set(anchor, undefined)
+        // The resume rejection is the ONLY account of why this failed, and it
+        // used to be dropped here in favour of a guess about a corrupt log —
+        // which sent an operator looking for damage that was not there when the
+        // real cause was a session this surface may not open at all.
+        const reason = resumeFailure.get(sessionId) ?? 'the session could not be loaded'
+        resumeFailure.delete(sessionId)
+        diag('warn', `lark-channel: resume failed for ${sessionId}: ${reason}`)
+        notify(`lark-channel: ${sessionId} could not be resumed (${reason}); retired the pointer held by ${pointing.join(', ')}`)
+        throw new Error(`这个会话在这里打不开：${reason}\n已回到本聊天自己的会话，再发一条消息即可继续。`)
       }
       const composition = await compositionFor(sessionId)
       // The workspace's own canonical path, so `attachSession` finds the header
@@ -1153,8 +1544,13 @@ export function installBridge(
     },
     // A rejected resume is the registry's only existence probe, and an
     // unreadable session log looks exactly like a chat nobody ever messaged, so
-    // the ladder's handled failures are reported rather than swallowed.
-    report: (line) => { ctx.logger.info(line) },
+    // the ladder's handled failures are reported rather than swallowed — to the
+    // host's log, and to this channel's own file, which is the record that
+    // outlives the window that ran the bot.
+    report: (line) => {
+      ctx.logger.info(line)
+      report(line)
+    },
   }
 
   const sessions = new ConversationSessions(config.sessionScope, ladder, sessionIdForKey)
@@ -1171,7 +1567,7 @@ export function installBridge(
   let unwound = false
 
   /**
-   * In-flight and settled binding creations, one per session id. A plain
+   * In-flight and settled binding creations, one per (chat, session). A plain
    * check-then-create raced two concurrent callers into two renderers, one of
    * them orphaned but still aimed at — the same promise-cache pattern the
    * compositions use makes creation single-flight. A model switch resumes the
@@ -1179,18 +1575,36 @@ export function installBridge(
    * calls through the preset's view, which a model change does not alter.
    */
   const bindings = new Map<string, Promise<ChatBinding>>()
-  const bindingFor = (sessionId: string, msg: NormalizedMessage): Promise<ChatBinding> => {
-    let pending = bindings.get(sessionId)
+  /** One chat's watch on one session, as the key of the state that surrounds it. */
+  const watchKey = (chatId: string, sessionId: string): string => `${chatId}\u0000${sessionId}`
+  /**
+   * Binding generation per (chat, session), advanced when that chat stops
+   * watching that session.
+   *
+   * Creation is asynchronous, so a renderer still composing when the
+   * conversation moves on would claim the dispatch slot afterwards and start
+   * rendering a session the chat has already left. The creation carries the
+   * generation it started under; a mismatch settles what it opened and claims
+   * nothing.
+   */
+  const bindingGenerations = new Map<string, number>()
+  const bindingFor = (
+    sessionId: string,
+    chat: { readonly chatId: string; readonly chatType: string },
+  ): Promise<ChatBinding> => {
+    const watch = watchKey(chat.chatId, sessionId)
+    let pending = bindings.get(watch)
     if (pending === undefined) {
+      const generation = bindingGenerations.get(watch) ?? 0
       pending = (async (): Promise<ChatBinding> => {
         const { presentCall } = await compositionFor(sessionId)
         // The renderer is the composition's last reader; dropping it here leaves
         // the next conversation bound on this id to read the roster fresh.
         compositions.delete(sessionId)
         const binding: ChatBinding = {
-          chatId: msg.chatId,
-          chatType: msg.chatType,
-          renderer: renderFor(msg.chatId, presentCall),
+          chatId: chat.chatId,
+          chatType: chat.chatType,
+          renderer: renderFor(chat.chatId, presentCall),
         }
         if (unwound) {
           // The fiber unwound while this was composing; nothing will ever
@@ -1198,17 +1612,72 @@ export function installBridge(
           void binding.renderer.close()
           throw new Error('lark-channel: bridge unwound while binding')
         }
+        if ((bindingGenerations.get(watch) ?? 0) !== generation) {
+          // The conversation left this session while its renderer was composing:
+          // the chat has already stopped watching it, so this one settles its
+          // card and claims nothing.
+          void binding.renderer.close()
+          return binding
+        }
         bySession.set(sessionId, binding)
         return binding
       })()
-      bindings.set(sessionId, pending)
+      bindings.set(watch, pending)
       pending.catch(() => {
         // Only the failure that still owns the slot clears it: a stale
         // rejection must not evict a successor's live promise.
-        if (bindings.get(sessionId) === pending) bindings.delete(sessionId)
+        if (bindings.get(watch) === pending) bindings.delete(watch)
       })
     }
     return pending
+  }
+
+  /**
+   * Stop one chat watching the session its conversation has left.
+   *
+   * A binding is what routes a session's events into a chat, and it used to
+   * outlive the conversation's own stay: the chat that switched away kept
+   * rendering the session it left — its stream, its approvals, its questions —
+   * beside the one it moved to, so one chat carried two conversations at once.
+   * This is that half of a binding's life, and it runs where the conversation's
+   * session identity changes and nowhere else: `/model` resumes the SAME id and
+   * reuses its renderer on purpose, so releasing an agent is not by itself a
+   * reason to stop watching.
+   *
+   * The session itself keeps running. It belongs to whoever opened it — a
+   * browser, a schedule — and only that owner decides when it stops.
+   * @param key - the conversation that moved, resolved fresh so a move that
+   * lands on the same session leaves the renderer where it is.
+   * @param chatId - the chat whose renderer goes away.
+   * @param left - the session id the conversation was on before the move.
+   */
+  const stopWatching = async (key: string, chatId: string, left: string): Promise<void> => {
+    // Not a change of session: `/cd` to the directory the conversation is
+    // already in, or a press on the row it is already on.
+    if (left === sessionIdOf(key)) return
+    const watch = watchKey(chatId, left)
+    bindingGenerations.set(watch, (bindingGenerations.get(watch) ?? 0) + 1)
+    // Dropped from the creation cache as well, so a later `bindingFor` on this
+    // pair builds a renderer of its own instead of handing back this one.
+    const abandoned = bindings.get(watch)
+    bindings.delete(watch)
+    // The bumped generation is read by exactly one party: a creation that was
+    // already in flight for this pair, which compares it to the number it
+    // captured. Once that creation has settled — and no successor has taken the
+    // slot since, whose own baseline is the bumped number — the entry answers
+    // nothing, so it is dropped rather than kept for the process's lifetime.
+    const drop = (): void => {
+      if (bindings.get(watch) === undefined) bindingGenerations.delete(watch)
+    }
+    if (abandoned === undefined) drop()
+    else void abandoned.then(drop, drop)
+    const binding = bySession.get(left)
+    // Another chat's watch on the same session is that chat's to give up.
+    if (binding === undefined || binding.chatId !== chatId) return
+    // Out of the dispatch table BEFORE the card settles: an event that lands
+    // while the card is closing must find nobody home.
+    bySession.delete(left)
+    await binding.renderer.close()
   }
 
   /**
@@ -1256,7 +1725,7 @@ export function installBridge(
       ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
       { name: STOP_COMMAND, description: '停止当前任务' },
       { name: CD_COMMAND, description: '切换本会话的工作区目录' },
-      { name: WS_COMMAND, description: '查看可用工作区' },
+      { name: WS_COMMAND, description: '选择工作区，点一行即切换' },
       { name: GET_COMMAND, description: '把工作区里的文件发到聊天' },
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
@@ -1282,6 +1751,29 @@ export function installBridge(
   const presetHeldText = (preset: string): string =>
     `🔓 已记下：当前这轮任务结束后切到 ${preset}。`
     + '\n（会话日志同一时刻只能有一个写入者，所以不在任务中途改。）'
+
+  /**
+   * What a group is told while its `/get` waits for the approval card.
+   *
+   * Named the file, because the sender typed a path one line ago and the room
+   * is the party being asked: without the name, a card that arrives a moment
+   * later has nothing tying it to the command.
+   * @param fileName - the cleared file's name.
+   * @returns the message text.
+   */
+  const getHeldText = (fileName: string): string =>
+    `📎 已就 \`${fileName}\` 发起审批：群里发文件要房间同意，通过后就会发出来。`
+
+  /**
+   * What a group is told when its `/get` cannot even be offered yet.
+   *
+   * The cap is per chat and counts everything outstanding in it — the model's
+   * own offers and this room's own commands alike — so the sentence names the
+   * one thing a person can act on: decide what is already waiting.
+   * @returns the message text.
+   */
+  const getBusyText = (): string =>
+    `⏳ 这个群已经有 ${MAX_PENDING_FILE_SENDS} 个文件在等审批，先决定完再发。`
 
   /** What the chat is told when a switch landed. */
   const presetSwitchedText = (preset: string): string =>
@@ -1378,6 +1870,12 @@ export function installBridge(
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
       aimBySession.delete(releasedId)
+      // The directory and route this session id was derived for go with it. A
+      // later message re-derives both before any ladder rung reads them, so the
+      // entries are only stale state here — and keeping them would leave one
+      // pair per session id the process ever derived.
+      pathBySession.delete(releasedId)
+      routeBySession.delete(releasedId)
       questions.cancelSession(releasedId)
     }
   }
@@ -1392,6 +1890,7 @@ export function installBridge(
     // load a log to report a zero.
     const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
     const meters = readMeters(projections(), live?.session)
+    const pointed = sessionPointers.pointerFor(anchorOf(subject.key))
     return {
       ...meters,
       workspace: chatWorkspaces.pathFor(subject.key),
@@ -1400,8 +1899,14 @@ export function installBridge(
       routeIsDefault: override === undefined,
       sessionId,
       bound: sessions.keyOf(sessionId) !== undefined,
-      switched: chatSessionPicks.pickFor(subject.key) !== undefined,
+      // A minted session is not a continuation: it has not been created yet, and
+      // the card's own `unbound` wording is what says so.
+      switched: pointed !== undefined && !isFreshSessionId(pointed),
       running: runningBySession.get(sessionId) === true,
+      // Read every time rather than remembered: the archive set is the host's
+      // live state, another surface may lift it the moment after this card is
+      // drawn, and the card's refresh button is how a reader asks again.
+      archived: archivedSessions().has(sessionId),
       pendingApprovals: [...pendingApprovals.values()]
         .filter(pending => pending.chatId === subject.chatId).length,
       version: pluginVersion,
@@ -1588,7 +2093,7 @@ export function installBridge(
         // and repeating it for every message would bury the rest of the log.
         const seen = `${msg.chatId}/${verdict.senderId}`
         if (!reportedBots.has(seen)) {
-          reportedBots.add(seen)
+          rememberOnce(reportedBots, seen)
           notify(strangerNotice(verdict.senderId, msg.chatId))
         }
         return
@@ -1599,7 +2104,7 @@ export function installBridge(
         // a fact worth seeing, and here the answer is "a bot".
         const seen = `${msg.chatId}/${msg.senderId}`
         if (!reportedBots.has(seen)) {
-          reportedBots.add(seen)
+          rememberOnce(reportedBots, seen)
           notify(servedNotice(msg.senderId, msg.chatId))
         }
       }
@@ -1640,23 +2145,64 @@ export function installBridge(
         // directory the conversation already runs in — so releasing its agent
         // would throw away a live context to send an attachment.
         if (channelCommand === GET_COMMAND) {
-          const reply = await runGetCommand(
-            msg.content,
-            chatWorkspaces.pathFor(key),
-            config.maxSendFileBytes,
-            async (file, bytes) => {
-              // No approval card, in a group either (ADR 0002): the human typed
-              // the path, and asking him to approve his own command is theatre.
-              await port.send(
-                msg.chatId,
-                { file: { source: bytes, fileName: file.fileName } },
-                replyOptions(replyTargetOf(msg)),
-              )
-            },
-          )
-          // A delivered file speaks for itself; only a refusal needs words.
-          if (reply !== undefined) await port.send(msg.chatId, { markdown: reply }).catch(reportSendFailure)
-          return
+          const workspace = chatWorkspaces.pathFor(key)
+          // A group's `/get` holds the same slot the model's send does, and it
+          // is taken BEFORE the read: the bytes are read before anyone is asked,
+          // so a room with its cards already outstanding refuses the next
+          // command without spending a read or another buffer — which is
+          // exactly the bound `deliverFile` keeps for the model's own sends.
+          const gated = msg.chatType !== 'p2p'
+          if (gated && !holdFileSend(msg.chatId)) {
+            await port.send(msg.chatId, { text: getBusyText() }).catch(reportSendFailure)
+            return
+          }
+          // Released by whoever ends up holding the bytes: this arm releases on
+          // every early return, and the gated arm hands the claim to the spawned
+          // task, which releases it when the room is done with it.
+          let held = gated
+          try {
+            // Read and cleared BEFORE anything is offered, so a refusal and a
+            // read failure both answer immediately — and so the bytes a room is
+            // asked about are the bytes that leave, exactly as in `deliverFile`.
+            const target = await readGetTarget(msg.content, workspace, config.maxSendFileBytes)
+            if (!target.ok) {
+              await port.send(msg.chatId, { markdown: target.reply }).catch(reportSendFailure)
+              return
+            }
+            // A direct message goes straight out (ADR 0002): its only reader is
+            // the person authorized to drive this agent, who could have asked
+            // for the contents on screen instead. A GROUP does not: the bytes
+            // land in a room, and every other file that reaches a room passes an
+            // approval card — so a human's `/get` takes the gate the model's
+            // `send_file` takes, and the room decides.
+            //
+            // The gate is NOT awaited here. This runs inside the transport's
+            // per-chat queue, and a card click arrives through that same queue
+            // (the SDK serializes a chat's messages and its card actions on one
+            // tail), so awaiting it would deadlock the very press it waits for.
+            if (gated) {
+              // The room asked is the room the command came from, never the chat
+              // the session happens to be bound to: a conversation can be adopted
+              // by another chat through `/sessions`, and sending a file the first
+              // room asked for into the second would move its contents across
+              // rooms with nobody saying so.
+              const chat: GateChat = { chatId: msg.chatId, chatType: msg.chatType }
+              held = false
+              spawn(offerGetInGroup(chat, target.file, target.bytes, msg)
+                .finally(() => { releaseFileSend(chat.chatId) }))
+              await port.send(msg.chatId, { text: getHeldText(target.file.fileName) }).catch(reportSendFailure)
+              return
+            }
+            await sendGetFile(
+              { chatId: msg.chatId, chatType: msg.chatType },
+              target.file,
+              target.bytes,
+              msg,
+            )
+            return
+          } finally {
+            if (held) releaseFileSend(msg.chatId)
+          }
         }
         // Dispose the conversation's current agent so the next message walks
         // the ladder again — under a new id after `/cd`, or resuming the same
@@ -1667,26 +2213,48 @@ export function installBridge(
         // deliberate — this side disposed the agent, so "nothing is running"
         // is a synchronous fact, and the closing event of an aborted turn is
         // not guaranteed to arrive.
+        // The session the conversation is on BEFORE the command moves it, for
+        // the binding that has to go with it. Captured here for the same reason
+        // as the release below: `/cd` and `/new` both re-derive the id, and the
+        // id that has to be let go of is the old one.
+        const left = sessionIdOf(key)
         const release = releaseFor(key)
         const subject = subjectOf(msg)
         let reply: { markdown: string } | { card: object }
-        if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
-          // A directory change is a session change, so it also ends any pick:
-          // otherwise the conversation would move to a new workspace and go on
-          // talking to the session it was told to continue in the old one. It
-          // rides the same callback as the release, which the command runs only
-          // where the directory ACTUALLY moved — clearing before the command
-          // would retire a pick over a path that turned out not to exist.
+        if (channelCommand === CD_COMMAND) {
+          // A directory change moves the conversation to another directory's
+          // thread, which is a session change: the pointer of the directory
+          // being left stays where it is — so a `/cd` back returns to the
+          // session that directory was on — and the new directory resolves to
+          // its own pointer or its own derived session. It rides the same
+          // callback as the release, which the command runs only where the
+          // directory ACTUALLY moved.
           const moved = async (): Promise<void> => {
-            await chatSessionPicks.set(key, undefined)
             await release()
+            await stopWatching(key, msg.chatId, left)
           }
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, moved) }
+        } else if (channelCommand === WS_COMMAND) {
+          // Answered with the picker's first page. Reading the list and drawing
+          // it touch no session log, so this stays far inside the command's own
+          // budget — and a press on a row is what performs the switch, through
+          // the same `switch()` a typed `/cd` reaches.
+          reply = { card: workspacePicker(subject).card }
         } else if (channelCommand === NEW_COMMAND) {
-          // Same reason, more bluntly: `/new` asks for a session that has no
-          // history, which is the opposite of continuing one.
-          await chatSessionPicks.set(key, undefined)
-          reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
+          // A session that has never existed, which is the opposite of
+          // continuing one: the id is minted, not derived, so nothing the
+          // conversation already ran can be handed back as "new".
+          const moved = async (): Promise<void> => {
+            await release()
+            await stopWatching(key, msg.chatId, left)
+          }
+          const started = await runNewCommand({
+            anchorId: anchorOf(key),
+            pointer: sessionPointers,
+            release: moved,
+            report,
+          })
+          reply = { markdown: started.reply }
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
@@ -1754,7 +2322,7 @@ export function installBridge(
           report: notify,
           hintWorkspace: !hintedWorkspaces.has(workspace),
         })
-        if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
+        if (inbound.landed.length > 0) rememberOnce(hintedWorkspaces, workspace)
         images = await collectImages(
           msg,
           port,
@@ -1901,7 +2469,7 @@ export function installBridge(
       toolName: request.toolName,
       agent: request.agent,
       call,
-      paint: (outcome, decidedBy) => settledCard(request.toolName, outcome, decidedBy),
+      paint: (outcome, decidedBy) => settledCard(request.toolName, outcome, decidedBy, pending.decidedElsewhere),
       state: 'sending',
       settle: resolveOutcome,
       removeAbort: () => { request.signal?.removeEventListener('abort', onAbort) },
@@ -1935,7 +2503,46 @@ export function installBridge(
       }
       pendingApprovals.delete(id)
     }
-    return settled
+
+    // The card is up, so the question is now live in TWO places: this card, and
+    // whatever answerer comes after this listener — the Web app's, in the
+    // deployment this was built for. Both are shown and whichever decides first
+    // is the answer, so the two are raced rather than ranked. That is the whole
+    // point: a person at the keyboard answers where they are, and a person away
+    // from it answers from the chat, without either surface taking the decision
+    // away from the other.
+    //
+    // Racing is why `next()` is called at all here, and two consequences come
+    // with it, both accepted:
+    //  - a deployment with no browser attached leaves the forwarded request
+    //    pending on the host, because the gateway settles an undelivered request
+    //    only when a client replies or the request's own lifetime ends. It is
+    //    released with the agent, so it cannot accumulate past one session.
+    //  - the browser keeps its own buttons after the chat answers, since that UI
+    //    belongs to the host. Its own settled check makes a later press inert.
+    const viaWeb = next().then(
+      // 'unavailable' is not a decision: it is the waterfall reporting that no
+      // answerer took the question, and the innermost chain resolves with it the
+      // moment the chain runs out. Treating it as a winner would let a chat card
+      // that is still on screen lose to a chain that declined to answer — the
+      // press would be discarded and the tool refused. It drops out instead.
+      outcome => outcome === 'unavailable' ? NEVER_SETTLES : { from: 'web' as const, outcome },
+      // A Web branch that throws did not decide either, and the card is still
+      // live. Dropping out is expressed as a promise that never settles.
+      () => NEVER_SETTLES,
+    )
+    const winner = await Promise.race([
+      settled.then(outcome => ({ from: 'chat' as const, outcome })),
+      viaWeb,
+    ])
+    if (winner.from === 'chat') return winner.outcome
+    // The Web app decided first. Retire the chat's card, saying where the
+    // decision actually came from rather than crediting a press that never
+    // happened here. `settleApproval` is idempotent, so an answer that landed
+    // in the same tick is left as it stands.
+    pending.decidedElsewhere = true
+    settleApproval(id, winner.outcome)
+    return winner.outcome
   }
 
   /**
@@ -1958,7 +2565,7 @@ export function installBridge(
    * @returns undefined once it may go out, or the English reason it may not.
    */
   const askFileSend = async (
-    binding: ChatBinding,
+    binding: GateChat,
     file: OutboundFile,
     sending: Buffer,
     signal?: AbortSignal,
@@ -2042,6 +2649,60 @@ export function installBridge(
     // should not accumulate one entry per room it once sent a file to.
     if (left > 0) heldFileSends.set(chatId, left)
     else heldFileSends.delete(chatId)
+  }
+
+  /**
+   * Put one cleared file in the chat, with the failures said in the chat.
+   *
+   * Shared by `/get`'s two arms so the direct-message path and the group's
+   * approved path report a refused upload the same way. The bytes come from the
+   * caller's own read, never from a path re-resolved here.
+   * @param chat - where the bytes go.
+   * @param file - the cleared file.
+   * @param bytes - its contents, already read.
+   * @param msg - the message the command arrived on, for the reply target.
+   */
+  const sendGetFile = async (
+    chat: GateChat,
+    file: OutboundFile,
+    bytes: Buffer,
+    msg: NormalizedMessage,
+  ): Promise<void> => {
+    try {
+      await port.send(chat.chatId, { file: { source: bytes, fileName: file.fileName } }, replyOptions(replyTargetOf(msg)))
+    } catch (error) {
+      await port.send(chat.chatId, { markdown: `⚠️ 发送 \`${file.fileName}\` 失败：${failureDetail(error)}` })
+        .catch(reportSendFailure)
+    }
+  }
+
+  /**
+   * Ask a room before a human's `/get` puts bytes in it, then send what it allowed.
+   *
+   * Off the message queue by construction (the caller spawns it): the card is
+   * settled by a click that arrives on that same queue, so waiting for it there
+   * would be waiting for something this chat cannot deliver.
+   *
+   * The caller owns the chat's file-send slot for as long as this runs, and
+   * releases it when this settles: the buffer carried here is exactly what that
+   * bound accounts for, and this function knows nothing about the claim.
+   * @param chat - the group to ask.
+   * @param file - the cleared file.
+   * @param bytes - its contents, read before the room was asked.
+   * @param msg - the message the command arrived on, for the reply target.
+   */
+  const offerGetInGroup = async (
+    chat: GateChat,
+    file: OutboundFile,
+    bytes: Buffer,
+    msg: NormalizedMessage,
+  ): Promise<void> => {
+    const refused = await askFileSend(chat, file, bytes)
+    if (refused !== undefined) {
+      await port.send(chat.chatId, { text: `⚠️ ${refused}` }).catch(reportSendFailure)
+      return
+    }
+    await sendGetFile(chat, file, bytes, msg)
   }
 
   /**
@@ -2169,14 +2830,21 @@ export function installBridge(
     const choice = questionActionValue(evt.action.value)
     if (choice !== undefined) {
       // A question is a choice, not an escalation: anyone the chat serves may
-      // answer it, exactly as they could by typing the answer instead.
+      // answer it, exactly as they could by typing the answer instead. The press
+      // still has to come from the chat the card was published to, which the
+      // store checks against the chat carried here.
       //
       // A multiple choice arrives as a form submission, whose chosen set the
       // platform delivers beside the button's own value rather than in it.
       const submitted = (evt.action.formValue as Record<string, unknown> | undefined)?.[QUESTION_SELECT]
       const settled = questions.answerByClick(
         choice,
-        Array.isArray(submitted) ? submitted.map(entry => String(entry)) : [],
+        { chatId: evt.chatId, operatorId: evt.operator.openId },
+        Array.isArray(submitted)
+          ? submitted
+            .slice(0, MAX_QUESTION_SUBMISSIONS)
+            .map(entry => String(entry).slice(0, MAX_QUESTION_FIELD_CHARS))
+          : [],
       )
       return settled === undefined
         ? { toast: toast('info', TOAST.questionGone) }
@@ -2188,6 +2856,8 @@ export function installBridge(
     if (preset !== undefined) return switchPresetFromCard(preset, evt)
     const session = sessionActionValue(evt.action.value)
     if (session !== undefined) return continueSession(session, evt)
+    const workspace = workspaceActionValue(evt.action.value)
+    if (workspace !== undefined) return handleWorkspaceAction(workspace, evt)
     const refresh = statusActionValue(evt.action.value)
     if (refresh !== undefined) {
       const refusal = refuseControlClick(refresh, evt)
@@ -2305,10 +2975,17 @@ export function installBridge(
         : port
           .send(chatId, { text: landed.ok ? presetSwitchedText(preset) : presetFailedText(preset, landed.detail) })
           .catch(reportSendFailure)
+    // A stopwatch on someone else's work must not be what keeps the process
+    // alive, and must not outlive the race it exists for: unref'd while it
+    // waits, cleared the moment either side settles.
+    let deadline: NodeJS.Timeout | undefined
     const quick = await Promise.race([
       pending,
-      new Promise<undefined>(resolve => { setTimeout(() => { resolve(undefined) }, QUICK_SWITCH_MS) }),
-    ])
+      new Promise<undefined>((resolve) => {
+        deadline = setTimeout(() => { resolve(undefined) }, QUICK_SWITCH_MS)
+        deadline.unref?.()
+      }),
+    ]).finally(() => { if (deadline !== undefined) clearTimeout(deadline) })
     if (quick !== undefined) {
       await say(quick)
       return
@@ -2318,16 +2995,112 @@ export function installBridge(
   }
 
   /**
-   * Continue the session one row named.
+   * Act on one press of the workspace picker: switch, or turn a page.
+   *
+   * Both travel as one payload kind, so this is the single arm that reaches
+   * either. A page control changes nothing but what is drawn — no switch, no
+   * release, no pick is retired — which is what makes paging safe to press
+   * repeatedly while deciding.
+   *
+   * A row goes through {@link ChatWorkspaces.switch}, the same call a typed
+   * `/cd` makes, so every guard a typed path faces — the directory must exist,
+   * it must not be a filesystem root or a home directory, it must sit under the
+   * configured roots — applies unchanged. The payload's path is not trusted;
+   * it is re-probed. What the picker adds is that the directory is usually one
+   * the channel already knows, so the press cannot fail for a typo.
+   * @param value - the payload the pressed row or control carried.
+   * @param evt - the click, for authorization and the operator log.
+   * @returns the toast and the repainted picker.
+   */
+  const handleWorkspaceAction = async (
+    value: WorkspaceActionValue,
+    evt: CardActionEvent,
+  ): Promise<CardActionResponse> => {
+    const refusal = refuseControlClick(value, evt)
+    if (refusal !== undefined) {
+      notify(`lark-channel: rejected a workspace switch: ${refusal}`)
+      return { toast: toast('error', TOAST.notYours) }
+    }
+    if (value.path === undefined) {
+      const painted = workspacePicker(subjectOfValue(value), value.page ?? 0)
+      return { card: { type: 'raw', data: painted.card } }
+    }
+    const before = conversationStamp(value.key)
+    // The session the conversation is on before the directory moves, so the
+    // chat stops watching it: a workspace switch is a session change.
+    const left = sessionIdOf(value.key)
+    const release = releaseFor(value.key)
+    const result = await chatWorkspaces.switch(value.key, value.path)
+    if (!result.ok) {
+      notify(`lark-channel: rejected a workspace switch in ${value.key}: ${result.reason}`)
+      return {
+        toast: toast('error', TOAST.workspaceRefused),
+        card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+      }
+    }
+    if (!result.changed) {
+      return {
+        toast: toast('info', TOAST.workspaceSame),
+        card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+      }
+    }
+    // The directory moved, so this conversation's next message must walk the
+    // ladder under the new anchor: each directory keeps its own pointer, and
+    // the one being entered resolves to its own session.
+    if (conversationStamp(value.key) !== before) notify(`lark-channel: ${value.key} moved twice quickly`)
+    await release()
+    await stopWatching(value.key, value.chatId, left)
+    diag('info', `lark-channel: ${value.key} switched workspace to ${result.path}`)
+    notify(`lark-channel: ${value.key} switched to ${result.path}`)
+    return {
+      toast: toast('success', TOAST.workspaceSwitched),
+      card: { type: 'raw', data: workspacePicker(subjectOfValue(value)).card },
+    }
+  }
+
+  /**
+   * The session cards already spent by a pick.
+   *
+   * A card is single-use: the rows it carries were authorized by one derivation,
+   * and the pick retires that card rather than redrawing it with new buttons. A
+   * press arriving afterwards — the platform redelivering one, or a card whose
+   * terminal repaint never reached the chat — must not resume a list this
+   * conversation has already moved on from.
+   */
+  const spentSessionCards = new Set<string>()
+
+  /** Bound on the marks kept, so a long-lived process cannot grow this forever. */
+  const SPENT_CARDS_MAX = 256
+
+  /**
+   * Record one rendering as spent, dropping the oldest mark once the bound is
+   * reached. Oldest-first is exact: a mark is only ever added once, and the
+   * insertion order of a `Set` is the order its keys were added.
+   * @param mark - the rendering's mark, as the pressed payload carried it.
+   */
+  const spendSessionCard = (mark: string): void => {
+    if (spentSessionCards.size >= SPENT_CARDS_MAX) {
+      const oldest = spentSessionCards.values().next().value
+      if (oldest !== undefined) spentSessionCards.delete(oldest)
+    }
+    spentSessionCards.add(mark)
+  }
+
+  /**
+   * Answer one session card press: continue a row, or turn a page.
    *
    * The payload's id is not trusted: the same list is derived again and the id
    * must still be in it. A card outlives the state it was drawn from — a
    * session can be archived, a `/cd` can move the conversation elsewhere — and
    * the only thing that may resume a session here is a row this conversation
    * would be offered NOW.
-   * @param value - the payload the pressed row carried.
+   *
+   * Every exit settles the card, including the ones that chose nothing: a card
+   * whose press could not land has just proved the list behind it stale, and
+   * redrawing it live would invite a second press on that same stale list.
+   * @param value - the payload the pressed row or page control carried.
    * @param evt - the click, for authorization and the operator log.
-   * @returns the toast and the repainted picker.
+   * @returns the toast and the card the press settles into.
    */
   const continueSession = async (
     value: SessionActionValue,
@@ -2338,57 +3111,155 @@ export function installBridge(
       notify(`lark-channel: rejected a session switch: ${refusal}`)
       return { toast: toast('error', TOAST.notYours) }
     }
+    // Checked before the page arm as well: a spent card's page control is a
+    // button on a card that is already closed.
+    if (spentSessionCards.has(value.a)) {
+      notify(`lark-channel: ${value.key} pressed a session card that was already used`)
+      return {
+        toast: toast('info', TOAST.sessionCardSpent),
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'spent',
+          }),
+        },
+      }
+    }
+    // A page control moves nothing: it repaints the same list, one page along,
+    // and reads the corpus again so what it draws is the corpus as it is now.
+    if (value.page !== undefined) {
+      return { card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', value.page) } }
+    }
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
     const before = conversationStamp(value.key)
-    const offered = await offeredSessions(value.key)
+    // The session the conversation is on if this press lands, so the chat stops
+    // watching the one it leaves at the same moment it starts on the new one.
+    const left = sessionIdOf(value.key)
+    // ONE derivation per press, and it is a FRESH one. The rows a press may name
+    // are exactly the rows this list holds, and a card outlives the corpus it
+    // was drawn from — so the list is read now rather than reused from the card.
+    const offered = await derive(value.key)
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
-      notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
+      notify(`lark-channel: ${String(value.session)} is no longer offered to ${value.key}`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'gone',
+          }),
+        },
       }
     }
-    // The derived one is not an override: picking it is how a conversation
-    // goes back, and going back means having no pick at all.
+    // The workspace still has to be the one this row was offered under. A card
+    // outlives the conversation's directory: `/cd` moves it, and a press on the
+    // older card would otherwise continue a session from the directory the chat
+    // has left — the exact sandbox move the picker filters against.
+    if (value.workspace !== undefined && value.workspace !== chatWorkspaces.pathFor(value.key)) {
+      notify(`lark-channel: ${value.key} left ${value.workspace} since that card was drawn`)
+      return {
+        toast: toast('info', TOAST.sessionGone),
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'moved',
+          }),
+        },
+      }
+    }
+    // The derived one is not an override: pressing it is how a conversation
+    // goes back, and going back means having no pointer at all.
     const derived = chatWorkspaces.sessionIdFor(value.key)
     // Checked before the release as well as after it: the release disposes a
     // live agent, and a press that has already lost its conversation should not
     // cost the room its running one.
     if (conversationStamp(value.key) === before) await releaseFor(value.key)()
     // A `/cd` or a `/new` may have landed while this was deriving and releasing.
-    // Both of them END a pick, and both of them ran their own clear BEFORE this
-    // write would land — so writing anyway would resurrect a pick they retired,
-    // pointing at a session belonging to a workspace this conversation left.
+    // Both move what the conversation resolves to, so a pointer written now would
+    // override what the person asked for in the meantime — and a `/cd` would put
+    // this press's session under the directory it just left.
     if (conversationStamp(value.key) !== before) {
       notify(`lark-channel: ${value.key} moved while a session switch was in flight`)
       return {
         toast: toast('info', TOAST.sessionGone),
-        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value)) },
+        card: {
+          type: 'raw',
+          data: settledSessionsCard({
+            workspace: chatWorkspaces.pathFor(value.key),
+            refusal: 'moved',
+          }),
+        },
       }
     }
-    await chatSessionPicks.set(value.key, choice.id === derived ? undefined : choice.id)
+    await sessionPointers.set(anchorOf(value.key), choice.id === derived ? undefined : choice.id)
+    // And it stops watching the one it left, in the same step. A pick is an
+    // override on the derived session, so the conversation it was on before is
+    // still live somewhere — a browser, a schedule — and it used to go on
+    // rendering into this chat beside the session just picked.
+    await stopWatching(value.key, value.chatId, left)
+    // The chat now claims that conversation, so it starts watching it here
+    // rather than on its next message. A binding is what routes a session's
+    // events to this chat, and until one exists every event of that session is
+    // dropped — so without this line a turn driven from the Web app on the
+    // session this chat just claimed reaches the chat not at all, and only
+    // recovers once somebody happens to type here.
+    //
+    // Only a row that is NOT this conversation's own derived id is bound: those
+    // rows come from the corpus listing, so each names a session that already
+    // exists. Picking the derived id means going back to a session this chat
+    // creates with its next message, and there is nothing to watch yet — the
+    // message path binds it then, exactly as it binds every fresh conversation.
+    if (choice.id !== derived) {
+      await bindingFor(choice.id, { chatId: value.chatId, chatType: value.chatType })
+    }
+    // The card is spent the moment the pick lands, not before it: a press that
+    // failed above must leave the card answerable by another.
+    spendSessionCard(value.a)
+    // Recorded, not just announced: the press succeeds and the failure arrives
+    // later, on the next message, when the pick is finally resumed. Without this
+    // line an operator sees a switch that reported success and a chat that then
+    // refused to continue, with nothing tying the two together.
+    diag('info', `lark-channel: ${value.key} picked ${choice.id === derived ? 'its own session' : choice.id}`)
     notify(`lark-channel: ${value.key} continues ${choice.id}`)
+    // The settled card rides the click's own response, exactly as a decided
+    // approval does: the patch API reports refusals in a body the SDK discards,
+    // so a repaint that failed would be invisible — and a card left showing live
+    // buttons after its pick is worse than any toast.
     return {
       toast: toast('success', choice.id === derived ? TOAST.sessionOwn : TOAST.sessionSwitched),
-      // Repainted from the list this press was authorized against: the facts
-      // behind each row cannot have changed in between, and the one thing that
-      // did — which row is current — is read fresh below.
-      card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+      card: {
+        type: 'raw',
+        data: settledSessionsCard({
+          // Labelled from the same derivation the press was authorized against,
+          // so the card cannot name a different conversation than the one the
+          // pick wrote.
+          picked: cardRowFor(offered.label([choice])[0] ?? choice, chatWorkspaces.sessionIdFor(value.key)),
+          workspace: chatWorkspaces.pathFor(value.key),
+          // Named only where the conversation is a room's: telling one person
+          // their own name back is noise, and the gate that matters is the
+          // control gate, not this line.
+          ...value.owner === undefined ? { decidedBy: await resolveApprovalDecider(evt) } : {},
+        }),
+      },
     }
   }
 
   /**
    * What a conversation resolves to, as one comparable value.
    *
-   * The workspace and the derived id together: `/cd` moves the first, `/new`
-   * moves the second, and either one retires a pick.
+   * The directory and the session it currently runs together: `/cd` moves the
+   * first, `/new` and a pick move the second, and either one retires a card
+   * that was drawn before it.
    * @param key - the conversation key.
    * @returns a value that changes whenever the conversation does.
    */
   const conversationStamp = (key: string): string =>
-    `${chatWorkspaces.pathFor(key)}\u0000${chatWorkspaces.sessionIdFor(key)}`
+    `${chatWorkspaces.pathFor(key)}\u0000${sessionIdOf(key)}`
 
   /**
    * The conversation a card payload names, without whatever else it carries.
@@ -2403,57 +3274,143 @@ export function installBridge(
   })
 
   /**
+   * What this conversation may continue, as one derivation.
+   * @param key - the conversation key.
+   * @param keyword - optional filter over titles and ids.
+   * @returns the derivation, or an empty one where nothing can be listed.
+   */
+  const derive = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+    const offer = offerFor(key, keyword)
+    return offer === undefined ? EMPTY_OFFER : await offerSessions(offer)
+  }
+
+  /**
+   * One derived row as the card's own row type.
+   * @param choice - the derived row.
+   * @param current - the session this conversation resolves to right now.
+   * @returns the row the card renders, and the settled card names.
+   */
+  const cardRowFor = (choice: SessionChoice, current: string): SessionCardRow => ({
+    id: choice.id,
+    ...choice.title === undefined ? {} : { title: choice.title },
+    ...choice.lastSaid === undefined ? {} : { lastSaid: choice.lastSaid },
+    ...choice.turns === undefined ? {} : { turns: choice.turns },
+    // Last movement, not creation: "recent" in a list of conversations
+    // means the one you were just in, not the one you opened first.
+    ...(choice.lastActive ?? choice.createdAt) === undefined
+      ? {}
+      : { when: choice.lastActive ?? choice.createdAt },
+    live: choice.live,
+    own: choice.own,
+    // Read now rather than taken from the row: a repaint follows the press
+    // that moved it, and the row was derived before that.
+    current: choice.id === current,
+  })
+
+  /**
    * The picker for one conversation: what it may continue, and one press each.
    *
    * Everything the card offers is resolved here, because the list IS the
-   * authorization — a row that never appears cannot be pressed, and the click
-   * handler re-derives the same list rather than trusting the payload's id.
+   * authorization — a row that never appears cannot be pressed.
    * @param subject - the conversation the card is built for.
    * @param line - the command line, so a keyword can narrow the list.
-   * @param derived - a list already derived for this conversation, to repaint
-   * from instead of reading every session's log a second time.
+   * @param page - the zero-based page to draw; out-of-range values clamp.
+   * @param derived - a derivation the caller already made for this conversation,
+   * so a repaint after a press does not read the corpus a second time. Only the
+   * row marked current is read fresh inside.
    * @returns the card to send.
    */
   const sessionPicker = async (
     subject: ConversationSubject,
     line = '',
+    page = 0,
     derived?: OfferedSessions,
   ): Promise<object> => {
     const keyword = line.trimStart().replace(/^\/\S+\s*/, '').trim()
-    const offered = derived ?? await offeredSessions(subject.key, keyword)
+    const listed = derived ?? await derive(subject.key, keyword)
+    const sliced = sessionsPage(listed, page)
+    // Labelled after the slice: what a conversation was last about is the one
+    // fact whose state grows with the session, so it is read for the rows the
+    // card draws rather than for the whole corpus.
+    const drawn = listed.label(sliced.rows)
     const current = sessionIdOf(subject.key)
+    // ONE mark for every control on this rendering, because the card is
+    // single-use: the first pick retires it, and a press arriving afterwards
+    // has to be recognizable as one of ITS buttons rather than just as some
+    // well-formed payload. Turning a page mints a new card, so paging is
+    // unaffected.
+    const stamp = cardMarker()
     return sessionsCard({
-      rows: offered.rows.map(choice => ({
-        id: choice.id,
-        ...choice.title === undefined ? {} : { title: choice.title },
-        ...choice.lastSaid === undefined ? {} : { lastSaid: choice.lastSaid },
-        ...choice.turns === undefined ? {} : { turns: choice.turns },
-        // Last movement, not creation: "recent" in a list of conversations
-        // means the one you were just in, not the one you opened first.
-        ...(choice.lastActive ?? choice.createdAt) === undefined
-          ? {}
-          : { when: choice.lastActive ?? choice.createdAt },
-        live: choice.live,
-        own: choice.own,
-        // Read now rather than taken from the row: a repaint follows the press
-        // that moved it, and the row was derived before that.
-        current: choice.id === current,
-      })),
+      rows: drawn.map(choice => cardRowFor(choice, current)),
       workspace: chatWorkspaces.pathFor(subject.key),
-      hidden: offered.hidden,
+      page: sliced.page,
+      pages: sliced.pages,
+      // Only a list that cannot be paged reports what it left out; a paged one
+      // draws every row it has, so a count beside it would name nothing.
+      hidden: listed.complete ? 0 : listed.hidden,
       ...keyword === '' ? {} : { keyword },
       canList: sessionQuery() !== undefined,
       // The row's own id LAST: a caller may hand in a payload that already
       // carries one — the click handler repaints from the value it was given —
       // and spreading that over the row would point every button at the
       // session someone just pressed.
-      valueFor: session => marked({ kind: SESSIONS_ACTION, ...subject, session }),
+      valueFor: session => stamp({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        session,
+        // The workspace each row was offered under, so a press is authorized
+        // against what the card actually showed without re-deriving the list.
+        workspace: chatWorkspaces.pathFor(subject.key),
+      }),
+      // The same payload kind carries a page control, so the dispatcher has one
+      // arm to reach and a foreign card cannot forge either.
+      pageValueFor: target => stamp({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        page: target,
+        workspace: chatWorkspaces.pathFor(subject.key),
+      }),
     })
   }
 
   /** The host's session-query engine, when this deployment composed one. */
   const sessionQuery = (): HostSessionQuery | undefined =>
     ctx.get('sessionQuery') as HostSessionQuery | undefined
+
+  /**
+   * The workspace picker: which directory this conversation runs in, and one
+   * press each for the rest.
+   *
+   * Reads nothing but channel state — the known paths are the default, what
+   * this conversation switched to, and what the host registry lists — so both
+   * drawing it and turning a page answer in well under the callback budget.
+   * @param subject - the conversation the card is built for.
+   * @param page - the zero-based page to draw; out-of-range values clamp.
+   * @returns the card to send, and the page it drew.
+   */
+  const workspacePicker = (
+    subject: ConversationSubject,
+    page = 0,
+  ): { readonly card: object; readonly page: number } => {
+    const choices = workspaceChoices(chatWorkspaces, subject.key)
+    const sliced = workspacePage(choices, page)
+    const card_ = workspacesCard({
+      rows: sliced.rows,
+      page: sliced.page,
+      pages: sliced.pages,
+      current: chatWorkspaces.pathFor(subject.key),
+      // Both a row and a page control travel as this one payload kind, so the
+      // dispatcher has a single arm to reach and a foreign card cannot forge
+      // either: the mark is minted per rendering, and the fields are validated.
+      valueFor: target => marked({
+        kind: WORKSPACE_ACTION,
+        ...subject,
+        ...target.path === undefined ? {} : { path: target.path },
+        ...target.page === undefined ? {} : { page: target.page },
+      }),
+    })
+    return { card: card_, page: sliced.page }
+  }
 
   /**
    * Sessions the operator archived, which no surface should offer.
@@ -2469,7 +3426,14 @@ export function installBridge(
   }
 
   /**
-   * What this conversation may continue right now.
+   * What this conversation may continue right now, as the offer `sessions.ts`
+   * derives from.
+   *
+   * Re-derived on every render and every press rather than reused: the list is
+   * the authorization, and a list remembered from an earlier draw authorizes
+   * rows the conversation may have outgrown. That was only affordable once the
+   * host began handing back what it already folds — a derivation is now one
+   * corpus listing and, per drawn row, one stored projection read.
    *
    * The conversation's half of {@link offerSessions}: which chat, which
    * workspace, and what this deployment lets us read. The rule itself lives in
@@ -2477,13 +3441,15 @@ export function installBridge(
    * running channel.
    * @param key - the conversation key.
    * @param keyword - optional filter over titles and ids.
-   * @returns the rows to offer and the hidden count.
+   * @returns the offer to derive from, or undefined where nothing can be listed.
    */
-  const offeredSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+  const offerFor = (key: string, keyword = ''): SessionOffer | undefined => {
     const query = sessionQuery()
-    if (query === undefined) return { rows: [], hidden: 0 }
-    return offerSessions({
+    if (query === undefined) return undefined
+    const diagnose = config.diagnoseSessions === true
+    return {
       query,
+      sources: sessionSources(),
       scope: {
         base: sessionIdFor(key, instanceIdentity(config.instance).sessionPrefix),
         current: sessionIdOf(key),
@@ -2494,9 +3460,28 @@ export function installBridge(
       },
       canonical: path => canonicalPathOf(path) ?? path,
       signal: commandSignal(),
-      report: notify,
-    })
+      // The picker's account of itself is a diagnostic, so every line goes to
+      // the channel's own file as well as the terminal: the question it answers
+      // is usually asked long after the window that ran the bot was closed.
+      report: diagnose ? (line) => { diag('warn', line); notify(line) } : notify,
+      ...diagnose ? { diagnose: true } : {},
+    }
   }
+
+  /**
+   * The days of `offerSessions` that live on the host.
+   *
+   * `liveSession` is what makes a running session's row exact rather than as
+   * stale as its last checkpoint: the registry holds the cells of every session
+   * this process has attached, and this channel already asks it for other
+   * readouts.
+   * @returns the cache faces this deployment composes; every one is optional.
+   */
+  const sessionSources = (): FactSources => ({
+    cache: ctx.get('sessionProjectionCache') as HostSessionProjectionCache | undefined,
+    projections: projections(),
+    liveSession: id => sessions.agentFor(id)?.session,
+  })
 
   /**
    * Whether one preset switch may proceed, wherever it was asked from.
@@ -2763,11 +3748,19 @@ export function installBridge(
    * @returns the callback name, resolved member name, or safe open-id fallback.
    */
   const resolveApprovalDecider = async (evt: CardActionEvent): Promise<string> => {
-    if (evt.operator.name !== undefined && evt.operator.name !== '') return evt.operator.name
+    // Clipped like every other value a card carries: the name is the operator's
+    // own text, and the settled card has to stay within what the platform will
+    // render.
+    const named = (value: string | undefined): string | undefined => {
+      const clipped = value?.replace(/[\s\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, DECIDER_NAME_MAX_CHARS)
+      return clipped === undefined || clipped === '' ? undefined : clipped
+    }
+    const callback = named(evt.operator.name)
+    if (callback !== undefined) return callback
     try {
       const members = await port.getChatMembers?.(evt.chatId)
-      const name = members?.find(member => member.id === evt.operator.openId)?.name
-      if (name !== undefined && name !== '') return name
+      const member = named(members?.find(candidate => candidate.id === evt.operator.openId)?.name)
+      if (member !== undefined) return member
     } catch (error) {
       // Name decoration must never turn a valid approval into a failed send.
       ctx.logger.debug('could not resolve approval decider name', error)
@@ -2865,6 +3858,40 @@ export function installBridge(
     aimAt(sessionId, binding, claimed)
   })
 
+  // Live model output no longer rides the session log: `assistant/chunk` was
+  // retired and the loop publishes `agent/assistant-stream` per agent instead.
+  // Translate each chunk frame back into the shape the renderers already read,
+  // so streaming — and the reasoning area of a thinking process — survives the
+  // move without either renderer knowing which host published the text.
+  const turnByAttempt = new Map<string, number>()
+  ctx.on('agent/assistant-stream', (payload: AssistantStreamPayload) => {
+    const sessionId = payload.agent?.session?.id
+    if (sessionId === undefined) return
+    const binding = bySession.get(sessionId)
+    if (binding === undefined) return
+    const frame = payload.frame
+    if (frame === undefined) return
+    if (frame.type === 'start') {
+      turnByAttempt.set(frame.attemptId, frame.turn)
+      return
+    }
+    if (frame.type === 'end') {
+      // This attempt's frames stop here; the next start re-registers its turn.
+      turnByAttempt.delete(frame.attemptId)
+      return
+    }
+    const turn = turnByAttempt.get(frame.attemptId)
+    // No start seen: this process attached mid-attempt. A chunk carries no turn
+    // of its own, so dropping it beats guessing which turn it belongs to.
+    if (turn === undefined) return
+    try {
+      binding.renderer.handle({ type: 'assistant/chunk', data: { turn, chunk: frame.chunk } })
+    } catch (error) {
+      notify(`lark-channel: rendering a live chunk of ${sessionId} failed: ${failureDetail(error)}`)
+      ctx.logger.warn('rendering a live chunk failed: %s', error)
+    }
+  })
+
   // Outbound: the owned chat's renderer decides what reaches the chat. The
   // bridge additionally remembers each call's arguments for the approval card,
   // and forgets the turn's calls once it closes.
@@ -2887,6 +3914,17 @@ export function installBridge(
       if (claimed !== undefined && event.data.id !== undefined) {
         targetByMessageId.delete(event.data.id)
         aimAt(session.id, binding, claimed)
+      }
+      // Mirror a prompt typed in another surface: the person driving this
+      // session from a browser still wants to read their own line here, beside
+      // the answer it produced. `rpcId` marks a browser-minted prompt, so this
+      // channel's own input — which has none — is never echoed back to the chat
+      // that sent it, and the host's synthetic context stays out of the chat.
+      if (event.data.source?.rpcId !== undefined) {
+        const mirrored = userText(event.data)
+        if (mirrored !== '') {
+          void port.send(binding.chatId, { markdown: mirrored }).catch(reportSendFailure)
+        }
       }
     } else if (isToolCallEvent(event)) {
       let calls = callSnapshots.get(session.id)
@@ -2924,8 +3962,36 @@ export function installBridge(
     }
     // AFTER the renderer: the turn's own closing output (the answer, a failure
     // line) still deserves its target; only what comes later must not.
-    if (isTurnEndEvent(event)) aimAt(session.id, binding, undefined)
+    if (isTurnEndEvent(event)) {
+      aimAt(session.id, binding, undefined)
+      // A turn the host refused carries no request and no answer, so the chat
+      // would otherwise just see its own message unanswered. `blocked` has other
+      // producers — any pre-step rejection ends a turn that way — so the archive
+      // set is what decides whether the archive is the account of this one.
+      if (event.data.reason.kind === 'blocked' && archivedSessions().has(session.id)) {
+        void port.send(binding.chatId, { text: ARCHIVED_SESSION_NOTICE.zh }).catch(reportSendFailure)
+      }
+    }
   })
+
+  // Structured questions are offered on both surfaces at once, exactly as
+  // approvals are: this chat gets a card and whatever answerer follows gets the
+  // Web app's question panel, and the first answer decides.
+  //
+  // PREPEND for the same reason the approval listener prepends. The Web app's
+  // answerer is registered during tree load and holds the question until a
+  // browser answers it, so a listener behind it would never be reached and a
+  // chat would wait forever on a question nobody in the browser is looking at.
+  //
+  // Only a conversation this channel already holds a binding for is claimed.
+  // Everything else — a session the Web app is driving on its own — delegates,
+  // and that delegation is what keeps the panel the only surface for it.
+  ctx.on('user-questions/request', (request, next) => {
+    const sessionId = request.agent?.session.id
+    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
+    if (binding === undefined || sessionId === undefined) return next()
+    return askOnBothSurfaces(binding, sessionId, request, next)
+  }, { prepend: true })
 
   // Approval questions for owned agents become cards; everything else delegates.
   //
@@ -2955,6 +4021,7 @@ export function installBridge(
     const open = [...bySession.values()]
     bySession.clear()
     bindings.clear()
+    bindingGenerations.clear()
     compositions.clear()
     callSnapshots.clear()
     runningBySession.clear()

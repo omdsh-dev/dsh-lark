@@ -4,11 +4,10 @@ import {
   QUESTION_ACTION,
   questionActionValue,
   questionCard,
-  shadowQuestionTool,
   SUBMIT_OPTION,
 } from '../src/questions.ts'
-import type { AskedQuestion, QuestionAnswer } from '../src/questions.ts'
-import { assertRegistrableTool, assertSupportedSchema, cardControls, cardTexts } from './harness.ts'
+import type { AskedQuestion, QuestionPorts } from '../src/questions.ts'
+import { cardControls, cardTexts } from './harness.ts'
 
 /** One question with two options, as a model would ask it. */
 const asked: AskedQuestion = {
@@ -22,7 +21,7 @@ const asked: AskedQuestion = {
 }
 
 /** A store over an in-memory transport, recording what it sent and repainted. */
-function createStore() {
+function createStore(ports: Partial<Pick<QuestionPorts, 'refuseApprover'>> = {}) {
   const sent: { chatId: string; card: object }[] = []
   const updated: { messageId: string; card: object }[] = []
   const reports: string[] = []
@@ -33,6 +32,7 @@ function createStore() {
     },
     update: async (messageId, card) => { updated.push({ messageId, card }) },
     report: (line) => { reports.push(line) },
+    ...ports,
   })
   return { store, sent, updated, reports }
 }
@@ -128,7 +128,7 @@ describe('multiple choice', () => {
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
 
-    const settled = store.answerByClick(submit, ['0', '2'])
+    const settled = store.answerByClick(submit, { chatId: 'oc_1' }, ['0', '2'])
     expect(await answer).toEqual({ id: 'q-scope', selected: ['bridge', 'session'] })
     expect(settled).toBeDefined()
     expect(textOf(settled!)).toContain('bridge、session')
@@ -141,8 +141,12 @@ describe('multiple choice', () => {
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
 
-    expect(store.answerByClick(submit, [])).toBeUndefined()
-    expect(store.answerByClick(submit, ['9'])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, [])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, ['9'])).toBeUndefined()
+    // A position that is not a position names nothing: `Number('')` is 0 and
+    // `Number('0x1')` is 1, so a non-canonical entry must not select an option.
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, [''])).toBeUndefined()
+    expect(store.answerByClick(submit, { chatId: 'oc_1' }, ['0x1'])).toBeUndefined()
     expect(store.awaiting('s1')).toBe(true)
     // Still answerable, by the same means as any other question.
     store.answerByText('s1', '全都要')
@@ -163,7 +167,7 @@ describe('ChatQuestions', () => {
     expect(store.awaiting('s1')).toBe(true)
 
     const [, second] = buttonsOf(sent[0]!.card)
-    const settled = store.answerByClick({ kind: QUESTION_ACTION, id: second!.id, option: second!.option })
+    const settled = store.answerByClick({ kind: QUESTION_ACTION, id: second!.id, option: second!.option }, { chatId: 'oc_1' })
     expect(await answer).toEqual({ id: 'q-deploy', selected: ['先跑测试'] })
     // The decided card comes BACK from the click, for the caller to return in
     // the callback response — the patch API's refusals are invisible, so a
@@ -195,13 +199,133 @@ describe('ChatQuestions', () => {
     await answer
   })
 
+  it('ignores a click that arrives from another chat, and says so on the console', async () => {
+    const { store, sent, reports } = createStore()
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // A card can be forwarded and its payload travels with it, so the chat is
+    // the one fact a forwarded press cannot fake: the question stays open.
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_elsewhere' }))
+      .toBeUndefined()
+    expect(store.awaiting('s1')).toBe(true)
+    expect(reports.some(line => line.includes('oc_elsewhere'))).toBe(true)
+
+    // The press from the chat the card belongs to still counts.
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_1' })).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+  })
+
+  it('gates a question that grants something on the approver rule', async () => {
+    const { store, sent, reports } = createStore({
+      refuseApprover: click => click.operatorId === 'ou_lead' ? undefined : `operator ${String(click.operatorId)} is not in approvers`,
+    })
+    const answer = store.ask({
+      sessionId: 's1',
+      chatId: 'oc_1',
+      question: asked,
+      // A plan review leaves plan mode and starts executing the plan, so the
+      // deployment's approver list decides who may make that press.
+      requiresApprover: true,
+    })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // Anyone the chat serves may answer an ordinary question; this one is a
+    // grant, so a member who is not an approver is refused and logged.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 0 },
+      { chatId: 'oc_1', operatorId: 'ou_bystander' },
+    )).toBeUndefined()
+    expect(store.awaiting('s1')).toBe(true)
+    expect(reports.some(line => line.includes('not in approvers'))).toBe(true)
+
+    // And the named approver's press is the one that settles it.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 0 },
+      { chatId: 'oc_1', operatorId: 'ou_lead' },
+    )).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+  })
+
+  it('leaves an ordinary question open to whoever the chat serves', async () => {
+    const { store, sent } = createStore({
+      refuseApprover: () => 'operator is not in approvers',
+    })
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const [first] = buttonsOf(sent[0]!.card)
+
+    // The rule is asked only where the asker said the question grants
+    // something: an ordinary question is not an escalation.
+    expect(store.answerByClick(
+      { kind: QUESTION_ACTION, id: first!.id, option: 1 },
+      { chatId: 'oc_1', operatorId: 'ou_bystander' },
+    )).toBeDefined()
+    expect(await answer).toEqual({ id: 'q-deploy', selected: ['先跑测试'] })
+  })
+
+  it('repaints the retried card when the question settled during the retry', async () => {
+    const sent: { chatId: string; card: object }[] = []
+    const updated: { messageId: string; card: object }[] = []
+    const reports: string[] = []
+    let attempts = 0
+    let releaseRetry!: () => void
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve })
+    const store = new ChatQuestions({
+      send: async (chatId, card) => {
+        sent.push({ chatId, card })
+        attempts += 1
+        // The first attempt fails before naming a card; the retry is slow, which
+        // is the window the repaint exists for.
+        if (attempts === 1) throw new Error('response lost')
+        await retryGate
+        return `om_q_${attempts}`
+      },
+      update: async (messageId, card) => { updated.push({ messageId, card }) },
+      report: (line) => { reports.push(line) },
+    })
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    // Settled while the retry was still in flight: the card the platform is
+    // about to render must not keep offering a press.
+    store.answerByText('s1', 'typed')
+    releaseRetry()
+
+    expect(await answer).toEqual({ id: 'q-deploy', selected: [], custom: 'typed' })
+    await vi.waitFor(() => { expect(updated.map(entry => entry.messageId)).toEqual(['om_q_2']) })
+    expect(reports.some(line => line.includes('retrying once'))).toBe(true)
+  })
+
+  it('asks nothing at all when the turn was already cancelled', async () => {
+    const { store, sent, reports } = createStore()
+    const controller = new AbortController()
+    controller.abort()
+
+    const answer = await store.ask({
+      sessionId: 's1',
+      chatId: 'oc_1',
+      question: asked,
+      signal: controller.signal,
+    })
+
+    // The abort event does not replay for a listener added late, so the entry
+    // check is what keeps a cancelled turn from posting a card that would park
+    // the tool for its whole timeout.
+    expect(answer).toEqual({ id: 'q-deploy', selected: [] })
+    expect(sent).toHaveLength(0)
+    expect(reports).toHaveLength(0)
+  })
+
   it('settles exactly once: a second click or answer is refused', async () => {
     const { store, sent, updated } = createStore()
     const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
     await vi.waitFor(() => { expect(sent).toHaveLength(1) })
     const [first] = buttonsOf(sent[0]!.card)
-    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 })).toBeDefined()
-    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 1 })).toBeUndefined()
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 0 }, { chatId: 'oc_1' })).toBeDefined()
+    expect(store.answerByClick({ kind: QUESTION_ACTION, id: first!.id, option: 1 }, { chatId: 'oc_1' })).toBeUndefined()
     expect(store.answerByText('s1', 'too late')).toBe(false)
     expect(await answer).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
     // The click painted its own card, so no patch was attempted at all.
@@ -246,87 +370,89 @@ describe('ChatQuestions', () => {
   })
 })
 
-describe('shadow tool definition', () => {
-  it('declares schemas the registry accepts, in compiled form', () => {
-    // Production rejected the first version of this definition: both schemas
-    // were written in the per-property spec form that `defineTool` compiles,
-    // while the registry validates real JSON Schema. Agent creation failed
-    // outright, so the chat could not start at all.
-    const definition = shadowQuestionTool(async () => []) as {
-      name: string
-      parameters: unknown
-      output: { schema: unknown }
-    }
-    expect(() => { assertRegistrableTool(definition) }).not.toThrow()
-    expect(definition.parameters).toMatchObject({ type: 'object', required: ['questions'] })
-    expect(definition.output.schema).toMatchObject({ type: 'object', required: ['answers'] })
-  })
+describe('retiring cards the other surface answered', () => {
+  it('settles the open card into the answer that arrived, naming where it came from', async () => {
+    const { store, sent, updated } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
 
-  it('the checker that guards it rejects the exact shape that shipped', () => {
-    // The spec form the host compiles — required as a per-property flag.
-    expect(() => {
-      assertSupportedSchema({
-        type: 'object',
-        properties: { answers: { type: 'array', required: true, items: { type: 'string' } } },
-      })
-    }).toThrow(/required must be an array/)
-  })
-
-  it('normalizes a malformed call rather than failing the turn', async () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      execute(args: unknown, exec: unknown): Promise<{ answers: unknown[] }>
-    }
-    expect(await definition.execute({ questions: 'not-an-array' }, {})).toEqual({ answers: [] })
-  })
-
-  it('declares the host contract the registry validates', () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      name: string
-      description: string
-      parameters: Record<string, unknown>
-      output: { schema: object; render: (a: unknown, v: unknown) => unknown[] }
-      execute: (args: unknown, exec: unknown) => Promise<unknown>
-    }
-    expect(definition.name).toBe('ask_user_question')
-    expect((definition.parameters as { properties: Record<string, unknown> }).properties.questions).toBeDefined()
-    expect(typeof definition.output.render).toBe('function')
-    expect(definition.output.render({}, { answers: [] })).toEqual([{ type: 'text', text: '{"answers":[]}' }])
-  })
-
-  it('normalizes the model\'s arguments and carries the session through', async () => {
-    const seen: { questions: readonly AskedQuestion[]; sessionId: string | undefined }[] = []
-    const definition = shadowQuestionTool(async (questions, sessionId) => {
-      seen.push({ questions, sessionId })
-      return questions.map((question): QuestionAnswer => ({ id: question.id, selected: ['ok'] }))
-    }) as { execute: (args: unknown, exec: unknown) => Promise<{ answers: QuestionAnswer[] }> }
-
-    const result = await definition.execute(
-      {
-        questions: [{
-          id: 'q1',
-          question: '继续？',
-          header: '确认',
-          multi_select: true,
-          options: [{ label: '是', description: '继续执行' }, { label: '否' }],
-        }],
-      },
-      { agent: { session: { id: 'lark-oc_1' } } },
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
+      [{ id: 'q-deploy', selected: ['现在部署'] }],
     )
-    expect(result).toEqual({ answers: [{ id: 'q1', selected: ['ok'] }] })
-    expect(seen[0]!.sessionId).toBe('lark-oc_1')
-    expect(seen[0]!.questions[0]).toEqual({
-      id: 'q1',
-      question: '继续？',
-      header: '确认',
-      multiSelect: true,
-      options: [{ label: '是', description: '继续执行' }, { label: '否' }],
-    })
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: ['现在部署'] })
+    await vi.waitFor(() => { expect(updated).toHaveLength(1) })
+    // The card must not read as a press this chat made: nobody here pressed it.
+    expect(JSON.stringify(updated[0]!.card)).toContain('已在网页端作答')
   })
 
-  it('survives a call with no questions and no agent', async () => {
-    const definition = shadowQuestionTool(async () => []) as {
-      execute: (args: unknown, exec: unknown) => Promise<{ answers: QuestionAnswer[] }>
-    }
-    expect(await definition.execute({}, {})).toEqual({ answers: [] })
+  it('settles into the typed answer when the other surface wrote one', async () => {
+    const { store, sent, updated } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
+      [{ id: 'q-deploy', selected: [], custom: '等周五再上' }],
+    )
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: [], custom: '等周五再上' })
+    await vi.waitFor(() => { expect(updated).toHaveLength(1) })
+    expect(JSON.stringify(updated[0]!.card)).toContain('等周五再上')
+  })
+
+  it('marks the batch decided, so a loop through it stops asking', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    const run = { sessionId: 's1', questionIds: ['q-deploy'], decided: false }
+    store.settleElsewhere(run, [])
+
+    expect(run.decided).toBe(true)
+  })
+
+  it('answers empty for a question the other surface left out of its batch', async () => {
+    const { store, sent } = createStore()
+    const pending = store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-deploy'], decided: false },
+      [{ id: 'someone-else', selected: ['x'] }],
+    )
+
+    expect(await pending).toEqual({ id: 'q-deploy', selected: [] })
+  })
+
+  it('leaves an older batch\'s card waiting, whatever the answers name', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: { ...asked, id: 'q-scope' } })
+    const newer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: { ...asked, id: 'q-policy' } })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    // The batch that was answered is the newer one, and the answers it carries
+    // name the older batch's question id — the collision a model's reused ids
+    // produce. Membership, not the answer ids, decides which card this closes.
+    store.settleElsewhere(
+      { sessionId: 's1', questionIds: ['q-policy'], decided: false },
+      [{ id: 'q-scope', selected: ['旧'] }, { id: 'q-policy', selected: ['新'] }],
+    )
+
+    expect(await newer).toEqual({ id: 'q-policy', selected: ['新'] })
+    expect(store.awaiting('s1')).toBe(true)
+  })
+
+  it('leaves another conversation\'s open card waiting', async () => {
+    const { store, sent } = createStore()
+    void store.ask({ sessionId: 's1', chatId: 'oc_1', question: asked })
+    void store.ask({ sessionId: 's2', chatId: 'oc_2', question: { ...asked, id: 'q-other' } })
+    await vi.waitFor(() => { expect(sent).toHaveLength(2) })
+
+    store.settleElsewhere({ sessionId: 's2', questionIds: ['q-other'], decided: false }, [])
+
+    expect(store.awaiting('s1')).toBe(true)
+    expect(store.awaiting('s2')).toBe(false)
   })
 })

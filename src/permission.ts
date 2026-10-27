@@ -22,16 +22,16 @@ import type { HostAgent, HostCommands, HostPermissionPresets, HostSessionProject
 import type { ConversationSubject } from './session.ts'
 
 /**
- * The `permissions` projection the host publishes for every session: which
- * preset is in force and which ones exist.
+ * The `permissions` projection the host publishes for every session.
+ *
+ * It carries the preset IN FORCE and nothing else: the host's own view is
+ * `{ currentValue }`, and the list of presets a deployment offers lives on the
+ * `permissionPresets` table instead. A card that read its rows from here would
+ * therefore offer no button at all, which is why only the current value is read
+ * off this projection.
  */
 export interface PermissionsProjection {
   readonly currentValue?: unknown
-  readonly options?: readonly {
-    readonly value?: unknown
-    readonly name?: unknown
-    readonly description?: unknown
-  }[]
 }
 
 /**
@@ -100,6 +100,14 @@ export interface PresetState {
 export function loosensSandbox(preset: string, presets: HostPermissionPresets | undefined): boolean {
   if (presets === undefined) return true
   try {
+    // The deployment's own list first, then the bundle. `resolve` alone is not
+    // enough: it reads a name out of a record, so a name the table never listed
+    // can still resolve through the prototype chain — and such a spec carries no
+    // knobs, which reads as "does not loosen" and skips the approver this
+    // function exists to require. The host's own command rejects those names, so
+    // nothing is granted today; asking the list first is what keeps this gate
+    // and that command answering the same question the same way.
+    if (!presets.names.includes(preset)) return true
     const spec = presets.resolve(preset)
     return spec.sandbox === UNCONFINED_SANDBOX || spec.approval === NEVER_ASK
   } catch {
@@ -115,42 +123,46 @@ const UNCONFINED_SANDBOX = 'danger-full-access'
 const NEVER_ASK = 'never'
 
 /**
- * Read one preset option out of the projection's untyped payload.
- * @param option - one entry of the projection's option list.
- * @returns the option, or undefined for a shape this does not recognize.
- */
-function readOption(option: {
-  readonly value?: unknown
-  readonly name?: unknown
-  readonly description?: unknown
-}): PresetOption | undefined {
-  const value = [option.value, option.name].find(
-    (candidate): candidate is string => typeof candidate === 'string' && candidate !== '',
-  )
-  if (value === undefined) return undefined
-  const name = typeof option.name === 'string' && option.name !== '' ? option.name : value
-  const description = typeof option.description === 'string' && option.description !== ''
-    ? option.description
-    : undefined
-  return { value, name, ...description === undefined ? {} : { description } }
-}
-
-/**
- * Attach what one preset actually does, when the deployment's table can be
- * read. A table that cannot be read leaves the option as the projection
- * described it, and every consumer treats "unknown" as its own caution.
- * @param option - the option as published.
+ * Every preset this deployment offers, read from its own table.
+ *
+ * The table is the same source every authorization decision here reads
+ * (`resolve`), so what a card OFFERS and what a switch ENFORCES cannot drift,
+ * and it is the only source that can list anything at all: the `permissions`
+ * projection publishes the preset in force and no options. A name the table
+ * lists but will not resolve is still offered, by name alone — the deployment
+ * says it has that preset, and an unreadable bundle is not a reason to hide a
+ * button; every consumer treats "unknown knobs" as its own caution.
  * @param presets - the deployment's preset table, when composed.
- * @returns the option, with its knobs when they are knowable.
+ * @returns the rows a picker may draw, in the table's declaration order.
  */
-function withSpec(option: PresetOption, presets: HostPermissionPresets | undefined): PresetOption {
-  if (presets === undefined) return option
+function presetRows(presets: HostPermissionPresets | undefined): PresetOption[] {
+  if (presets === undefined) return []
+  let names: readonly string[]
   try {
-    const spec = presets.resolve(option.value)
-    return { ...option, sandbox: spec.sandbox, approval: spec.approval }
+    names = presets.names
   } catch {
-    return option
+    // The table refuses to list itself (a default preset it cannot resolve, in
+    // the host's own implementation): offering nothing is the honest read.
+    return []
   }
+  return names.map((value): PresetOption => {
+    try {
+      const spec = presets.resolve(value)
+      const name = typeof spec.name === 'string' && spec.name !== '' ? spec.name : value
+      const description = typeof spec.description === 'string' && spec.description !== ''
+        ? spec.description
+        : undefined
+      return {
+        value,
+        name,
+        ...description === undefined ? {} : { description },
+        sandbox: spec.sandbox,
+        approval: spec.approval,
+      }
+    } catch {
+      return { value, name: value }
+    }
+  })
 }
 
 /**
@@ -214,31 +226,48 @@ export function permissionActionValue(value: unknown): PermissionActionValue | u
  * whole log every time a card is drawn. And it is PUBLISHED: the projection
  * carries a registered schema, unlike a service method or a sentence meant for
  * a human to read.
+ *
+ * Only the CURRENT value comes from the projection. The rows a picker offers
+ * come from the deployment's own preset table, which is the one source that
+ * lists them and the one every switch is judged against.
  * @param projections - the projection registry, when composed.
  * @param agent - the conversation's live agent.
- * @returns the state, empty where nothing published one.
+ * @param presets - the deployment's preset table, when composed.
+ * @returns the state, with no rows where no table is composed.
  */
 export function readPresets(
   projections: HostSessionProjections | undefined,
   agent: HostAgent | undefined,
   presets?: HostPermissionPresets | undefined,
 ): PresetState {
-  if (projections === undefined || agent === undefined) return { available: [] }
+  const current = currentPresetOf(projections, agent)
+  return {
+    ...current === undefined ? {} : { current },
+    available: presetRows(presets),
+  }
+}
+
+/**
+ * The preset one conversation is running under, as the projection published it.
+ * @param projections - the projection registry, when composed.
+ * @param agent - the conversation's live agent.
+ * @returns the preset in force, or undefined when nothing published one.
+ */
+function currentPresetOf(
+  projections: HostSessionProjections | undefined,
+  agent: HostAgent | undefined,
+): string | undefined {
+  if (projections === undefined || agent === undefined) return undefined
   let value: PermissionsProjection | undefined
   try {
     value = projections.snapshot(agent.session).values.permissions as PermissionsProjection | undefined
   } catch {
     // A projection that cannot be read leaves the card with nothing to claim,
     // which is the honest state — not a guess about someone's permissions.
-    return { available: [] }
+    return undefined
   }
-  if (value === undefined) return { available: [] }
-  const current = typeof value.currentValue === 'string' ? value.currentValue : undefined
-  const available = (value.options ?? [])
-    .map(option => readOption(option))
-    .filter((option): option is PresetOption => option !== undefined)
-    .map(option => withSpec(option, presets))
-  return { ...current === undefined || current === '' ? {} : { current }, available }
+  const current = value?.currentValue
+  return typeof current === 'string' && current !== '' ? current : undefined
 }
 
 /**
@@ -257,7 +286,11 @@ export async function switchPreset(
 ): Promise<{ readonly ok: boolean; readonly detail?: string }> {
   if (commands === undefined) return { ok: false, detail: 'no command runtime is composed' }
   const execution = await commands
-    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, signal)
+    // The host's `execute` takes the attachments a submission carries between
+    // the line and the signal. This channel only ever submits a plain
+    // invocation, so the array is empty — but it has to be there: passed the
+    // signal in that position, the host reads `signal.aborted` off an array.
+    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, [], signal)
     .catch((error: unknown) => {
       // A cancelled command is not a failed one, and flattening the two here
       // is invisible from the outside: the caller would see an ordinary

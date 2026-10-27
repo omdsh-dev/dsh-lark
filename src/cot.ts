@@ -89,19 +89,54 @@ function cotEvent(eventType: string, content: object): CotEvent {
   lastTimestamp = Math.max(Date.now(), lastTimestamp + 1)
   return {
     event_type: eventType,
-    content: encoded.length <= MAX_EVENT_CONTENT_CHARS
-      ? encoded
-      // Dropping the payload would lose the event; a truncation marker keeps
-      // its shape valid while saying that something was cut.
-      : JSON.stringify({ ...content as Record<string, unknown>, truncated: true, delta: undefined }),
+    content: encoded.length <= MAX_EVENT_CONTENT_CHARS ? encoded : boundedFallback(content),
     timestamp: String(lastTimestamp),
   }
 }
 
-/** Bound a value a tool produced before it rides an event. */
-function boundResult(text: string): string {
-  const limit = 1500
-  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+/** How much of one string field the oversized-event fallback keeps. */
+const FALLBACK_FIELD_MAX_CHARS = 200
+
+/**
+ * An event whose payload is too big to write, reduced to something writable.
+ *
+ * Blanking `delta` is not enough on its own: a provider error's `message` is the
+ * size that made the event oversized in the first place, and re-serializing the
+ * same fields would hand the platform the same refusal — which drops the event
+ * AND, because a drain sends a batch, up to forty-nine of its siblings. String
+ * fields are therefore cut first, and the result is measured again.
+ * @param content - the event's own fields.
+ * @returns the bounded payload.
+ */
+function boundedFallback(content: object): string {
+  const reduced: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(content as Record<string, unknown>)) {
+    if (key === 'delta') continue
+    reduced[key] = typeof value === 'string' ? boundResult(value, FALLBACK_FIELD_MAX_CHARS) : value
+  }
+  reduced.truncated = true
+  const encoded = JSON.stringify(reduced)
+  // Still too big — one of the non-string fields is the bulk — so the shape is
+  // kept and everything but the marker is dropped.
+  return encoded.length <= MAX_EVENT_CONTENT_CHARS
+    ? encoded
+    : JSON.stringify({ truncated: true, dropped: encoded.length })
+}
+
+/**
+ * Bound a value a tool produced before it rides an event.
+ *
+ * Cut on code points, and counted the same way: slicing UTF-16 code units can
+ * end on half of a surrogate pair, which reaches the platform as an unpaired
+ * escape, and the notice beside it would then be wrong for every emoji or
+ * supplementary character in the text.
+ * @param text - the value to bound.
+ * @param limit - the longest result, in code points.
+ * @returns the value, with a notice when it was cut.
+ */
+function boundResult(text: string, limit = 1500): string {
+  const points = Array.from(text)
+  return points.length <= limit ? text : `${points.slice(0, limit - 1).join('')}…`
 }
 
 /** Options for {@link createCotRenderer}. */
@@ -214,7 +249,11 @@ export function createCotRenderer(
       : cotEvent('RUN_ERROR', { message: failure, code: 'TURN_FAILED' }))
     const settled = run.draining
     closing.add(settled)
-    void settled.finally(() => closing.delete(settled))
+    // Caught like the sibling in `outbound.ts`: `finally` passes a rejection
+    // through, and this promise is awaited by nobody until disposal, so a failed
+    // drain would otherwise surface as an unhandled rejection — a process-level
+    // fault for one failed thinking-process write.
+    void settled.finally(() => closing.delete(settled)).catch(() => {})
   }
 
   return {
@@ -287,7 +326,10 @@ export function createCotRenderer(
           run,
           cotEvent('TOOL_CALL_START', {
             toolCallId,
-            icon: TOOL_ICONS[shown.kind ?? ''] ?? 'default',
+            // Read by own key: `TOOL_ICONS['constructor']` finds a function on
+            // the prototype chain, so the `?? default` never fires for it and
+            // the icon key would be dropped from the event instead.
+            icon: Object.hasOwn(TOOL_ICONS, shown.kind ?? '') ? TOOL_ICONS[shown.kind ?? ''] : 'default',
             title: shown.title,
             toolCallName: event.data.name,
           }),

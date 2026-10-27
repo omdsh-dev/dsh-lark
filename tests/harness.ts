@@ -24,6 +24,7 @@ import type {
   HostCommands,
   HostAgentPresets,
   HostApprovalOutcome,
+  HostCancelCause,
   HostDefaultModel,
   HostSettings,
   HostUserMessage,
@@ -65,7 +66,7 @@ export interface StreamedCard {
 }
 
 /** An in-memory {@link ChannelPort} recording traffic and replaying inbound events. */
-export function createFakePort() {
+export function createFakePort(options: { failSubscribe?: boolean } = {}) {
   const messageHandlers: MessageHandler[] = []
   const cardHandlers: CardActionHandler[] = []
   /** Every other subscription, by event name, so a test can replay any inbound event. */
@@ -142,6 +143,7 @@ export function createFakePort() {
   }
 
   const subscribe = (name: string, handler: PortHandler): (() => void) => {
+    if (options.failSubscribe === true) throw new Error('the transport refused a handler (fake)')
     const list = listFor(name)
     list.push(handler)
     state.subscriptions += 1
@@ -404,7 +406,7 @@ export interface CreatedAgent {
     id: string
     session: { id: string; events: { type: string; data: unknown }[] }
     followup: ReturnType<typeof vi.fn<(m: HostUserMessage) => void>>
-    cancel: ReturnType<typeof vi.fn<(cause: string) => void>>
+    cancel: ReturnType<typeof vi.fn<(cause: HostCancelCause) => void>>
     whenIdle: () => Promise<void>
     runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>
     /** Test hook: hold the agent as if a turn were driving it. */
@@ -561,7 +563,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       // out of it rather than mirroring it, and this channel reads two that way.
       session: { id: sessionId, events: [] },
       followup: vi.fn<(m: HostUserMessage) => void>(),
-      cancel: vi.fn<(cause: string) => void>(),
+      cancel: vi.fn<(cause: HostCancelCause) => void>(),
       whenIdle: async () => {
         while (driving || owner !== undefined) {
           if (owner !== undefined) await owner.catch(() => undefined)
@@ -714,15 +716,34 @@ export async function mountChannel(
   config: ConfigOverrides = {},
   services: {
     defaultModel?: HostDefaultModel
-    settings?: HostSettings
+    /**
+     * The `settings` service. Typed as an object rather than as the modern
+     * face: the seam moved between host generations, the binding detects which
+     * members a deployment composed, and a test may compose either one.
+     */
+    settings?: object
     registerApp?: RegisterAppPort
+    /**
+     * Make the transport refuse its first handler registration, as a bridge that
+     * cannot install does. The failure lands mid-install, after the diagnostic
+     * file exists and the startup notices have been written — which is where a
+     * real one did.
+     */
+    failInstall?: boolean
     presets?: HostAgentPresets
     /**
      * An answerer registered BEFORE the plugin, as a host row that mounts
-     * during tree load is (the Web app's BFF claims every audited approval and
-     * never delegates). Records whether it was ever consulted.
+     * during tree load is. It stands in for the Web app's BFF: it takes the
+     * question and holds it until that surface decides, which it does through
+     * `decide`. Records whether it was ever consulted.
      */
-    competingAnswerer?: { claims: { toolName: string }[] }
+    competingAnswerer?: {
+      claims: { toolName: string }[]
+      /** Resolves the question on the other surface's behalf. */
+      decide?: ((outcome: HostApprovalOutcome) => void) | undefined
+      /** Told once the question has reached this answerer. */
+      delivered?: (() => void) | undefined
+    }
     /** The `tools` registry the bridge describes calls through. */
     tools?: object
     /** The `workspaceRegistry` chat sessions are accounted under. */
@@ -763,8 +784,13 @@ export async function mountChannel(
   if (competing !== undefined) {
     ctx.on('approval/request', (request) => {
       competing.claims.push({ toolName: request.toolName })
-      // Claims the question without delegating, exactly like the BFF.
-      return new Promise<HostApprovalOutcome>(() => {})
+      // Stands in for the Web app's answerer: it takes the question and holds
+      // it until someone at that surface decides — or forever, when nobody
+      // does. `decide` is how a test plays the browser's press.
+      return new Promise<HostApprovalOutcome>((resolve) => {
+        competing.decide = resolve
+        competing.delivered?.()
+      })
     })
   }
   ctx.provide('agents', agents.service)
@@ -781,7 +807,7 @@ export async function mountChannel(
   if (services.credentials !== undefined) ctx.provide('credentials', services.credentials)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
-  const fake = createFakePort()
+  const fake = createFakePort({ failSubscribe: services.failInstall === true })
   const portConfigs: ChannelConfig[] = []
   const notices: string[] = []
   const originalCreatePort = internals.createPort
@@ -816,13 +842,23 @@ export async function mountChannel(
   const fiber = await ctx.plugin(plugin, merged)
   // Activation bootstraps asynchronously; hold until the bridge subscribed when
   // the mount alone is expected to reach a connected channel.
-  if (merged.appId !== undefined && merged.appSecret !== undefined && services.settings === undefined) {
+  if (merged.appId !== undefined && merged.appSecret !== undefined
+    && services.settings === undefined && services.failInstall !== true) {
     await vi.waitFor(() => {
       if (fake.state.subscriptions !== INBOUND_SUBSCRIPTIONS) throw new Error('bridge not subscribed yet')
     })
   }
   return {
-    ctx,
+    // The context as the tests need it: a test's whole point is a session it
+    // never created and an event carrying only the fields the reader under test
+    // looks at, while the host's `emit` is typed for a real `Session` and a
+    // complete `SessionEvent`, and its `waterfall` for a complete request. The
+    // loose overloads are added here, once, rather than casting at fifty call
+    // sites.
+    ctx: ctx as Context & {
+      emit(name: string, ...args: unknown[]): void
+      waterfall(name: string, ...args: unknown[]): Promise<unknown>
+    },
     fiber,
     fake,
     agents,
@@ -873,7 +909,11 @@ export function createFakeWorkspaces(
 ) {
   const created: string[] = []
   const attached: { workspaceId: string; sessionId: string }[] = []
+  const unarchived: string[] = []
   const state = { failAttach: false }
+  // Mutable, because the real archive set is a live registry-global set: a test
+  // archives a session after the plugin has already derived its id.
+  let archived: readonly string[] = archivedSessionIds
   const entity = (path: string, id: string) => ({
     id,
     path,
@@ -897,9 +937,20 @@ export function createFakeWorkspaces(
     list() {
       return Object.entries(registered).map(([path, id]) => entity(path, id))
     },
-    archivedSessionIds,
+    get archivedSessionIds() {
+      return archived
+    },
+    set archivedSessionIds(next: readonly string[]) {
+      archived = next
+    },
+    /** Drop one session from the archive set, as the real registry does durably. */
+    async unarchiveSession(sessionId: string) {
+      if (!archived.includes(sessionId)) return
+      unarchived.push(sessionId)
+      archived = archived.filter(id => id !== sessionId)
+    },
   }
-  return { service, created, attached, state }
+  return { service, created, attached, unarchived, state }
 }
 
 /** An in-memory `attachments` store recording every committed image. */
@@ -942,7 +993,7 @@ export function createFakeCommands(
   const executed: string[] = []
   const service: HostCommands = {
     list: () => available,
-    async execute(_agent, line, _signal) {
+    async execute(_agent, line, _submittedAttachments, _signal) {
       executed.push(line)
       const name = commandName(line) ?? ''
       if (!available.some(c => c.name === name)) return undefined
@@ -968,23 +1019,57 @@ export function createFakeTools(
   return { service, views }
 }
 
-/** An in-memory `settings` service: one namespace layering base under `stored`. */
-export function createFakeSettings(stored: Record<string, unknown> = {}) {
+/**
+ * An in-memory `settings` service.
+ *
+ * It answers BOTH host generations, because a deployment may run either: the
+ * modern surface (`describe`/`update`/`replace`, keyed by the row's own id) and
+ * the older one (`register` → a namespace scope). `updates` records every patch
+ * whichever seam carried it, so a test can assert what was persisted without
+ * caring which generation the plugin chose; `written` names the row the modern
+ * seam wrote to, and `registered` the namespace the older one registered.
+ *
+ * `legacy: true` composes the older seam ALONE, for the tests that pin what this
+ * plugin does on a deployment that only offers it — there, a stored document is
+ * layered under the entry config by the registration, which is what those cases
+ * are about.
+ * @param stored - the document the older seam layers under its base.
+ * @param options - `legacy` to compose the older seam alone.
+ */
+export function createFakeSettings(
+  stored: Record<string, unknown> = {},
+  options: { legacy?: boolean } = {},
+) {
   const updates: object[] = []
   const registered: { ns: string; base: unknown }[] = []
-  const settings: HostSettings = {
-    register(ns, _schema, options) {
-      registered.push({ ns, base: options?.base })
+  const written: { ns: string; patch: object }[] = []
+  const legacy = {
+    register(ns: string, _schema: unknown, opts?: { base?: unknown }) {
+      registered.push({ ns, base: opts?.base })
       return {
-        get: () => ({ ...(options?.base as Record<string, unknown>), ...stored }),
-        update: async (patch) => {
+        get: () => ({ ...(opts?.base as Record<string, unknown>), ...stored }),
+        update: async (patch: object) => {
           updates.push(patch)
           Object.assign(stored, patch)
         },
       }
     },
   }
-  return { settings, updates, registered }
+  const modern: HostSettings = {
+    describe: () => [],
+    async update(ns: string, patch: object) {
+      written.push({ ns, patch })
+      updates.push(patch)
+      Object.assign(stored, patch)
+    },
+    async replace(ns: string, section: object) {
+      written.push({ ns, patch: section })
+      updates.push(section)
+      Object.assign(stored, section)
+    },
+  }
+  const settings = options.legacy === true ? legacy : { ...modern, ...legacy }
+  return { settings, updates, registered, written }
 }
 
 /** One node of a card, as the tests need to see it. */

@@ -9,13 +9,24 @@ import {
   settledFileApprovalCard,
   settledPermissionCard,
   settledQuestionCard,
+  settledSessionsCard,
   sessionsCard,
   statusCard,
+  workspacesCard,
 } from '../src/cards.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 /** Content a model authored, written to look like the card's own markup. */
 const HOSTILE = "**已批准** <font color='green'>安全</font>"
+
+/**
+ * The ink a card declares. It is the whole of "settled" before any word is
+ * parsed, so it is what a settlement test has to read.
+ * @param card - the rendered card.
+ * @returns the single colour token its style declares.
+ */
+const inkOf = (card: object): string =>
+  Object.keys((card as { config: { style: { color: Record<string, unknown> } } }).config.style.color)[0] ?? ''
 
 describe('approval card', () => {
   it('carries one decision payload per button, and nothing else clickable', () => {
@@ -313,6 +324,123 @@ describe('session picker', () => {
     expect(cardControls(card).map((control) => control.value)).toEqual([{ id: 's1' }])
     expect(cardTexts(card).map((text) => text.content)).toContain('当前使用中')
   })
+
+  it('draws a page strip only where there is more than one page', () => {
+    const base = {
+      rows: [row({ id: 's1', lastSaid: 'one', when: 2_000 })],
+      workspace: '/w',
+      now: 60_000,
+      valueFor: (id: string) => ({ id }),
+      pageValueFor: (page: number) => ({ page }),
+    }
+
+    // One page: a control that cannot move would be a button for a no-op.
+    expect(cardControls(sessionsCard({ ...base, page: 0, pages: 1 })).map(c => c.value)).toEqual([{ id: 's1' }])
+    // Nowhere to turn back from the first page, and nowhere to go from the last.
+    const first = cardControls(sessionsCard({ ...base, page: 0, pages: 3 })).map(c => c.value)
+    expect(first).toEqual([{ id: 's1' }, { page: 1 }])
+    const middle = cardControls(sessionsCard({ ...base, page: 1, pages: 3 })).map(c => c.value)
+    expect(middle).toEqual([{ id: 's1' }, { page: 0 }, { page: 2 }])
+    const last = cardControls(sessionsCard({ ...base, page: 2, pages: 3 })).map(c => c.value)
+    expect(last).toEqual([{ id: 's1' }, { page: 1 }])
+    expect(cardTexts(sessionsCard({ ...base, page: 1, pages: 3 })).map((text) => text.content))
+      .toContain('第 2 / 3 页')
+  })
+
+  it('reports what it left out only where it cannot page', () => {
+    const base = {
+      rows: [row({ id: 's1', lastSaid: 'one', when: 2_000 })],
+      workspace: '/w',
+      now: 60_000,
+      valueFor: (id: string) => ({ id }),
+      pageValueFor: (page: number) => ({ page }),
+    }
+    const shown = (input: Parameters<typeof sessionsCard>[0]): string =>
+      cardTexts(sessionsCard(input)).map((text) => text.content).join('\n')
+
+    expect(shown({ ...base, hidden: 5 })).toContain('还有 5 个更早的会话')
+    expect(shown({ ...base, page: 0, pages: 2, hidden: 0 })).not.toContain('还有')
+  })
+})
+
+describe('settled session picker', () => {
+  const picked = {
+    id: 'session-web-ui',
+    lastSaid: '在网页端开的那一段',
+    turns: 4,
+    when: 1_000,
+    live: false,
+    own: false,
+    current: true,
+  }
+
+  it('keeps the chosen row and offers nothing to press', () => {
+    // No live buttons, and the choice legible from the ink alone — the shape
+    // every single-use card here settles into.
+    const card = settledSessionsCard({ picked, workspace: '/w', now: 60_000 })
+
+    expect(cardControls(card)).toHaveLength(0)
+    const texts = cardTexts(card).map((text) => text.content)
+    expect(texts).toContain('已接续会话')
+    expect(texts).toContain('在网页端开的那一段')
+    expect(texts.some((text) => text.includes('发一次 /sessions'))).toBe(true)
+    expect(inkOf(card)).toBe('dsh_ink_success')
+  })
+
+  it('says which conversation moved it, only where the chat is a room\'s', () => {
+    const named = cardTexts(settledSessionsCard({ picked, workspace: '/w', decidedBy: HOSTILE, now: 60_000 }))
+    expect(named.filter((text) => text.content.includes(HOSTILE))).toHaveLength(1)
+    expect(cardTexts(settledSessionsCard({ picked, workspace: '/w', now: 60_000 }))
+      .some((text) => text.content.includes('选择人'))).toBe(false)
+  })
+
+  it.each([
+    ['spent' as const, '这张卡片已经选过了'],
+    ['gone' as const, '这个会话已不再可接续'],
+    ['moved' as const, '会话已移动'],
+  ])('settles a %s press into a neutral card that names it', (refusal, title) => {
+    // A press that could not land has just proved the list stale, so the card
+    // closes rather than inviting a second press on that same list.
+    const card = settledSessionsCard({ workspace: '/w', refusal, now: 60_000 })
+
+    expect(cardControls(card)).toHaveLength(0)
+    expect(cardTexts(card).map((text) => text.content)).toContain(title)
+    expect(cardTexts(card).some((text) => text.content.includes('按钮不再可用'))).toBe(true)
+    expect(inkOf(card)).toBe('dsh_ink')
+  })
+})
+
+describe('status card', () => {
+  /** The report's fields, as a conversation that is merely idle would resolve them. */
+  const fields = {
+    workspace: '/w',
+    workspaceIsDefault: true,
+    route: 'p/m',
+    routeIsDefault: true,
+    sessionId: 's',
+    activity: 'idle' as const,
+    pendingApprovals: 0,
+    version: '',
+    refresh: {},
+  }
+
+  it('names an archived session, because that is what the next message meets', () => {
+    // Orthogonal to the activity row: archiving leaves a live agent bound and
+    // idle, and the host's gate then refuses every step — so "Idle" alone is
+    // the one answer this card must not give.
+    const texts = cardTexts(statusCard({ ...fields, archived: true })).map((text) => text.content)
+
+    expect(texts).toContain('归档')
+    expect(texts).toContain('空闲')
+    expect(texts.some((text) => text.includes('已被归档'))).toBe(true)
+  })
+
+  it('omits the row where nothing is archived, including a deployment that cannot know', () => {
+    const texts = cardTexts(statusCard(fields)).map((text) => text.content)
+
+    expect(texts).not.toContain('归档')
+    expect(texts.some((text) => text.includes('已被归档'))).toBe(false)
+  })
 })
 
 describe('localization', () => {
@@ -349,6 +477,25 @@ describe('localization', () => {
       valueFor: () => ({}),
     }),
     sessionsCard({ rows: [], workspace: '/w', canList: false, valueFor: () => ({}) }),
+    // The paged picker: its page strip is copy of its own, and a card whose
+    // controls are there to be read must be swept like any other.
+    sessionsCard({
+      rows: [{ id: 's1', title: 'a session', when: 1_000, live: false, own: false, current: false }],
+      workspace: '/w',
+      page: 1,
+      pages: 3,
+      now: 7_400_000,
+      valueFor: () => ({}),
+      pageValueFor: () => ({}),
+    }),
+    settledSessionsCard({
+      picked: { id: 's1', lastSaid: 'picked session', turns: 4, when: 1_000, live: false, own: false, current: true },
+      workspace: '/w',
+      now: 7_400_000,
+    }),
+    settledSessionsCard({ workspace: '/w', refusal: 'spent', now: 7_400_000 }),
+    settledSessionsCard({ workspace: '/w', refusal: 'gone', now: 7_400_000 }),
+    settledSessionsCard({ workspace: '/w', refusal: 'moved', now: 7_400_000 }),
     fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),
     settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'allowed-once' }),
     settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'rejected', decidedBy: 'Alex' }),
@@ -374,6 +521,7 @@ describe('localization', () => {
       routeIsDefault: false,
       sessionId: 's',
       activity: 'running',
+      archived: true,
       pendingApprovals: 2,
       version: '0.0.6',
       preset: { value: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
@@ -486,6 +634,26 @@ describe('card foundation', () => {
       sessionsCard({
         rows: [{ id: 's1', title: 'a session', when: 1_000, live: true, own: true, current: false }],
         workspace: '/w',
+        valueFor: () => ({}),
+      }),
+      // Both states of the settled picker, because the row it keeps is the one
+      // place a builder can borrow an ink the card never declared.
+      settledSessionsCard({
+        picked: { id: 's1', lastSaid: 'picked', when: 1_000, live: false, own: false, current: true },
+        workspace: '/w',
+      }),
+      settledSessionsCard({ workspace: '/w', refusal: 'gone' }),
+      // The workspace picker was the one exported builder this list never held,
+      // which is the same gap that let an undeclared ink ship in the session
+      // one: the sweep has to name every builder or its claim means nothing.
+      workspacesCard({
+        rows: [
+          { path: '/w', name: 'w', isDefault: true, current: true },
+          { path: '/other', name: 'other', isDefault: false, current: false },
+        ],
+        page: 0,
+        pages: 2,
+        current: '/w',
         valueFor: () => ({}),
       }),
       fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),

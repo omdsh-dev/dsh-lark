@@ -231,9 +231,11 @@ describe('durable sessions', () => {
       const opened = harness.agents.created[0]!
       expect(opened.meta).toBeUndefined()
       expect(opened.setupRan).toBe(true)
-      // The shadow tool is re-registered on a RESUMED agent too; without it a
-      // recovered conversation would silently lose its ability to ask.
-      expect(opened.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
+      // A resumed agent still gets the composition a fresh one gets. What it no
+      // longer carries is a second `ask_user_question`: the host owns that tool
+      // and this channel answers the request it raises, so a recovered
+      // conversation keeps asking through the same one the model already knows.
+      expect(opened.registeredTools.map((tool) => tool.name)).not.toContain('ask_user_question')
       expect(opened.agent.followup).toHaveBeenCalledTimes(1)
     } finally {
       await harness.dispose()

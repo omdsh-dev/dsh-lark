@@ -36,6 +36,22 @@ class SupersededError extends Error {
 }
 
 /**
+ * A session this channel must not open, reported in the chat's own words.
+ *
+ * The ladder falls through to `create` whenever a resume fails, because a
+ * rejection is its only existence probe and "never served here" is the ordinary
+ * case. An id that exists but may not run is the opposite case: creating an
+ * agent under it would answer a refusal by writing over the very session that
+ * was refused, so a refusal ends the walk instead of advancing it.
+ */
+export class SessionRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SessionRefusedError'
+  }
+}
+
+/**
  * Which conversation a control card governs, and where it was published.
  *
  * A card that changes a conversation's settings has to say which conversation
@@ -107,6 +123,18 @@ export interface OpenedSession {
  * in-memory object and need no Cordis mount.
  */
 export interface SessionLadder {
+  /**
+   * Whether this channel may drive one id at all, asked before EVERY
+   * acquisition hands a session out — the live-binding fast path included.
+   *
+   * The rungs below cannot answer this on their own: a conversation whose
+   * binding is already live never reaches `resume`, so a session refused there
+   * would still be driven through the binding it holds. A deployment with
+   * nothing to refuse answers by returning.
+   * @param sessionId - the branded session id about to be driven.
+   * @throws {SessionRefusedError} to refuse the id, with the chat's own words.
+   */
+  admit(sessionId: string): void
   /**
    * Return the live agent for this id, if the host already has one.
    * @param sessionId - the branded session id.
@@ -230,6 +258,7 @@ export class ConversationSessions {
    * @param key - the conversation key.
    * @returns the bound session, the same object for every later call of its key.
    * @throws {Error} when this store is closed, or when creation genuinely fails.
+   * @throws {SessionRefusedError} when the ladder refuses the id outright.
    */
   async acquireKey(key: string): Promise<OpenedSession> {
     for (;;) {
@@ -242,6 +271,13 @@ export class ConversationSessions {
         continue
       }
       const generation = this.generation(key)
+      // Re-asked every iteration, because every iteration is a chance for the
+      // world to have moved: a release re-derives the id, and an id admitted
+      // under one state may be refused under the next. Asked HERE rather than
+      // in a rung, because the binding below is handed out without touching a
+      // single rung at all — and a session refused inside `resume` would still
+      // be driven through a binding this conversation already holds.
+      this.ladder.admit(this.idFor(key))
       const bound = this.opened.get(key)
       if (bound !== undefined) {
         // Reusable only while it still IS this key's session: a workspace
@@ -338,6 +374,13 @@ export class ConversationSessions {
       await teardown
     } finally {
       if (this.retiring.get(key) === teardown) this.retiring.delete(key)
+      // The bumped epoch is only ever read by a walk that was already in flight
+      // when it moved, and every one of those has settled by now (the teardown
+      // awaits them). Dropping it once no successor owns the key keeps this map
+      // from growing one entry per conversation that ever started over: a later
+      // walk reads `?? 0` exactly as it would read a number nobody compares
+      // against any more.
+      if (this.opening.get(key) === undefined) this.generations.delete(key)
     }
     return true
   }
@@ -425,6 +468,10 @@ export class ConversationSessions {
     try {
       return { handle: await this.ladder.resume(sessionId), owned: true }
     } catch (error) {
+      // A refusal is terminal: the session exists and this channel declined to
+      // open it, so falling through would create an agent under the id the
+      // refusal just named.
+      if (error instanceof SessionRefusedError) throw error
       // The registry offers no existence probe, so a rejection is the only
       // signal that this conversation was never served here — and an unreadable
       // log looks exactly the same. Reporting it keeps a corrupt session log

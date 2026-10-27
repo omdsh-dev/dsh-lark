@@ -125,3 +125,28 @@ export function refuseApprovalClick(
     chatType: pending.chatType,
   })
 }
+
+/**
+ * The named-approver rule alone, for a press that is not an approval click.
+ *
+ * {@link refuseApprovalClick} answers a wider question — whether the press came
+ * from the card's own chat, whether the operator is an approver, and, with no
+ * approvers configured, whether the operator may drive that chat at all. A
+ * question card's press has already been checked against its chat by the store
+ * that owns the card, and a question is not an escalation unless the deployment
+ * says it is, so only the named-approver half applies here: empty approvers
+ * narrows nothing, exactly as every other list here does.
+ * @param authorization - the channel's authorization rules.
+ * @param click - who pressed, as the card callback named them.
+ * @returns the refusal for the operator log, or undefined when the press counts.
+ */
+export function refuseApproverOnly(
+  authorization: Authorization,
+  click: { readonly operatorId?: string | undefined },
+): string | undefined {
+  if (authorization.approvers.size === 0) return undefined
+  if (click.operatorId === undefined) return 'the click carries no operator id'
+  return authorization.approvers.has(click.operatorId)
+    ? undefined
+    : `operator ${click.operatorId} is not in approvers`
+}

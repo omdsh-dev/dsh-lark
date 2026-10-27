@@ -1,5 +1,5 @@
 import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, sep } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -8,14 +8,15 @@ import {
   describeRefusalForChat,
   describeRefusalForModel,
   GET_COMMAND,
+  readGetTarget,
   readOutboundFile,
   resolveOutboundFile,
-  runGetCommand,
   SEND_FILE_TOOL,
   sendFileTool,
 } from '../src/outbound-file.ts'
 import type { OutboundFile, OutboundRefusal, SendFilePorts } from '../src/outbound-file.ts'
 import { assertRegistrableTool } from './harness.ts'
+import { canSymlinkFile, denyRead, linkDirectory, READ_DENIED_CODE } from './platform.ts'
 
 /** Workspaces these tests wrote into, removed after each one. */
 const workspaces: string[] = []
@@ -61,7 +62,10 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
   })
 
-  it('follows a symlink before it decides, so one leaving the workspace is refused', async () => {
+  // The link here is to a FILE, which is the one shape Windows will not make
+  // without a privilege an unelevated token lacks — so this states its
+  // invariant where a file link exists, and says so where it does not.
+  it.skipIf(!canSymlinkFile())('follows a symlink before it decides, so one leaving the workspace is refused', async () => {
     const workspace = createWorkspace()
     const outside = createWorkspace()
     await writeFile(join(outside, 'secret.md'), 'not yours')
@@ -77,11 +81,30 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
   })
 
+  // The same ordering, in the one link shape every platform can build: a
+  // directory link inside the workspace pointing at a directory outside it. The
+  // path is inside by its own spelling — which a string check would clear — and
+  // outside by everything the filesystem holds, so a container test running
+  // before `realpath` is caught here on a host that will not make file links.
+  it('follows a directory link before it decides, so one leaving the workspace is refused', async () => {
+    const workspace = createWorkspace()
+    const outside = createWorkspace()
+    await writeFile(join(outside, 'secret.md'), 'not yours')
+    linkDirectory(outside, join(workspace, 'escape'))
+
+    const spelled = join(workspace, 'escape', 'secret.md')
+    expect(spelled.startsWith(`${workspace}${sep}`)).toBe(true)
+    expect(await readFile(spelled, 'utf8')).toBe('not yours')
+    expect(realpathSync(spelled)).toBe(join(outside, 'secret.md'))
+    expect(resolveOutboundFile(join('escape', 'secret.md'), workspace, 1024))
+      .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
+  })
+
   it('still clears a file when the workspace path is itself a symlink', async () => {
     const real = createWorkspace()
     const elsewhere = createWorkspace()
     const linked = join(elsewhere, 'project')
-    symlinkSync(real, linked)
+    linkDirectory(real, linked)
     await writeFile(join(real, 'report.md'), 'body')
     const cleared = {
       path: join(real, 'report.md'),
@@ -101,7 +124,9 @@ describe('resolveOutboundFile', () => {
     expect(resolveOutboundFile(join(linked, 'report.md'), linked, 1024)).toEqual({ ok: true, file: cleared })
   })
 
-  it('names a file by where it really sits, so a symlink cannot rename it', async () => {
+  // A file link again, and the one that has to be a file link: the whole point
+  // is that the link carries a name the file does not really have.
+  it.skipIf(!canSymlinkFile())('names a file by where it really sits, so a symlink cannot rename it', async () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'secrets'))
     await writeFile(join(workspace, 'secrets', 'tokens.env'), 'TOKEN=x')
@@ -145,15 +170,21 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'not_found' } })
   })
 
-  it('refuses everything when the workspace itself is not there', () => {
+  it('refuses everything when the workspace itself is not there', async () => {
     const missing = join(createWorkspace(), 'never-created')
+    // A file that really exists, somewhere else that really exists. The earlier
+    // spelling of this used `/etc/hosts`, which made the assertion POSIX-only:
+    // off POSIX the path resolves to nothing, `realpath` never answers, and the
+    // verdict stops at `not_found` before the container check this is about.
+    const outside = createWorkspace()
+    await writeFile(join(outside, 'elsewhere.md'), 'not yours')
 
     // The uncanonicalizable workspace still bounds the check rather than
     // widening it: a `/cd` target removed under a live conversation must not
     // turn the container check into "anywhere at all".
     expect(resolveOutboundFile('report.md', missing, 1024))
       .toEqual({ ok: false, refusal: { code: 'not_found' } })
-    expect(resolveOutboundFile('/etc/hosts', missing, 1024))
+    expect(resolveOutboundFile(join(outside, 'elsewhere.md'), missing, 1024))
       .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
   })
 
@@ -478,65 +509,40 @@ describe('send_file tool', () => {
   })
 })
 
-describe('runGetCommand', () => {
+describe('readGetTarget', () => {
   it('explains itself when the line carries no path', async () => {
     const workspace = createWorkspace()
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(`/${GET_COMMAND}`, workspace, 1024, async (file) => { sent.push(file) })
+    const target = await readGetTarget(`/${GET_COMMAND}`, workspace, 1024)
 
-    expect(reply).toContain(`/${GET_COMMAND} <路径>`)
-    expect(sent).toEqual([])
+    expect(target.ok).toBe(false)
+    expect(target.ok ? '' : target.reply).toContain(`/${GET_COMMAND} <路径>`)
   })
 
   it('refuses in 中文 what the tool refuses in English, through the same check', async () => {
     const workspace = createWorkspace()
     const outside = createWorkspace()
     await writeFile(join(outside, 'secret.md'), 'not yours')
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND} ${join(outside, 'secret.md')}`,
-      workspace,
-      1024,
-      async (file) => { sent.push(file) },
-    )
+    const target = await readGetTarget(`/${GET_COMMAND} ${join(outside, 'secret.md')}`, workspace, 1024)
 
-    expect(reply).toBe(`⚠️ ${describeRefusalForChat({ code: 'outside_workspace' })}`)
-    expect(sent).toEqual([])
+    expect(target.ok).toBe(false)
+    expect(target.ok ? '' : target.reply).toBe(`⚠️ ${describeRefusalForChat({ code: 'outside_workspace' })}`)
   })
 
-  it('says nothing at all when the file itself is the reply', async () => {
+  it('hands back the cleared file and its bytes, saying nothing at all', async () => {
     const workspace = createWorkspace()
     await writeFile(join(workspace, 'report.md'), '# 报告')
-    const sent: { file: OutboundFile; bytes: Buffer }[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND}   ./report.md  `,
-      workspace,
-      1024,
-      async (file, bytes) => { sent.push({ file, bytes }) },
-    )
+    const target = await readGetTarget(`/${GET_COMMAND}   ./report.md  `, workspace, 1024)
 
-    expect(reply).toBeUndefined()
-    expect(sent).toHaveLength(1)
-    expect(sent[0]!.file).toEqual({
+    expect(target.ok).toBe(true)
+    if (!target.ok) return
+    expect(target.file).toEqual({
       path: join(workspace, 'report.md'),
       fileName: 'report.md',
       bytes: 8,
       pathInWorkspace: 'report.md',
       workspaceName: basename(workspace),
     })
-    expect(sent[0]!.bytes.toString('utf8')).toBe('# 报告')
-  })
-
-  it('tells the chat when the send failed instead of going quiet', async () => {
-    const workspace = createWorkspace()
-    await writeFile(join(workspace, 'report.md'), 'body')
-    const reply = await runGetCommand(`/${GET_COMMAND} report.md`, workspace, 1024, async () => {
-      throw new Error('upload rejected: 230013')
-    })
-
-    expect(reply).toContain('⚠️')
-    expect(reply).toContain('report.md')
-    expect(reply).toContain('230013')
+    expect(target.bytes.toString('utf8')).toBe('# 报告')
   })
 
   // Root reads a mode-000 file regardless, which would leave this passing for the
@@ -548,21 +554,16 @@ describe('runGetCommand', () => {
     await writeFile(path, 'body')
     // Stats as a regular file under the ceiling, so it clears the check and fails
     // in the read — where the message Node builds quotes the absolute path.
-    await chmod(path, 0o000)
-    const sent: OutboundFile[] = []
-    const reply = await runGetCommand(
-      `/${GET_COMMAND} out/report.md`,
-      workspace,
-      1024,
-      async (file) => { sent.push(file) },
-    )
+    denyRead(path)
+    const target = await readGetTarget(`/${GET_COMMAND} out/report.md`, workspace, 1024)
 
-    expect(sent).toEqual([])
-    expect(reply).toContain('⚠️')
+    expect(target.ok).toBe(false)
+    if (target.ok) return
+    expect(target.reply).toContain('⚠️')
     // Which file, and why, in the form the human typed it.
-    expect(reply).toContain(join('out', 'report.md'))
-    expect(reply).toContain('EACCES')
+    expect(target.reply).toContain(join('out', 'report.md'))
+    expect(target.reply).toContain(READ_DENIED_CODE)
     // `/get` answers in the chat, and in a group that is a whole room.
-    expect(reply).not.toContain(workspace)
+    expect(target.reply).not.toContain(workspace)
   })
 })

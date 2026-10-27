@@ -1,0 +1,89 @@
+/* The Lark approval takeover: the shipped panel's geometry with one extra
+   settled state. Tokens only — no literal colors (DSH docs/web-styling.md). */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px calc(var(--dsh-composer-side-clearance) + 16px) 12px;
+}
+
+.card {
+  overflow: hidden;
+  width: 100%;
+  max-width: var(--dsh-chat-content-width);
+  /* A warn panel keeps a real state-colored border beside the elevation
+     shadow, the same exception the shipped panel uses. */
+  border: 1px solid var(--dsw-alias-state-warn-secondary);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-specific-input-major);
+  box-shadow: var(--dsw-shadow-lv2);
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
+}
+
+/* The warn strip carries the "needs a decision" signal; the StateDot still
+   flips to the settled state when another surface already decided. */
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--dsw-alias-state-warn-tertiary);
+  color: var(--dsw-alias-state-warn-primary);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+/* A request another surface already decided is a completion, not a warning:
+   the strip follows the StateDot's state color. */
+.stripSettled {
+  background: var(--dsw-alias-state-success-tertiary);
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  max-height: var(--dsh-composer-text-max-height);
+  overflow-y: auto;
+  padding: 12px 16px 0;
+}
+
+.headline {
+  color: var(--dsw-alias-label-primary);
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 24px;
+  white-space: pre-wrap;
+}
+
+.command {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code);
+  font-size: 13px;
+  line-height: 20px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.actionRow {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 16px;
+}
+
+/* The destructive choice sits away from the confirm button and keeps the
+   shipped panel's danger hover. */
+.reject {
+  margin-right: auto;
+}
+
+.reject:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+  color: var(--dsw-alias-state-error-primary);
+  border-color: transparent;
+}
