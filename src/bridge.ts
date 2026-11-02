@@ -1057,11 +1057,11 @@ export function installBridge(
     await (ctx.get('loader') as HostLoader | undefined)?.await()
     const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
     const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
-    // A roster keeps every tool off the global layer, so its standing key is
-    // the view that can describe this agent's calls.
-    const toolScope = presets === undefined || presetId === undefined
-      ? undefined
-      : await presets.standingKeyFor(presetId)
+    // dsh 0.2.1-rc.2 的 @deepseek-ai/dsh-agent-preset-registry 已移除
+    // standingKeyFor 接口；降级为 undefined 只影响 tool 卡片标题展示，
+    // 不影响消息收发、agent 创建等核心链路。后续作者可改用 0.2.x
+    // 新的 scopeOf(ctx) 或 recompose() + bindScopeParent 机制替代。
+    const toolScope = undefined
     return {
       ...presetId === undefined ? {} : { presetId },
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
