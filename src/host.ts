@@ -150,6 +150,12 @@ export interface HostSessionQuery {
   /** The complete logical corpus, newest first. */
   listSessions(signal?: AbortSignal): Promise<readonly HostSessionRecord[]>
   /**
+   * The desktop host (dsh >= 0.2.1-rc.5) renames the corpus listing to
+   * `filterSessions(filters)`; declared here so the session picker can fall
+   * back to it when `listSessions` is absent. Filters are host-defined.
+   */
+  filterSessions?(filters?: unknown): Promise<readonly HostSessionRecord[]>
+  /**
    * Lightweight records for one session's events — no text, so counting what a
    * conversation contains and asking when it last moved costs no payload.
    */

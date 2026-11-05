@@ -479,7 +479,12 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     canonicalized.set(path, resolved)
     return resolved
   }
-  const records = await query.listSessions(offer.signal).catch((error: unknown) => {
+  // The desktop host's `sessionQuery` (dsh >= 0.2.1-rc.5) renamed the listing
+  // method to `filterSessions(filters)`; fall back to it when `listSessions`
+  // is absent, so the /session picker works on both host generations.
+  const records = await (typeof query.listSessions === 'function'
+    ? query.listSessions(offer.signal)
+    : query.filterSessions!({})).catch((error: unknown) => {
     offer.report?.(`lark-channel: listing sessions failed: ${String(error)}`)
     return [] as readonly HostSessionRecord[]
   })

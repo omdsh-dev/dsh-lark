@@ -1058,15 +1058,22 @@ export function installBridge(
     const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
     const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
     // A roster keeps every tool off the global layer, so its standing key is
-    // the view that can describe this agent's calls.
+    // the view that can describe this agent's calls. The desktop host's
+    // `agentPresets` (dsh >= 0.2.1-rc.5) no longer exposes `standingKeyFor`;
+    // treat it as absent (tool scope stays undefined, call presentation
+    // degrades) rather than failing agent composition.
     const toolScope = presets === undefined || presetId === undefined
       ? undefined
-      : await presets.standingKeyFor(presetId)
+      : await presets.standingKeyFor?.(presetId)
     return {
       ...presetId === undefined ? {} : { presetId },
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
-        if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
+        // Guard the newer host's mount signature: if it is missing or
+        // incompatible, keep composing the agent without the preset mount.
+        if (presets !== undefined && presetId !== undefined && typeof presets.mount === 'function') {
+          await presets.mount(agentCtx, presetId)
+        }
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
       },
     }
