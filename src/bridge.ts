@@ -2347,8 +2347,11 @@ export function installBridge(
     }
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
+    // The keyword that found the row rides the payload: without it, a session
+    // found by keyword but outside the unfiltered top-N window would never
+    // validate here.
     const before = conversationStamp(value.key)
-    const offered = await offeredSessions(value.key)
+    const offered = await offeredSessions(value.key, value.keyword ?? '')
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
       notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
@@ -2453,8 +2456,14 @@ export function installBridge(
       // The row's own id LAST: a caller may hand in a payload that already
       // carries one — the click handler repaints from the value it was given —
       // and spreading that over the row would point every button at the
-      // session someone just pressed.
-      valueFor: session => marked({ kind: SESSIONS_ACTION, ...subject, session }),
+      // session someone just pressed. The keyword rides the payload so the
+      // press validates against the same narrowed list that found the row.
+      valueFor: session => marked({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        session,
+        ...keyword === '' ? {} : { keyword },
+      }),
     })
   }
 

@@ -177,6 +177,13 @@ export interface SessionActionValue extends ConversationSubject {
   readonly kind: typeof SESSIONS_ACTION
   /** The session to continue; the row for the derived one carries it too. */
   readonly session: string
+  /**
+   * The keyword this row was found under, when the picker was narrowed.
+   * The press re-derives the offer with the SAME keyword: a session found by
+   * keyword may sit outside the unfiltered top-N window, and validating it
+   * against that window would refuse every keyword-found out-of-window row.
+   */
+  readonly keyword?: string | undefined
 }
 
 /**
@@ -192,6 +199,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
   if (typeof record.key !== 'string' || record.key === '') return undefined
   if (typeof record.chatId !== 'string' || typeof record.chatType !== 'string') return undefined
   if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
+  if (record.keyword !== undefined && typeof record.keyword !== 'string') return undefined
   return {
     kind: SESSIONS_ACTION,
     session: record.session,
@@ -199,6 +207,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
     chatId: record.chatId,
     chatType: record.chatType,
     ...record.owner === undefined ? {} : { owner: record.owner },
+    ...record.keyword === undefined ? {} : { keyword: record.keyword },
   }
 }
 
