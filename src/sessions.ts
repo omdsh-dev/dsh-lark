@@ -374,7 +374,6 @@ export function sessionChoices(
   input: SessionPickerInput,
   canonical: (path: string) => string,
 ): SessionChoice[] {
-  const home = canonical(input.workspace)
   const keyword = input.keyword?.trim().toLowerCase() ?? ''
   const choices = records
     .filter(record => typeof record.header?.id === 'string' && record.header.id !== '')
@@ -388,9 +387,14 @@ export function sessionChoices(
       // is never offered: its title alone summarizes what was said there.
       return isOwnSession(id, input.base) || !isChatSession(id, input.marker)
     })
-    // A session carries the directory it runs in, so one from elsewhere would
-    // move this conversation's sandbox without anyone saying so.
-    .filter(record => record.header?.cwd !== undefined && canonical(record.header.cwd) === home)
+    // Cross-workspace switching: offer sessions from every workspace, not
+    // just the chat's current one. A picked session carries its own cwd and
+    // moves the conversation's sandbox there — the operator asked for exactly
+    // that by pressing the row.
+    .filter(record => {
+      const cwd = record.header?.cwd
+      return cwd !== undefined && canonical(cwd) !== undefined
+    })
     .map((record): SessionChoice => {
       const id = record.header!.id!
       const title = titles.get(id)
