@@ -1385,6 +1385,13 @@ export function installBridge(
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
       aimBySession.delete(releasedId)
+      // Unbind the chat-side renderer too: `bySession` is what routes host
+      // session events back to a chat (see the `session/event` handler), and a
+      // released session that stays live under another owner (e.g. the desktop
+      // GUI) would otherwise keep mirroring its events into this thread after
+      // the conversation switched away. In-flight renders from before the
+      // release are already closed by the release; new events stop here.
+      bySession.delete(releasedId)
       questions.cancelSession(releasedId)
     }
   }
