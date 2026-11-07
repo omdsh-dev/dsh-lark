@@ -3235,7 +3235,7 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('filters by title on a keyword, and reads no title it will not use', async () => {
+    it('filters by title on a keyword, and reads only the titles it draws', async () => {
       // The keyword used to be matched against a title map that was still
       // empty at filter time, so it only ever matched session ids.
       const { query, titled } = createFakeSessionQuery([
@@ -3258,8 +3258,11 @@ describe('dsh-lark-channel', () => {
 
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(0) })
-      // Both rows have something a person said, so nothing needed a title.
-      expect(titled).toEqual([])
+      // The title is the row's label, so every drawn row asks for one — and
+      // only the drawn rows do, never the whole corpus.
+      const asked = titled.flat()
+      expect(asked).not.toEqual([])
+      expect(asked.every(id => id === 'session-docs' || id === 'session-build')).toBe(true)
 
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions 云文档' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(1) })
