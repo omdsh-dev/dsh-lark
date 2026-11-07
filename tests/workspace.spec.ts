@@ -67,7 +67,10 @@ describe('workspaceSessionId', () => {
 })
 
 describe('expandHome', () => {
-  it('expands ~ and ~/ against the home, and leaves everything else alone', () => {
+  // `expandHome` resolves through `node:path`, so a POSIX home literal comes
+  // back with a drive letter on Windows. The behaviour under test is the
+  // shorthand expansion, which only has these spellings on POSIX.
+  it.skipIf(process.platform === 'win32')('expands ~ and ~/ against the home, and leaves everything else alone', () => {
     expect(expandHome('~', '/home/me')).toBe('/home/me')
     expect(expandHome('~/work', '/home/me')).toBe('/home/me/work')
     expect(expandHome('/abs/path', '/home/me')).toBe('/abs/path')
@@ -76,7 +79,10 @@ describe('expandHome', () => {
 })
 
 describe('withinRoots', () => {
-  it('allows anywhere on an empty list, and only descendants otherwise', () => {
+  // POSIX prefixes: on Windows `resolve('/srv/alpha')` becomes
+  // `C:\srv\alpha`, so the string-prefix comparison under test has no
+  // equivalent with these literals.
+  it.skipIf(process.platform === 'win32')('allows anywhere on an empty list, and only descendants otherwise', () => {
     expect(withinRoots('/anywhere', [])).toBe(true)
     expect(withinRoots('/srv/alpha/sub', ['/srv/alpha'])).toBe(true)
     expect(withinRoots('/srv/alpha', ['/srv/alpha'])).toBe(true)
@@ -160,7 +166,9 @@ describe('ChatWorkspaces', () => {
     if (!unknown.ok) expect(unknown.reason).toContain('绝对路径')
   })
 
-  it('refuses a directory outside the configured roots, but never the default', async () => {
+  // Same POSIX-prefix assumption as `withinRoots`: `/srv/alpha` is not a
+  // prefix relationship once Windows resolves it against a drive.
+  it.skipIf(process.platform === 'win32')('refuses a directory outside the configured roots, but never the default', async () => {
     const { store } = createStore({ roots: ['/srv/alpha'] })
     expect(await store.switch('chat', '/srv/beta')).toMatchObject({ ok: false })
     expect(await store.switch('chat', '/srv/alpha')).toMatchObject({ ok: true })

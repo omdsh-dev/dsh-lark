@@ -88,7 +88,10 @@ function fileMessage(resources: ResourceDescriptor[], overrides: Partial<Normali
 }
 
 describe('sanitizeFileName', () => {
-  it('keeps only the last component of a path, however it escapes', () => {
+  // The last assertion pins POSIX `basename` semantics (it does not split on a
+  // backslash, so the separator pass has to). Windows `basename` splits on both
+  // separators, which makes the same input resolve differently.
+  it.skipIf(process.platform === 'win32')('keeps only the last component of a path, however it escapes', () => {
     expect(sanitizeFileName('../../etc/passwd')).toBe('passwd')
     expect(sanitizeFileName('/etc/shadow')).toBe('shadow')
     // POSIX `basename` does not split on a backslash, so the separator pass must.
@@ -314,7 +317,9 @@ describe('collectInboundFiles', () => {
     expect(reports[0]).toContain('inbox directory')
   })
 
-  it('writes nothing through an inbox that is a symlink out of the workspace', async () => {
+  // Creates a directory symlink, which Windows refuses without elevated rights
+  // (and the escape it proves is the POSIX one).
+  it.skipIf(process.platform === 'win32')('writes nothing through an inbox that is a symlink out of the workspace', async () => {
     const workspace = createWorkspace()
     const elsewhere = createWorkspace()
     // What an injected model can arrange with one write inside its OWN
@@ -343,7 +348,8 @@ describe('collectInboundFiles', () => {
     expect(reports[0]).toContain('inbox directory')
   })
 
-  it('downloads through the directory it proved, not the one it was spelled', async () => {
+  // Same directory-symlink requirement as the test above.
+  it.skipIf(process.platform === 'win32')('downloads through the directory it proved, not the one it was spelled', async () => {
     const workspace = createWorkspace()
     // A link that stays INSIDE the workspace, so containment clears it and the
     // two spellings of one landing directory become distinguishable.
