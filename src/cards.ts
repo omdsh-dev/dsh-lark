@@ -800,6 +800,9 @@ const STATUS = {
   workspace: { zh: '工作区', en: 'Workspace' },
   model: { zh: '模型', en: 'Model' },
   session: { zh: '会话', en: 'Session' },
+  sessionId: { zh: '会话 ID', en: 'Session ID' },
+  recent: { zh: '最近', en: 'Recent' },
+  untitled: { zh: '（新会话，还没有标题）', en: '(new session — no title yet)' },
   activity: { zh: '当前', en: 'Activity' },
   version: { zh: '版本', en: 'Version' },
   preset: { zh: '权限', en: 'Permissions' },
@@ -917,6 +920,10 @@ export function statusCard(input: {
   readonly route: string
   readonly routeIsDefault: boolean
   readonly sessionId: string
+  /** The session's folded title, when the host has folded one. */
+  readonly title?: string | undefined
+  /** The last thing a person said here, as this process remembers it. */
+  readonly recent?: string | undefined
   readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
   readonly pendingApprovals: number
   readonly version: string
@@ -952,7 +959,15 @@ export function statusCard(input: {
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
         )),
-      ...field(STATUS.session, input.sessionId),
+      // The title is what a person recognises the conversation by; the id
+      // stays for /resume and for telling two same-titled sessions apart.
+      ...input.title === undefined
+        ? []
+        : field(STATUS.session, input.title),
+      ...input.recent === undefined
+        ? []
+        : field(STATUS.recent, input.recent),
+      ...field(input.title === undefined ? STATUS.session : STATUS.sessionId, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
     ]),
     actions([{ label: STATUS.refresh, value: input.refresh }], true),

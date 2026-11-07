@@ -733,6 +733,14 @@ export function installBridge(
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
+   * The last thing a person said in each chat, for the `/status` readout.
+   *
+   * Memory only: this is a readability aid ("which conversation am I in?"),
+   * not a record. Nothing reads it back after a restart, and nothing outside
+   * `/status` may treat its absence as "nothing was said".
+   */
+  const lastSaidByChat = new Map<string, string>()
+  /**
    * Outbound file sends holding a buffer, per chat id — the group ones, which
    * are the sends that wait on a human while they hold it.
    *
@@ -1403,11 +1411,13 @@ export function installBridge(
     const route = override === undefined ? deploymentRoute() : formatRoute(override)
     // Meters come off the LIVE session: a conversation whose agent has not been
     // built yet has spent nothing, and reading its stored log to say so would
-    // load a log to report a zero.
+    // load a log to report a zero. The title rides the same snapshot, so it
+    // costs nothing beyond what the meters already read.
     const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
     const meters = readMeters(projections(), live?.session)
     return {
       ...meters,
+      recent: lastSaidByChat.get(subject.chatId),
       workspace: chatWorkspaces.pathFor(subject.key),
       workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
       route,
@@ -1787,6 +1797,10 @@ export function installBridge(
       // message the moment two overlap. When a turn consumes several, the last
       // claim wins: a batched answer addresses the latest ask.
       const message = chatUserMessage(msg, images, inbound)
+      // Remembered for `/status` only: one bounded line, no I/O, and the map
+      // is keyed per chat so switching sessions never mixes two rooms up.
+      const said = msg.content.replace(/\s+/g, ' ').trim()
+      if (said !== '') lastSaidByChat.set(msg.chatId, said.length > 40 ? `${said.slice(0, 40)}…` : said)
       const target = replyTargetOf(msg)
       if (targetByMessageId.size >= MAX_PENDING_TARGETS) {
         const oldest = targetByMessageId.keys().next().value

@@ -21,6 +21,12 @@ export interface SessionMeters {
     readonly cacheRead: number
     readonly cacheWrite: number
   } | undefined
+  /**
+   * The session's folded title, taken from the SAME projection snapshot the
+   * meters come from — so showing it costs no extra log read. Absent for a
+   * session whose title has not been folded yet.
+   */
+  readonly title?: string | undefined
 }
 
 /** Read one number out of an untyped projection value. */
@@ -53,6 +59,15 @@ export function readMeters(
   }
   const pressure = values.contextPressure as HostContextPressure | undefined
   const totals = values.tokenUsage as HostTokenUsage | undefined
+  // The title is a projection too; the host may expose it as the folded string
+  // or as the row's `{ title }` wrapper, so both shapes are accepted. Neither
+  // is read from the log here — this is the snapshot already in hand.
+  const rawTitle = values.title
+  const title = typeof rawTitle === 'string'
+    ? rawTitle
+    : typeof (rawTitle as { readonly title?: unknown } | undefined)?.title === 'string'
+      ? (rawTitle as { readonly title: string }).title
+      : undefined
   const used = pressure?.projectedTokens ?? pressure?.pressureTokens
   const usage = totals === undefined
     ? undefined
@@ -67,6 +82,7 @@ export function readMeters(
       ? {}
       : { context: { used: count(used), window: pressure?.contextWindow } },
     ...usage === undefined || (usage.input === 0 && usage.output === 0) ? {} : { usage },
+    ...title === undefined || title === '' ? {} : { title },
   }
 }
 
@@ -114,6 +130,17 @@ export interface StatusFields {
   readonly routeIsDefault: boolean
   /** The durable session id the conversation resolves to. */
   readonly sessionId: string
+  /**
+   * The session's folded title, when one has been folded. Taken from the meter
+   * snapshot (no extra read); absent before the host has titled the session.
+   */
+  readonly title?: string | undefined
+  /**
+   * The last thing a person said in this chat, as this process remembers it.
+   * Pure memory, so it survives no restart — it is a readability aid, not a
+   * record.
+   */
+  readonly recent?: string | undefined
   /** Whether an agent is currently bound for the conversation. */
   readonly bound: boolean
   /** Whether this conversation has an explicit /session switch (resumed on next message). */
@@ -163,6 +190,8 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     route: fields.route,
     routeIsDefault: fields.routeIsDefault,
     sessionId: fields.sessionId,
+    ...fields.title === undefined ? {} : { title: fields.title },
+    ...fields.recent === undefined ? {} : { recent: fields.recent },
     activity: fields.running ? 'running' : fields.bound ? 'idle' : fields.switched === true ? 'switched' : 'unbound',
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
