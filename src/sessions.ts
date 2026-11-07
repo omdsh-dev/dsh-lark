@@ -552,10 +552,10 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
   const visible = here === undefined || top.includes(here)
     ? top
     : [here, ...top.slice(0, PICKER_ROWS - 1)]
-  // A title is a fallback label, so it is folded only for rows that are drawn
-  // AND have nothing a person said — which, among real conversations, is
-  // almost none of them.
-  const untitled = visible.filter(choice => choice.lastSaid === undefined && choice.title === undefined)
+  // The title is the row's label now, so every drawn row asks for one — not
+  // only the rows with nothing said. This is ONE batched read for the whole
+  // window (`readTitleSnapshots` folds several ids at once), not a read per row.
+  const untitled = visible.filter(choice => choice.title === undefined)
   const titles = await readTitles(query, untitled.map(choice => choice.id), offer.signal)
   const rows = visible.map((choice) => {
     const title = titles.get(choice.id)

@@ -1077,15 +1077,25 @@ export function sessionsCard(input: {
    * instead of offering a press, the same way every settled row here does.
    */
   const rowFor = (row: SessionCardRow): object => {
-    const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
+    // The title is the label a person recognises the conversation by; what was
+    // last said becomes the second line. A row with no title yet (a session the
+    // host has not folded one for) falls back to that line, then to the "nothing
+    // said" marker.
+    const label = row.title ?? row.lastSaid ?? SESSIONS.untitled
     const notes = [
+      // What was said, when the title already took the label slot.
+      row.title !== undefined && row.lastSaid !== undefined ? row.lastSaid : undefined,
       row.when === undefined ? undefined : agoLabel(now - row.when),
       row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
       row.live && !row.current ? SESSIONS.elsewhere : undefined,
-    ].filter((note): note is Copy => note !== undefined)
+    ].filter((note): note is string | Copy => note !== undefined)
+    const asCopy = (note: string | Copy): Copy => typeof note === 'string' ? { zh: note, en: note } : note
     const detail = notes.length === 0
       ? undefined
-      : { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') }
+      : {
+          zh: notes.map(note => asCopy(note).zh).join(' · '),
+          en: notes.map(note => asCopy(note).en).join(' · '),
+        }
     return row.current
       ? settledRow(label, detail, SESSIONS.inUse, INK.info.token)
       : optionRow({ label, description: detail }, input.valueFor(row.id))
