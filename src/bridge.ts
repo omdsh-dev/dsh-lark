@@ -733,6 +733,14 @@ export function installBridge(
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
+   * The last thing a person said in each chat, for the `/status` readout.
+   *
+   * Memory only: this is a readability aid ("which conversation am I in?"),
+   * not a record. Nothing reads it back after a restart, and nothing outside
+   * `/status` may treat its absence as "nothing was said".
+   */
+  const lastSaidByChat = new Map<string, string>()
+  /**
    * Outbound file sends holding a buffer, per chat id — the group ones, which
    * are the sends that wait on a human while they hold it.
    *
@@ -1058,15 +1066,22 @@ export function installBridge(
     const presets = ctx.get('agentPresets') as HostAgentPresets | undefined
     const presetId = presets === undefined ? undefined : (await presets.resolve(config.preset)).id
     // A roster keeps every tool off the global layer, so its standing key is
-    // the view that can describe this agent's calls.
+    // the view that can describe this agent's calls. The desktop host's
+    // `agentPresets` (dsh >= 0.2.1-rc.5) no longer exposes `standingKeyFor`;
+    // treat it as absent (tool scope stays undefined, call presentation
+    // degrades) rather than failing agent composition.
     const toolScope = presets === undefined || presetId === undefined
       ? undefined
-      : await presets.standingKeyFor(presetId)
+      : await presets.standingKeyFor?.(presetId)
     return {
       ...presetId === undefined ? {} : { presetId },
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
-        if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
+        // Guard the newer host's mount signature: if it is missing or
+        // incompatible, keep composing the agent without the preset mount.
+        if (presets !== undefined && presetId !== undefined && typeof presets.mount === 'function') {
+          await presets.mount(agentCtx, presetId)
+        }
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
       },
     }
@@ -1378,6 +1393,13 @@ export function installBridge(
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
       aimBySession.delete(releasedId)
+      // Unbind the chat-side renderer too: `bySession` is what routes host
+      // session events back to a chat (see the `session/event` handler), and a
+      // released session that stays live under another owner (e.g. the desktop
+      // GUI) would otherwise keep mirroring its events into this thread after
+      // the conversation switched away. In-flight renders from before the
+      // release are already closed by the release; new events stop here.
+      bySession.delete(releasedId)
       questions.cancelSession(releasedId)
     }
   }
@@ -1389,11 +1411,13 @@ export function installBridge(
     const route = override === undefined ? deploymentRoute() : formatRoute(override)
     // Meters come off the LIVE session: a conversation whose agent has not been
     // built yet has spent nothing, and reading its stored log to say so would
-    // load a log to report a zero.
+    // load a log to report a zero. The title rides the same snapshot, so it
+    // costs nothing beyond what the meters already read.
     const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
     const meters = readMeters(projections(), live?.session)
     return {
       ...meters,
+      recent: lastSaidByChat.get(subject.chatId),
       workspace: chatWorkspaces.pathFor(subject.key),
       workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
       route,
@@ -1773,6 +1797,10 @@ export function installBridge(
       // message the moment two overlap. When a turn consumes several, the last
       // claim wins: a batched answer addresses the latest ask.
       const message = chatUserMessage(msg, images, inbound)
+      // Remembered for `/status` only: one bounded line, no I/O, and the map
+      // is keyed per chat so switching sessions never mixes two rooms up.
+      const said = msg.content.replace(/\s+/g, ' ').trim()
+      if (said !== '') lastSaidByChat.set(msg.chatId, said.length > 40 ? `${said.slice(0, 40)}…` : said)
       const target = replyTargetOf(msg)
       if (targetByMessageId.size >= MAX_PENDING_TARGETS) {
         const oldest = targetByMessageId.keys().next().value
@@ -2340,8 +2368,11 @@ export function installBridge(
     }
     // What the list was derived under, so what it authorizes can be checked
     // against the conversation as it stands when the pick is actually written.
+    // The keyword that found the row rides the payload: without it, a session
+    // found by keyword but outside the unfiltered top-N window would never
+    // validate here.
     const before = conversationStamp(value.key)
-    const offered = await offeredSessions(value.key)
+    const offered = await offeredSessions(value.key, value.keyword ?? '')
     const choice = offered.rows.find(candidate => candidate.id === value.session)
     if (choice === undefined) {
       notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
@@ -2446,8 +2477,14 @@ export function installBridge(
       // The row's own id LAST: a caller may hand in a payload that already
       // carries one — the click handler repaints from the value it was given —
       // and spreading that over the row would point every button at the
-      // session someone just pressed.
-      valueFor: session => marked({ kind: SESSIONS_ACTION, ...subject, session }),
+      // session someone just pressed. The keyword rides the payload so the
+      // press validates against the same narrowed list that found the row.
+      valueFor: session => marked({
+        kind: SESSIONS_ACTION,
+        ...subject,
+        session,
+        ...keyword === '' ? {} : { keyword },
+      }),
     })
   }
 

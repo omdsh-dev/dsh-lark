@@ -60,7 +60,9 @@ describe('parseArguments', () => {
     expect(parseArguments(['--profile', 'bot'])).toMatchObject({ kind: 'start', profile: 'bot' })
   })
 
-  it('reads the profile and workspace of an explicit start', () => {
+  // `--workspace /srv/work` is resolved absolutely by `node:path`; on Windows
+  // that becomes `C:\srv\work`, so the literal only round-trips on POSIX.
+  it.skipIf(process.platform === 'win32')('reads the profile and workspace of an explicit start', () => {
     expect(parseArguments(['start', '--profile', 'bot', '--workspace', '/srv/work']))
       .toMatchObject({ kind: 'start', profile: 'bot', workspace: '/srv/work' })
   })
@@ -340,18 +342,21 @@ describe('onboarding detection', () => {
 })
 
 describe('servicePath', () => {
-  it('leads with the interpreter that can run a `#!/usr/bin/env node` dsh', () => {
+  // These literals are POSIX paths joined with `:`, and `delimiter` is `;` on
+  // Windows — the split under test has no equivalent there. The service unit
+  // this feeds is a systemd/launchd artefact in any case.
+  it.skipIf(process.platform === 'win32')('leads with the interpreter that can run a `#!/usr/bin/env node` dsh', () => {
     const path = servicePath('/opt/nvm/v22/bin/dsh', '/opt/nvm/v22/bin/node', '/usr/bin')
     expect(path.split(delimiter)[0]).toBe('/opt/nvm/v22/bin')
   })
 
-  it('keeps a separately installed interpreter as well as dsh\'s own directory', () => {
+  it.skipIf(process.platform === 'win32')('keeps a separately installed interpreter as well as dsh\'s own directory', () => {
     const entries = servicePath('/opt/prefix/bin/dsh', '/opt/nvm/v22/bin/node', '/usr/bin').split(delimiter)
     expect(entries).toContain('/opt/prefix/bin')
     expect(entries).toContain('/opt/nvm/v22/bin')
   })
 
-  it('carries the operator\'s PATH through, so the agent still finds its tools', () => {
+  it.skipIf(process.platform === 'win32')('carries the operator\'s PATH through, so the agent still finds its tools', () => {
     const entries = servicePath('/opt/bin/dsh', '/opt/bin/node', '/opt/homebrew/bin:/usr/bin').split(delimiter)
     expect(entries).toContain('/opt/homebrew/bin')
   })
@@ -543,7 +548,9 @@ describe('scan console', () => {
 })
 
 describe('how the command spells itself', () => {
-  it('answers with the form the caller actually used', () => {
+  // The npx detection reads POSIX install paths (`/home/...`, `/usr/local/...`);
+  // on Windows those literals do not resolve to the same shape.
+  it.skipIf(process.platform === 'win32')('answers with the form the caller actually used', () => {
     // Run through npx the binary lives in a throwaway cache, so telling that
     // caller to run a bare `dsh-lark-channel` is telling them to run nothing.
     expect(invocation('/home/dev/.npm/_npx/abc123/node_modules/dsh-lark-channel/lib/cli.js'))

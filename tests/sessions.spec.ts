@@ -53,18 +53,18 @@ describe('what a conversation may continue', () => {
     expect(offered.map(choice => choice.own)).toEqual([false, true, true])
   })
 
-  it('keeps to the conversation\'s workspace, comparing canonical paths', () => {
+  it('offers sessions from every workspace, keeping cwd-less records out', () => {
     const records = corpus(
       { id: 'session-here', cwd: '/tmp/work', createdAt: 10 },
       { id: 'session-elsewhere', cwd: '/other', createdAt: 20 },
       { id: 'session-nowhere', createdAt: 30 },
     )
-    // `/tmp` is a link into `/private/var` on macOS, so a session recorded
-    // under one spelling must still be recognized under the other — a
-    // conversation would otherwise be offered nothing in its own directory.
+    // Cross-workspace (local patch): a row from another directory is offered,
+    // because picking it moves the conversation's sandbox there on purpose.
+    // A record with no cwd at all stays out — there is no sandbox to move to.
     const canonical = (path: string) => (path.startsWith('/private/') ? path : `/private${path}`)
     const offered = sessionChoices(records, new Map(), { ...HERE, workspace: '/private/tmp/work' }, canonical)
-    expect(offered.map(choice => choice.id)).toEqual(['session-here'])
+    expect(offered.map(choice => choice.id)).toEqual(['session-elsewhere', 'session-here'])
   })
 
   it('marks the one in use and the ones another surface is driving', () => {

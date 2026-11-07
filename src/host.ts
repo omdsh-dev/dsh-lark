@@ -150,6 +150,12 @@ export interface HostSessionQuery {
   /** The complete logical corpus, newest first. */
   listSessions(signal?: AbortSignal): Promise<readonly HostSessionRecord[]>
   /**
+   * The desktop host (dsh >= 0.2.1-rc.5) renames the corpus listing to
+   * `filterSessions(filters)`; declared here so the session picker can fall
+   * back to it when `listSessions` is absent. Filters are host-defined.
+   */
+  filterSessions?(filters?: unknown): Promise<readonly HostSessionRecord[]>
+  /**
    * Lightweight records for one session's events — no text, so counting what a
    * conversation contains and asking when it last moved costs no payload.
    */
@@ -644,14 +650,22 @@ export function isToolResultEvent(
 
 /**
  * The call one result answers, and the text it produced.
+ *
+ * Two shapes reach this function. The ACP one nests the payload — a block that
+ * carries its own `content` array of inner blocks — while a host that records
+ * the block directly puts the text on the block itself. Reading only the first
+ * shape yields an empty string for the second, which is how tool results came
+ * out as empty code blocks in the process card.
  * @param data - the completed result payload.
  * @returns the call id and its joined text output.
  */
 export function toolResultText(data: ToolResultData): { callId: string | undefined; text: string } {
   const block = data.message.content[0]
-  const text = (block?.content ?? [])
-    .filter(inner => inner.type === 'text' && inner.text !== undefined)
-    .map(inner => inner.text)
+  const nested = block?.content
+  const blocks = Array.isArray(nested) ? nested : block === undefined ? [] : [block]
+  const text = blocks
+    .filter(inner => inner?.type === 'text' && typeof inner.text === 'string')
+    .map(inner => inner.text as string)
     .join('')
   return { callId: block?.toolCallId ?? data.message.source?.callId, text }
 }

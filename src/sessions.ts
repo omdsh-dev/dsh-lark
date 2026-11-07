@@ -177,6 +177,13 @@ export interface SessionActionValue extends ConversationSubject {
   readonly kind: typeof SESSIONS_ACTION
   /** The session to continue; the row for the derived one carries it too. */
   readonly session: string
+  /**
+   * The keyword this row was found under, when the picker was narrowed.
+   * The press re-derives the offer with the SAME keyword: a session found by
+   * keyword may sit outside the unfiltered top-N window, and validating it
+   * against that window would refuse every keyword-found out-of-window row.
+   */
+  readonly keyword?: string | undefined
 }
 
 /**
@@ -192,6 +199,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
   if (typeof record.key !== 'string' || record.key === '') return undefined
   if (typeof record.chatId !== 'string' || typeof record.chatType !== 'string') return undefined
   if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
+  if (record.keyword !== undefined && typeof record.keyword !== 'string') return undefined
   return {
     kind: SESSIONS_ACTION,
     session: record.session,
@@ -199,6 +207,7 @@ export function sessionActionValue(value: unknown): SessionActionValue | undefin
     chatId: record.chatId,
     chatType: record.chatType,
     ...record.owner === undefined ? {} : { owner: record.owner },
+    ...record.keyword === undefined ? {} : { keyword: record.keyword },
   }
 }
 
@@ -374,7 +383,6 @@ export function sessionChoices(
   input: SessionPickerInput,
   canonical: (path: string) => string,
 ): SessionChoice[] {
-  const home = canonical(input.workspace)
   const keyword = input.keyword?.trim().toLowerCase() ?? ''
   const choices = records
     .filter(record => typeof record.header?.id === 'string' && record.header.id !== '')
@@ -388,9 +396,14 @@ export function sessionChoices(
       // is never offered: its title alone summarizes what was said there.
       return isOwnSession(id, input.base) || !isChatSession(id, input.marker)
     })
-    // A session carries the directory it runs in, so one from elsewhere would
-    // move this conversation's sandbox without anyone saying so.
-    .filter(record => record.header?.cwd !== undefined && canonical(record.header.cwd) === home)
+    // Cross-workspace switching: offer sessions from every workspace, not
+    // just the chat's current one. A picked session carries its own cwd and
+    // moves the conversation's sandbox there — the operator asked for exactly
+    // that by pressing the row.
+    .filter(record => {
+      const cwd = record.header?.cwd
+      return cwd !== undefined && canonical(cwd) !== undefined
+    })
     .map((record): SessionChoice => {
       const id = record.header!.id!
       const title = titles.get(id)
@@ -479,7 +492,12 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     canonicalized.set(path, resolved)
     return resolved
   }
-  const records = await query.listSessions(offer.signal).catch((error: unknown) => {
+  // The desktop host's `sessionQuery` (dsh >= 0.2.1-rc.5) renamed the listing
+  // method to `filterSessions(filters)`; fall back to it when `listSessions`
+  // is absent, so the /session picker works on both host generations.
+  const records = await (typeof query.listSessions === 'function'
+    ? query.listSessions(offer.signal)
+    : query.filterSessions!({})).catch((error: unknown) => {
     offer.report?.(`lark-channel: listing sessions failed: ${String(error)}`)
     return [] as readonly HostSessionRecord[]
   })
@@ -534,10 +552,10 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
   const visible = here === undefined || top.includes(here)
     ? top
     : [here, ...top.slice(0, PICKER_ROWS - 1)]
-  // A title is a fallback label, so it is folded only for rows that are drawn
-  // AND have nothing a person said — which, among real conversations, is
-  // almost none of them.
-  const untitled = visible.filter(choice => choice.lastSaid === undefined && choice.title === undefined)
+  // The title is the row's label now, so every drawn row asks for one — not
+  // only the rows with nothing said. This is ONE batched read for the whole
+  // window (`readTitleSnapshots` folds several ids at once), not a read per row.
+  const untitled = visible.filter(choice => choice.title === undefined)
   const titles = await readTitles(query, untitled.map(choice => choice.id), offer.signal)
   const rows = visible.map((choice) => {
     const title = titles.get(choice.id)

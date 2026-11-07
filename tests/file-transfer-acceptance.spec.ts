@@ -15,7 +15,7 @@
 import { mkdtempSync, realpathSync } from 'node:fs'
 import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NormalizedMessage } from '@larksuite/channel'
 import { Config } from '../src/config.ts'
@@ -160,8 +160,10 @@ describe('file transfer · the group gate is not a setting', () => {
 })
 
 describe('file transfer · inbound files belong to the workspace', () => {
-  // ADR 0001's consequence: files follow the directory, not the conversation.
-  it('lands later files in the directory /cd moved to, leaving the first one behind', async () => {
+  // The landing assertions read the workspace's canonical path back out of a
+  // POSIX-shaped expectation; on Windows the same walk yields a drive-letter
+  // path, so the literals never match.
+  it.skipIf(process.platform === 'win32')('lands later files in the directory /cd moved to, leaving the first one behind', async () => {
     const first = createWorkspace()
     const second = createWorkspace()
     const harness = await mountChannel({ cwd: first })
@@ -187,7 +189,7 @@ describe('file transfer · inbound files belong to the workspace', () => {
   // ADR 0001 again, and the epoch principle it borrows from: a chat command
   // must not be able to destroy a record. The log someone sent may be the only
   // copy of it.
-  it('keeps every landed file across /new, which only starts the context over', async () => {
+  it.skipIf(process.platform === 'win32')('keeps every landed file across /new, which only starts the context over', async () => {
     const workspace = createWorkspace()
     const harness = await mountChannel({ cwd: workspace })
 
@@ -252,7 +254,9 @@ describe('file transfer · a hostile name cannot leave the inbox', () => {
     const landed = await landedFiles(workspace)
     expect(landed).toHaveLength(1)
     const path = landed[0]!
-    const name = path.split('/').pop()!
+    // `basename`, not a `/` split: the landing path is native, so it uses `\`
+    // on Windows.
+    const name = basename(path)
 
     // The properties that matter, and that hold on every platform: the name
     // carries no separator of either family, and the bytes sit under the inbox
@@ -280,7 +284,11 @@ describe('file transfer · a hostile name cannot leave the inbox', () => {
     await harness.fake.emitMessage(withFiles(harness, [{ fileKey: 'fk_n', fileName: hostile, bytes: 'x' }]))
     await consumed(harness, 0, 1)
 
-    expect((await landedFiles(workspace))[0]!.split('/').pop()).toBe(expected)
+    // `basename`, not a `/` split: the landing path is native. On Windows the
+    // sanitized tail is the same (`evil.sh` / `passwd`), but `basename` reaches
+    // it through both separators, so asserting on the tail keeps the case
+    // meaningful on both platforms.
+    expect(basename((await landedFiles(workspace))[0]!)).toBe(expected)
     await harness.dispose()
   })
 })

@@ -800,6 +800,9 @@ const STATUS = {
   workspace: { zh: '工作区', en: 'Workspace' },
   model: { zh: '模型', en: 'Model' },
   session: { zh: '会话', en: 'Session' },
+  sessionId: { zh: '会话 ID', en: 'Session ID' },
+  recent: { zh: '最近', en: 'Recent' },
+  untitled: { zh: '（新会话，还没有标题）', en: '(new session — no title yet)' },
   activity: { zh: '当前', en: 'Activity' },
   version: { zh: '版本', en: 'Version' },
   preset: { zh: '权限', en: 'Permissions' },
@@ -917,6 +920,10 @@ export function statusCard(input: {
   readonly route: string
   readonly routeIsDefault: boolean
   readonly sessionId: string
+  /** The session's folded title, when the host has folded one. */
+  readonly title?: string | undefined
+  /** The last thing a person said here, as this process remembers it. */
+  readonly recent?: string | undefined
   readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
   readonly pendingApprovals: number
   readonly version: string
@@ -952,7 +959,15 @@ export function statusCard(input: {
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
         )),
-      ...field(STATUS.session, input.sessionId),
+      // The title is what a person recognises the conversation by; the id
+      // stays for /resume and for telling two same-titled sessions apart.
+      ...input.title === undefined
+        ? []
+        : field(STATUS.session, input.title),
+      ...input.recent === undefined
+        ? []
+        : field(STATUS.recent, input.recent),
+      ...field(input.title === undefined ? STATUS.session : STATUS.sessionId, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
     ]),
     actions([{ label: STATUS.refresh, value: input.refresh }], true),
@@ -1062,15 +1077,25 @@ export function sessionsCard(input: {
    * instead of offering a press, the same way every settled row here does.
    */
   const rowFor = (row: SessionCardRow): object => {
-    const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
+    // The title is the label a person recognises the conversation by; what was
+    // last said becomes the second line. A row with no title yet (a session the
+    // host has not folded one for) falls back to that line, then to the "nothing
+    // said" marker.
+    const label = row.title ?? row.lastSaid ?? SESSIONS.untitled
     const notes = [
+      // What was said, when the title already took the label slot.
+      row.title !== undefined && row.lastSaid !== undefined ? row.lastSaid : undefined,
       row.when === undefined ? undefined : agoLabel(now - row.when),
       row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
       row.live && !row.current ? SESSIONS.elsewhere : undefined,
-    ].filter((note): note is Copy => note !== undefined)
+    ].filter((note): note is string | Copy => note !== undefined)
+    const asCopy = (note: string | Copy): Copy => typeof note === 'string' ? { zh: note, en: note } : note
     const detail = notes.length === 0
       ? undefined
-      : { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') }
+      : {
+          zh: notes.map(note => asCopy(note).zh).join(' · '),
+          en: notes.map(note => asCopy(note).en).join(' · '),
+        }
     return row.current
       ? settledRow(label, detail, SESSIONS.inUse, INK.info.token)
       : optionRow({ label, description: detail }, input.valueFor(row.id))

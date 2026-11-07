@@ -61,7 +61,9 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
   })
 
-  it('follows a symlink before it decides, so one leaving the workspace is refused', async () => {
+  // Every case below creates a symlink. Windows refuses `symlink` without
+  // elevated rights, and the escape it proves is the POSIX one.
+  it.skipIf(process.platform === 'win32')('follows a symlink before it decides, so one leaving the workspace is refused', async () => {
     const workspace = createWorkspace()
     const outside = createWorkspace()
     await writeFile(join(outside, 'secret.md'), 'not yours')
@@ -77,7 +79,7 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'outside_workspace' } })
   })
 
-  it('still clears a file when the workspace path is itself a symlink', async () => {
+  it.skipIf(process.platform === 'win32')('still clears a file when the workspace path is itself a symlink', async () => {
     const real = createWorkspace()
     const elsewhere = createWorkspace()
     const linked = join(elsewhere, 'project')
@@ -101,7 +103,7 @@ describe('resolveOutboundFile', () => {
     expect(resolveOutboundFile(join(linked, 'report.md'), linked, 1024)).toEqual({ ok: true, file: cleared })
   })
 
-  it('names a file by where it really sits, so a symlink cannot rename it', async () => {
+  it.skipIf(process.platform === 'win32')('names a file by where it really sits, so a symlink cannot rename it', async () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'secrets'))
     await writeFile(join(workspace, 'secrets', 'tokens.env'), 'TOKEN=x')
@@ -145,7 +147,9 @@ describe('resolveOutboundFile', () => {
       .toEqual({ ok: false, refusal: { code: 'not_found' } })
   })
 
-  it('refuses everything when the workspace itself is not there', () => {
+  // `/etc/hosts` is the POSIX absolute path this case leans on; on Windows it
+  // is not an absolute path at all, so the branch under test is unreachable.
+  it.skipIf(process.platform === 'win32')('refuses everything when the workspace itself is not there', () => {
     const missing = join(createWorkspace(), 'never-created')
 
     // The uncanonicalizable workspace still bounds the check rather than
@@ -541,7 +545,10 @@ describe('runGetCommand', () => {
 
   // Root reads a mode-000 file regardless, which would leave this passing for the
   // wrong reason rather than failing.
-  it.skipIf(process.getuid?.() === 0)('tells the chat a read failed without printing the host path', async () => {
+  // Reads a directory as a file to provoke the failure, then asserts the POSIX
+  // errno (`EACCES`/`EISDIR`). Windows reports a different code, and `getuid`
+  // does not exist there — hence both guards.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('tells the chat a read failed without printing the host path', async () => {
     const workspace = createWorkspace()
     await mkdir(join(workspace, 'out'))
     const path = join(workspace, 'out', 'report.md')
