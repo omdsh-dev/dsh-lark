@@ -351,6 +351,29 @@ export class ConversationSessions {
   async close(): Promise<void> {
     this.closed = true
     const owned = [...this.opened.values()].filter(session => session.owned)
+    // Unloading this plugin IS a disposal, and a turn cut by disposal is
+    // committed by the host from its loop's `finally`: an ending it never
+    // assigned is written as `turn/end { reason: null }`, a record the host's
+    // own continuation projection dereferences — one of them makes the whole
+    // session unprojectable. End each running turn here, briefly and
+    // best-effort, before the agents go away; a loop that cannot stop must not
+    // hold the unload open, so the wait is bounded.
+    for (const session of owned) {
+      try {
+        session.handle.agent.cancel('the channel is shutting down')
+      } catch {
+        // A cancel that throws is no worse than the disposal that follows it.
+      }
+    }
+    const idles = owned
+      .map(session => session.handle.agent.whenIdle?.())
+      .filter((idle): idle is Promise<void> => idle !== undefined)
+    if (idles.length > 0) {
+      await Promise.race([
+        Promise.all(idles.map(idle => idle.catch(() => undefined))),
+        new Promise<void>((resolve) => { setTimeout(resolve, 500) }),
+      ]).catch(() => undefined)
+    }
     // A release already in flight took its binding out of `opened`, so closing
     // would not see it — and "closed" would mean "closed except for whatever
     // was being released at that moment", which is not what a caller disposing

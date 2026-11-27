@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Releasing a conversation's agent no longer leaves its session log unprojectable. `/cd`, `/new`, and a model switch dispose a live agent; the host commits the interrupted turn's ending from the agent loop's `finally`, and an ending it never assigned is written as `turn/end { reason: null }`. The host's continuation projection dereferences that field, so a single such record made the whole session fail to project in the desktop client (`Cannot read properties of null (reading 'kind')`) for a conversation the channel had merely moved away from. The release now cancels the running turn first and gives the loop a bounded two seconds to commit a real ending before disposing the agent; a stuck turn still cannot block the switch.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
