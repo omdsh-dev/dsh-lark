@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A conversation never resumes a session that belongs to another directory. The session id is derived from the chat and the directory it runs in, but the deployment default deliberately keeps the plain id so existing conversations keep their sessions; a session created while an older default was in force carries that plain id with a header `cwd` pointing elsewhere, and `resume` accepted it — so after the default moved, the chat kept answering from the old directory while `/status` showed the new one, and `/cd` to the current directory changed no mapping, released nothing, and left the chat stuck. Opening a conversation now compares the derived id's stored directory with the one the conversation runs in, and on a mismatch moves to the newest epoch that belongs to the right directory (`ChatEpochs.adopt`) — the context it actually built there — minting a new one only when no such epoch exists. The check runs once per opening, so a restart, a `/cd`, and a hand-edited mapping all heal the same way.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),

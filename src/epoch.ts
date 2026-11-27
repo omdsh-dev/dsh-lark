@@ -80,9 +80,11 @@ export class ChatEpochs {
   }
 
   /**
-   * Move one conversation to a fresh session.
+   * Move one conversation to a fresh session. An epoch nobody has ever used is
+   * the next number; a repair may instead adopt an epoch that already exists
+   * (see {@link adopt}).
    * @param baseId - the id that conversation derives at epoch zero.
-   * @returns the new epoch, and whether it will survive a restart.
+   * @returns the new epoch, and whether it survives a restart.
    */
   async startNew(baseId: string): Promise<EpochChange> {
     const epoch = this.epochOf(baseId) + 1
@@ -96,6 +98,28 @@ export class ChatEpochs {
       this.report('lark-channel: new sessions are in-memory only (no settings service); they reset on restart')
     }
     return { epoch, durable }
+  }
+
+  /**
+   * Point one conversation at an epoch that already exists.
+   *
+   * Used by the directory repair: when the id a conversation derives turns out
+   * to name a session created in ANOTHER directory, the conversation is put on
+   * the newest epoch that belongs to the right one — the context it actually
+   * built there — rather than on a fresh number whose session was never
+   * spoken to.
+   * @param baseId - the id that conversation derives at epoch zero.
+   * @param epoch - the existing epoch to adopt; must be positive.
+   * @returns whether the move survives a restart.
+   */
+  async adopt(baseId: string, epoch: number): Promise<boolean> {
+    const next = epoch > 0 ? epoch : 0
+    if (this.epochOf(baseId) === next) return true
+    this.entries.set(baseId, String(next))
+    return this.persist({ chatEpochs: { [baseId]: String(next) } }).catch((error: unknown) => {
+      this.report(`lark-channel: persisting the adopted session failed: ${String(error)}`)
+      return false
+    })
   }
 }
 
