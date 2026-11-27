@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Host commands typed into a chat run again. `commands.execute` is positional and four wide — `(agent, line, submittedAttachments, signal)` — and it reads `signal.aborted` before it looks at anything else, so a three-argument call put the signal where attachments belong and left the signal undefined: every host command typed into a chat, `/permission` included, failed with `Cannot read properties of undefined (reading 'aborted')`. The caller now passes an empty attachment list, and the test asserts the argument POSITION rather than merely that the call happened; the fakes had declared the same wrong shape, which is why the suite stayed green.
+- The bot's `/` panel keeps up with a command's TEXT, not only its name. The platform registers a command with a description and offers no update, so an entry that already existed was never touched again — `/permission` went on advertising the host's English one-liner long after the channel had given it a card, a picker, and a current-preset row. The sync now compares descriptions as well: a changed one is repaired by removing the entry and registering it again (the only route the platform offers), the refresh is reported, and an entry whose description the platform could not report is left alone rather than rewritten against a guess.
+- A permission switch is read back before it is claimed. A host accepting the command line is not the session holding the preset; what a chat and the desktop both display is the session's `permissions` projection, so that is what is read once the switch settles, and a projection that still shows another preset is reported as the failure it is instead of "已切到 X". A typed switch cancelled while queued (a `/new`, `/cd`, or model switch released the agent first) now says that it did not happen, instead of staying silent after having been acknowledged.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),

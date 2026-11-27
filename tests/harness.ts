@@ -75,7 +75,15 @@ export function createFakePort() {
   const streams: StreamedCard[] = []
   /** Commands already on the app's panel, and the ones this run registered. */
   const panelCommands: string[] = []
+  /**
+   * The text each registered command carries. A name pushed straight into
+   * `panelCommands` has no entry here, which is the case the sync must leave
+   * alone: the platform reported no description, so there is nothing to compare.
+   */
+  const panelDescriptions = new Map<string, string>()
   const panelCreated: string[] = []
+  /** Every registration this run made, with the text it registered. */
+  const createdDescriptions: { command: string; description: string }[] = []
   const panelDeleted: string[] = []
   /** Thinking processes opened by the renderer, with the events written to each. */
   const cots: {
@@ -224,17 +232,27 @@ export function createFakePort() {
     },
     async listSlashCommands() {
       if (state.failPanelList) throw new Error('no permission to list commands (fake)')
-      return panelCommands.map((c, index) => ({ command: c, commandId: `cmd_${index}` }))
+      return panelCommands.map((c, index) => ({
+        command: c,
+        commandId: `cmd_${index}`,
+        ...panelDescriptions.has(c) ? { description: panelDescriptions.get(c)! } : {},
+      }))
     },
     async deleteSlashCommand(commandId) {
       if (state.failPanelDelete) throw new Error('cannot remove command (fake)')
       const index = panelCommands.findIndex((_, i) => `cmd_${i}` === commandId)
-      if (index >= 0) panelDeleted.push(panelCommands[index]!)
+      if (index >= 0) {
+        panelDeleted.push(panelCommands[index]!)
+        panelDescriptions.delete(panelCommands[index]!)
+        panelCommands.splice(index, 1)
+      }
     },
-    async createSlashCommand(command) {
+    async createSlashCommand(command, description) {
       if (state.failPanelCreate) throw new Error('command already exists (fake)')
       panelCommands.push(command)
+      panelDescriptions.set(command, description)
       panelCreated.push(command)
+      createdDescriptions.push({ command, description })
     },
     async stream(to, input): Promise<SendResult> {
       if (state.failStreams) throw new Error('stream rejected (fake)')
@@ -265,7 +283,9 @@ export function createFakePort() {
     updated,
     streams,
     panelCommands,
+    panelDescriptions,
     panelCreated,
+    createdDescriptions,
     panelDeleted,
     resourceBytes,
     chatMembers,
@@ -942,7 +962,9 @@ export function createFakeCommands(
   const executed: string[] = []
   const service: HostCommands = {
     list: () => available,
-    async execute(_agent, line, _signal) {
+    // Four positional arguments, as the host declares them: a fake that
+    // accepted three would let the very bug this suite exists to catch pass.
+    async execute(_agent, line, _submittedAttachments, _signal) {
       executed.push(line)
       const name = commandName(line) ?? ''
       if (!available.some(c => c.name === name)) return undefined

@@ -46,6 +46,7 @@ import type {
   HostSessionEvent,
   HostSessionProjections,
   HostCommands,
+  HostCommandDescriptor,
   HostContentBlock,
   HostSystemPrompt,
   HostTools,
@@ -268,6 +269,18 @@ interface PresetOutcome {
  * that a busy one does not hold its chat's queue.
  */
 const QUICK_SWITCH_MS = 1200
+
+/**
+ * How long a landed switch waits for the `permissions` projection to agree with
+ * it. The fold is incremental and may publish a tick after the command settles,
+ * so a single read would call a working switch broken; the window is short
+ * enough that a genuinely unapplied one is still answered while the person is
+ * looking at the chat.
+ */
+const PRESET_SETTLE_MS = 400
+
+/** One read of the projection while {@link PRESET_SETTLE_MS} runs out. */
+const PRESET_SETTLE_STEP_MS = 25
 
 /**
  * How many times disposal waits for the background set to empty. Each round
@@ -501,6 +514,27 @@ const MAX_PENDING_FILE_SENDS = 3
  * agent dies between accepting a followup and starting its turn.
  */
 const MAX_PENDING_TARGETS = 500
+
+/**
+ * What the bot's `/` panel says for one host command.
+ *
+ * The host describes its commands for whoever types them at a terminal, in
+ * English, and that text is what a panel row showed — beside this channel's own
+ * rows, which are Chinese and name the surface the command actually has here.
+ * `/permission` is the row that matters most: in this channel it is also a card
+ * with buttons, a current preset and a switch the host performs, so a row
+ * advertising "switch the permission preset (sandbox mode + approval policy)"
+ * both reads as foreign and undersells it. Only commands this channel gives a
+ * surface of its own are restated; everything else keeps the host's words.
+ * @param descriptor - the host's own row.
+ * @returns the description to register on the panel.
+ */
+function panelDescription(descriptor: HostCommandDescriptor): string {
+  if (descriptor.name === PERMISSION_COMMAND) {
+    return '查看或切换本会话的权限预设（沙箱范围 + 审批策略）'
+  }
+  return descriptor.description
+}
 
 /**
  * Reduce one presentation title to a single safe card line: the value is
@@ -1253,7 +1287,10 @@ export function installBridge(
     panelPublished = true
     const hosted = (ctx.get('commands') as HostCommands | undefined)?.list(agent) ?? []
     const desired = [
-      ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
+      ...hosted.map(descriptor => ({
+        name: descriptor.name,
+        description: panelDescription(descriptor),
+      })),
       { name: STOP_COMMAND, description: '停止当前任务' },
       { name: CD_COMMAND, description: '切换本会话的工作区目录' },
       { name: WS_COMMAND, description: '查看可用工作区' },
@@ -1264,8 +1301,9 @@ export function installBridge(
       { name: SESSIONS_COMMAND, description: '列出可接续的会话，点一行就切过去' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
-    void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
+    void syncSlashPanel(port, desired, notify).then(({ added, updated, removed }) => {
       if (added.length > 0) notify(`lark-channel: registered /${added.join(', /')} on the bot's slash panel`)
+      if (updated.length > 0) notify(`lark-channel: refreshed the text of /${updated.join(', /')} on the bot's slash panel`)
       if (removed.length > 0) notify(`lark-channel: removed /${removed.join(', /')} from the bot's slash panel`)
     })
   }
@@ -1283,7 +1321,12 @@ export function installBridge(
     `🔓 已记下：当前这轮任务结束后切到 ${preset}。`
     + '\n（会话日志同一时刻只能有一个写入者，所以不在任务中途改。）'
 
-  /** What the chat is told when a switch landed. */
+  /** What the chat is told when a queued switch never ran. */
+  const presetDroppedText = (preset: string): string =>
+    `⚠️ 这次没有切到 ${preset}：还没轮到它，会话就被 /new、/cd 或换模型接管了。`
+    + `\n再发一次 \`/permission ${preset}\` 就行。`
+
+  /** What the chat is told when the switch landed. */
   const presetSwitchedText = (preset: string): string =>
     `🔓 已切到 ${preset}。用 \`/permission\` 可以随时切回。`
 
@@ -1435,10 +1478,53 @@ export function installBridge(
       notify(`lark-channel: the switch to ${preset} was dropped — ${sessionId} moved on before it ran`)
       return outcome
     }
-    notify(outcome.ok
-      ? `lark-channel: session ${sessionId} switched to preset ${preset}`
-      : `lark-channel: preset switch to ${preset} failed: ${outcome.detail ?? 'unknown'}`)
+    if (!outcome.ok) {
+      notify(`lark-channel: preset switch to ${preset} failed: ${outcome.detail ?? 'unknown'}`)
+      return outcome
+    }
+    // The command returning success is the host accepting the line, not the
+    // session holding the preset. What a chat and the desktop both display is
+    // the `permissions` projection, which is folded from the session's own
+    // events, so THAT is what gets read back — the same value the other
+    // surface renders. A mismatch is reported instead of accepted: a chat told
+    // "已切到 X" while every other surface still shows Y is the one failure
+    // this command cannot afford, because the person then authorizes nothing
+    // and believes otherwise.
+    const inForce = await settledPreset(agent, preset)
+    if (inForce !== undefined && inForce !== preset) {
+      const detail = `会话实际停在 ${inForce}`
+      notify(`lark-channel: the switch to ${preset} did not take: ${detail}`)
+      return { ok: false, detail }
+    }
+    notify(`lark-channel: session ${sessionId} switched to preset ${preset}`)
     return outcome
+  }
+
+  /**
+   * What one session's `permissions` projection says once a switch has settled.
+   *
+   * Read twice, briefly: the projection is folded from the events the command
+   * just appended, and a fold that lands a tick after the command settles is
+   * normal, while a value that is still wrong after the window is the state
+   * the next reader will see too. Undefined means nobody publishes the
+   * projection — a deployment without presets — and then there is nothing to
+   * check and nothing to claim.
+   * @param agent - the conversation's agent.
+   * @param preset - the preset the switch asked for.
+   * @returns the preset in force, or undefined when none is published.
+   */
+  const settledPreset = async (agent: HostAgent, preset: string): Promise<string | undefined> => {
+    const now = (): string | undefined => readPresets(projections(), agent, presetTable()).current
+    let current = now()
+    for (
+      let waited = 0;
+      current !== undefined && current !== preset && waited < PRESET_SETTLE_MS;
+      waited += PRESET_SETTLE_STEP_MS
+    ) {
+      await new Promise<void>(resolve => setTimeout(resolve, PRESET_SETTLE_STEP_MS))
+      current = now()
+    }
+    return current
   }
 
   /**
@@ -2298,10 +2384,12 @@ export function installBridge(
     // one message; a slow one is acknowledged and reported when it lands.
     const pending = applyPreset(agent.session.id, agent, preset)
     const say = async (landed: PresetOutcome): Promise<unknown> =>
-      // Silent on a dropped switch, the same way the card is: the conversation
-      // released its own agent, and it did not fail at anything.
+      // A dropped switch IS said here, unlike on the card path: this chat was
+      // told "已记下" and then has no card standing in front of it to show the
+      // buttons again, so silence would leave it believing the session is now
+      // more open than it is. The card path repaints its picker instead.
       landed.cancelled === true
-        ? undefined
+        ? port.send(chatId, { text: presetDroppedText(preset) }).catch(reportSendFailure)
         : port
           .send(chatId, { text: landed.ok ? presetSwitchedText(preset) : presetFailedText(preset, landed.detail) })
           .catch(reportSendFailure)

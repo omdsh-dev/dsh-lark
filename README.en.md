@@ -70,7 +70,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |
-| Permission presets | `/permission` opens a picker saying what each preset may touch and whether it still asks; loosening the sandbox needs an approver, tightening it does not |
+| Permission presets | `/permission` opens a picker saying what each preset may touch and whether it still asks, and a switch is read back from the session before it is reported; loosening the sandbox needs an approver, tightening it does not |
 | Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them — and refreshes in place |
 | Session scope | One agent per chat, per topic thread, or per person in a shared chat |
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
