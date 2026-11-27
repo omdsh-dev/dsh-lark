@@ -2683,7 +2683,7 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
       const settled = harness.fake.updated[0]!.card
       expect(cardControls(settled)).toHaveLength(0)
-      expect(cardTexts(settled).some((text) => text.content.includes('已切到 danger-full-access'))).toBe(true)
+      expect(cardTexts(settled).some((text) => text.content.includes('已切到 完全权限（danger-full-access）'))).toBe(true)
       await harness.dispose()
     })
 
@@ -2725,7 +2725,7 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
       const settled = harness.fake.updated[0]!.card
       expect(cardControls(settled)).toHaveLength(0)
-      expect(cardTexts(settled).some((t) => t.content.includes('已切到 danger-full-access'))).toBe(true)
+      expect(cardTexts(settled).some((t) => t.content.includes('已切到 完全权限（danger-full-access）'))).toBe(true)
       await harness.dispose()
     })
 
@@ -2759,7 +2759,7 @@ describe('dsh-lark-channel', () => {
 
       harness.agents.created[0]!.agent.drive(false)
       await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
-      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切到 danger-full-access') })
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切到 完全权限（danger-full-access）') })
       await harness.dispose()
     })
 
@@ -3950,5 +3950,87 @@ describe('dsh-lark-channel', () => {
     await fiber.dispose()
     expect(unregister).toHaveBeenCalledTimes(1)
     await removeService()
+  })
+})
+
+describe('permission presets the deployment actually defines', () => {
+  /** A command runtime that records what it runs; the switch itself is not under test here. */
+  const switching = () => {
+    const ran: string[] = []
+    return {
+      ran,
+      service: {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success' as const, text: `preset ${line}` } }
+        },
+      },
+    }
+  }
+
+  /**
+   * A projection shaped the way the current host publishes it: the folded knob
+   * state, no option list. A reader that expected the older `{currentValue,
+   * options}` shape saw no preset at all here — every card came out empty
+   * beside a command that worked.
+   */
+  const foldedProjection = (state: Record<string, unknown>) => ({
+    snapshot: () => ({ asOfSeq: 1, values: { permissions: state } }),
+  })
+
+  /** Everything the channel sent, as one searchable string. */
+  const allSent = (harness: { fake: { sent: { input: unknown }[] } }): string =>
+    harness.fake.sent.map(message => JSON.stringify(message.input)).join('\n')
+
+  it('offers the whole table, marks the one in force, and still reads it without options', async () => {
+    const commands = switching()
+    const harness = await mountChannel({}, {
+      commands: commands.service,
+      sessionProjections: foldedProjection({
+        preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask', seeded: true,
+      }),
+      permissionPresets: createFakePermissionPresets({
+        'read-only': { sandbox: 'read-only', approval: 'ask' },
+      }),
+    })
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+
+    await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+
+    // Every switchable preset is a row; the one in force is stated, not offered.
+    expect(cardControls(card).map(control => (control.value as { preset: string }).preset))
+      .toEqual(['danger-full-access', 'read-only'])
+    const shown = cardTexts(card).map((text) => text.content).join('\n')
+    expect(shown).toContain('仅可查看')
+    expect(shown).toContain('工作区内修改')
+    expect(shown).toContain('完全权限')
+    // Reading is still a read.
+    expect(commands.ran).toEqual([])
+    await harness.dispose()
+  })
+
+  it('answers a name outside the table with the table, and runs nothing', async () => {
+    const commands = switching()
+    const harness = await mountChannel({}, {
+      commands: commands.service,
+      sessionProjections: foldedProjection({
+        preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask', seeded: true,
+      }),
+      // One preset is enough to prove the answer is the list, not a guess.
+      permissionPresets: createFakePermissionPresets(),
+    })
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+
+    await harness.fake.emitMessage(fakeMessage({ content: '/permission team-default' }))
+    await vi.waitFor(() => { expect(allSent(harness)).toContain('没有 “team-default” 这个预设') })
+    expect(allSent(harness)).toContain('工作区内修改（workspace-write）')
+    expect(allSent(harness)).toContain('完全权限（danger-full-access）')
+    expect(commands.ran).toEqual([])
+    await harness.dispose()
   })
 })

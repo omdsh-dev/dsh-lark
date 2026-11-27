@@ -25,6 +25,7 @@
  * @module dsh-lark-channel/cards
  */
 
+import { presetLabelCopy } from './permission.ts'
 import { formatByteSize } from './format.ts'
 
 /**
@@ -936,7 +937,7 @@ export function statusCard(input: {
         // should not be something you discover by noticing no card arrived.
         : field(
           STATUS.preset,
-          input.preset.value,
+          presetTitled(input.preset.value, input.preset.name),
           isUnconfinedRow(input.preset) ? STATUS.presetOpen : undefined,
         ),
       ...input.pendingApprovals === 0
@@ -1208,11 +1209,22 @@ export function permissionCard(input: {
   readonly presets: readonly PresetRow[]
   readonly valueFor: (preset: string) => object
 }): object {
-  const current = input.current ?? PERMISSION.unknown.zh
-  return card('warning', fill(PERMISSION.summary, current), [
-    ...heading('warning', PERMISSION.title, PERMISSION.context),
+  const current: Line = input.current === undefined
+    ? PERMISSION.unknown
+    : presetTitled(input.current)
+  // The picker reads as an ordinary command result: every other command's card
+  // opens with the same blue title, and a warning-toned heading made this one
+  // look like something had gone wrong. The risk is carried where it belongs,
+  // on the unconfined row, not on the whole card.
+  return card('info', fillLine(PERMISSION.summary, current), [
+    ...heading('info', PERMISSION.title, PERMISSION.context),
     ...input.presets.map(preset => preset.value === input.current
-      ? settledRow(labelOf(preset), describePreset(preset), PERMISSION.inUse, INK.warning.token)
+      ? settledRow(
+        labelOf(preset),
+        describePreset(preset),
+        PERMISSION.inUse,
+        isUnconfinedRow(preset) ? INK.warning.token : INK.info.token,
+      )
       : optionRow(
         { label: labelOf(preset), description: describePreset(preset) },
         input.valueFor(preset.value),
@@ -1235,15 +1247,52 @@ export interface PresetRow {
 }
 
 /**
+ * Join this module's copy to a value that may itself be bilingual, keeping
+ * both languages aligned instead of pasting one language into both.
+ * @param copy - the localized sentence with a `%s` slot.
+ * @param value - the value to put in the slot.
+ * @returns one copy carrying both languages.
+ */
+function fillLine(copy: Copy, value: Line): Copy {
+  if (!isCopy(value)) return fill(copy, value)
+  return { zh: copy.zh.replace('%s', value.zh), en: copy.en.replace('%s', value.en) }
+}
+
+/**
+ * One preset named for a card: the key `/permission` takes, with the name a
+ * chat uses for it beside it. Both languages travel together, because a
+ * Chinese-only label is untranslated copy on an English card.
+ * @param value - the preset key.
+ * @param name - the label the deployment published, when it published one.
+ * @returns a card line.
+ */
+function presetNameLine(value: string, name?: string | undefined): Line {
+  const label = presetLabelCopy(value, name)
+  if (typeof label === 'string') return label === value ? value : `${value} · ${label}`
+  return { zh: `${value} · ${label.zh}`, en: `${value} · ${label.en}` }
+}
+
+/**
+ * One preset named for a title or a summary: the name first, with the key it
+ * is switched by in parentheses when the two differ.
+ * @param value - the preset key.
+ * @param name - the label the deployment published, when it published one.
+ * @returns a card line.
+ */
+function presetTitled(value: string, name?: string | undefined): Line {
+  const label = presetLabelCopy(value, name)
+  if (typeof label === 'string') return label
+  return { zh: `${label.zh}（${value}）`, en: `${label.en} (${value})` }
+}
+
+/**
  * How a row is labelled: the preset's own value, which is what a person types
- * into `/permission`, with the host's display name beside it when it differs.
+ * into `/permission`, with a human name beside it when one differs from it.
  * @param preset - the row's preset.
  * @returns the label line.
  */
-function labelOf(preset: PresetRow): string {
-  return preset.name === undefined || preset.name === preset.value
-    ? preset.value
-    : `${preset.value} · ${preset.name}`
+function labelOf(preset: PresetRow): Line {
+  return presetNameLine(preset.value, preset.name)
 }
 
 /** What the settled picker says, in each of its two endings. */
@@ -1281,7 +1330,7 @@ export function settledPermissionCard(input: {
 }): object {
   const stage = input.stage ?? 'done'
   const state: CardState = isUnconfinedRow(input.preset) ? 'warning' : 'success'
-  const title = fill(PERMISSION_SETTLED[stage], input.preset.value)
+  const title = fillLine(PERMISSION_SETTLED[stage], presetTitled(input.preset.value, input.preset.name))
   const context = stage === 'done'
     ? describePreset(input.preset) ?? PERMISSION_SETTLED.plain
     : stage === 'held' ? PERMISSION_SETTLED.heldContext : PERMISSION_SETTLED.switchingContext

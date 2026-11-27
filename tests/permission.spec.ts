@@ -182,7 +182,7 @@ describe('what the surfaces after a switch say', () => {
     const misleading = { value: 'workspace-write', sandbox: 'danger-full-access', approval: 'never' }
     const settled = settledPermissionCard({ preset: misleading })
     const shown = cardTexts(settled).map((t) => t.content).join('\n')
-    expect(shown).toContain('已切到 workspace-write')
+    expect(shown).toContain('已切到 工作区内修改（workspace-write）')
     expect(shown).toContain('不再有审批卡')
 
     // And the honest one still reads quietly.
@@ -346,7 +346,7 @@ describe('the picker once a preset was chosen', () => {
     const settled = settledPermissionCard({ preset: { value: 'danger-full-access' } })
     expect(cardControls(settled)).toHaveLength(0)
     const shown = cardTexts(settled).map((t) => t.content)
-    expect(shown.some((t) => t.includes('已切到 danger-full-access'))).toBe(true)
+    expect(shown.some((t) => t.includes('已切到 完全权限（danger-full-access）'))).toBe(true)
     // What was just granted is restated where the decision landed.
     expect(shown.some((t) => t.includes('不再有审批卡'))).toBe(true)
     expect(shown.some((t) => t.includes('/permission'))).toBe(true)
@@ -356,7 +356,7 @@ describe('the picker once a preset was chosen', () => {
     const held = settledPermissionCard({ preset: { value: 'workspace-write' }, stage: 'held' })
     expect(cardControls(held)).toHaveLength(0)
     const shown = cardTexts(held).map((t) => t.content).join('\n')
-    expect(shown).toContain('本轮任务结束后切到 workspace-write')
+    expect(shown).toContain('本轮任务结束后切到 工作区内修改（workspace-write）')
     expect(shown).not.toContain('已切到')
   })
 })
@@ -368,5 +368,67 @@ describe('switching through a runtime that answers nothing', () => {
     expect(await switchPreset(agent, commands, 'workspace-write', AbortSignal.timeout(1000)))
       .toEqual({ ok: false, detail: 'the host does not offer /permission' })
     expect(execute).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('reading the table the current host publishes', () => {
+  /** The deployment's three presets, resolved the way the host's service does. */
+  const table = {
+    names: ['read-only', 'workspace-write', 'danger-full-access'],
+    resolve: (name: string): { sandbox: string; approval: string } => {
+      const specs: Record<string, { sandbox: string; approval: string }> = {
+        'read-only': { sandbox: 'read-only', approval: 'ask' },
+        'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+        'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+      }
+      const spec = specs[name]
+      if (spec === undefined) throw new Error(`no preset ${name}`)
+      return spec
+    },
+  }
+
+  it('lists every preset the table holds, even though the projection lists none', () => {
+    // The shape the current host publishes: folded state, no options, and a
+    // null selection for a session that never made one.
+    const { projections } = fakeProjections({
+      permissions: { preset: null, sandbox: 'workspace-write', approval: 'ask', seeded: true },
+    })
+    expect(readPresets(projections, agent, table)).toEqual({
+      current: 'workspace-write',
+      available: [
+        { value: 'read-only', name: 'read-only', sandbox: 'read-only', approval: 'ask' },
+        { value: 'workspace-write', name: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
+        { value: 'danger-full-access', name: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never' },
+      ],
+    })
+  })
+
+  it('takes the committed selection when the session made one', () => {
+    const { projections } = fakeProjections({
+      permissions: { preset: 'read-only', sandbox: 'read-only', approval: 'ask', seeded: true },
+    })
+    expect(readPresets(projections, agent, table).current).toBe('read-only')
+  })
+
+  it('asks the host to derive the preset when the log records no selection', () => {
+    const derived = {
+      ...table,
+      current: () => 'danger-full-access',
+    }
+    const { projections } = fakeProjections({
+      permissions: { preset: null, sandbox: null, approval: null, seeded: false },
+    })
+    expect(readPresets(projections, agent, derived).current).toBe('danger-full-access')
+  })
+
+  it('still reads the older wire shape, table or no table', () => {
+    const { projections } = fakeProjections({
+      permissions: { currentValue: 'danger-full-access', options: [{ value: 'danger-full-access' }] },
+    })
+    // Without a table the projection's own list is all there is to offer.
+    expect(readPresets(projections, agent)).toEqual({
+      current: 'danger-full-access',
+      available: [{ value: 'danger-full-access', name: 'danger-full-access' }],
+    })
   })
 })

@@ -121,6 +121,7 @@ import {
   PERMISSION_ACTION,
   PERMISSION_COMMAND,
   permissionActionValue,
+  presetLabel,
   readPresets,
   requestedEscalation,
   switchPreset,
@@ -1280,12 +1281,40 @@ export function installBridge(
    * @returns the message text.
    */
   const presetHeldText = (preset: string): string =>
-    `🔓 已记下：当前这轮任务结束后切到 ${preset}。`
+    `⏳ 已记下：当前这轮任务结束后切到 ${preset}。`
     + '\n（会话日志同一时刻只能有一个写入者，所以不在任务中途改。）'
 
-  /** What the chat is told when a switch landed. */
-  const presetSwitchedText = (preset: string): string =>
-    `🔓 已切到 ${preset}。用 \`/permission\` 可以随时切回。`
+  /**
+   * One preset named the way this chat names it: the human label, with the key
+   * it is switched by beside it, and no doubled parenthesis when a deployment's
+   * preset has no label of its own.
+   * @param preset - the preset key.
+   * @returns the name to put in a sentence.
+   */
+  const presetNamed = (preset: string): string => {
+    const name = presetLabel(preset)
+    return name === preset ? preset : `${name}（${preset}）`
+  }
+
+  /**
+   * What the chat is told when a switch landed.
+   *
+   * The direction is part of the report: a switch that narrows the session and
+   * one that widens it are both "done", but reading the same sentence for both
+   * leaves the person guessing which way their permissions just moved.
+   * @param preset - the preset now in force.
+   * @returns the message text.
+   */
+  const presetSwitchedText = (preset: string): string => {
+    const head = preset === UNCONFINED_PRESET
+      ? `🔓 已切到 ${presetNamed(preset)}：不再沙箱、不再弹审批卡。`
+      : preset === 'read-only'
+        ? `🔒 已切到 ${presetNamed(preset)}：不写任何文件，需要写的操作会弹审批卡。`
+        : preset === 'workspace-write'
+          ? `🛡️ 已切到 ${presetNamed(preset)}：只能写工作区和临时目录。`
+          : `✅ 已切到 ${presetNamed(preset)}。`
+    return `${head}\n用 \`/permission\` 可以随时切回。`
+  }
 
   /** What the chat is told when the person asking may not make this change. */
   const PRESET_NOT_YOURS = '⚠️ 你无权把本会话切到这个权限预设。'
@@ -1302,6 +1331,19 @@ export function installBridge(
    */
   const presetFailedText = (preset: string, detail?: string): string =>
     `⚠️ 切换到 ${preset} 失败${detail === undefined ? '' : `：${detail}`}。\n可以再点一次，或用 \`/permission ${preset}\` 直接切。`
+
+  /**
+   * What the chat is told when the name it typed is not one this deployment
+   * offers. The host would answer this in English, naming the table in a
+   * sentence written for a terminal; a chat gets the list it can press.
+   * @param preset - the name that was not offered.
+   * @param offered - the presets that are.
+   * @returns the message text.
+   */
+  const presetUnknownText = (preset: string, offered: readonly string[]): string =>
+    `⚠️ 没有 “${preset}” 这个预设。可选：\n`
+    + offered.map(name => `· ${presetNamed(name)}`).join('\n')
+    + '\n也可以只发 `/permission`，在卡片上点。'
 
   /** Bot senders this channel answers, and the budget their exchanges spend. */
   const botPeers = new Set(config.botPeers)
@@ -2289,6 +2331,22 @@ export function installBridge(
     if (refusal !== undefined) {
       notify(`lark-channel: rejected a permission switch: ${refusal}`)
       await port.send(chatId, { text: PRESET_NOT_YOURS }).catch(reportSendFailure)
+      return
+    }
+    // A name the table does not hold is answered here, before the host is
+    // asked: the host's own refusal is an English sentence about a table, and
+    // this is the one place a reader can be shown the presets as rows. The
+    // offered names come from the deployment's table — the thing `/permission`
+    // validates against — not from a projection that may list a subset.
+    let known: readonly string[] = []
+    try {
+      known = presetTable()?.names ?? []
+    } catch {
+      known = []
+    }
+    if (known.length === 0) known = state.available.map(option => option.value)
+    if (known.length > 0 && !known.includes(preset)) {
+      await port.send(chatId, { text: presetUnknownText(preset, known) }).catch(reportSendFailure)
       return
     }
     // Never awaited to the end here. This runs inside the transport's per-chat

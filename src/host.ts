@@ -76,6 +76,15 @@ export interface HostPermissionPresets {
   /** Every switchable preset name, in the table's declaration order. */
   readonly names: readonly string[]
   /**
+   * The preset currently in force for one session, derived by the host.
+   *
+   * The projection records the last SELECTION and may hold null for a session
+   * that never made one; this derives from the committed knobs and breaks ties
+   * between two names on one bundle the way the host's own picker does. Absent
+   * where the host does not publish it, in which case the projection decides.
+   */
+  current?(session: unknown): string
+  /**
    * One preset's knob bundle.
    * @throws when the name is not in the deployment's table.
    */
