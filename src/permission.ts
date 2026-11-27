@@ -257,7 +257,11 @@ export async function switchPreset(
 ): Promise<{ readonly ok: boolean; readonly detail?: string }> {
   if (commands === undefined) return { ok: false, detail: 'no command runtime is composed' }
   const execution = await commands
-    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, signal)
+    // The attachment list is positional: leaving it out puts the signal where
+    // the host expects attachments and leaves the signal `undefined`, which the
+    // host dereferences before it runs anything. This channel has no
+    // attachments to submit with a switch, so the list is empty.
+    .execute(agent, `/${PERMISSION_COMMAND} ${preset}`, [], signal)
     .catch((error: unknown) => {
       // A cancelled command is not a failed one, and flattening the two here
       // is invisible from the outside: the caller would see an ordinary

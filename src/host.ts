@@ -320,8 +320,20 @@ export interface HostCommands {
    * Run one complete slash-command line. Resolves `undefined` when the syntax
    * or the name does not resolve, which is what distinguishes an unknown
    * command from one that ran and failed.
+   *
+   * The attachments argument is positional and cannot be omitted: the host
+   * reads `signal.aborted` before it looks at anything else, so a caller that
+   * passes its signal one place too early hands the host an ARRAY and leaves
+   * the signal itself `undefined`. That is not a missing feature, it is a
+   * TypeError on every host command the chat types — this channel's own
+   * `/permission` card included. Pass an empty list for a plain invocation.
    */
-  execute(agent: HostAgent, line: string, signal: AbortSignal): Promise<HostCommandExecution | undefined>
+  execute(
+    agent: HostAgent,
+    line: string,
+    submittedAttachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<HostCommandExecution | undefined>
 }
 
 /** The `systemPrompt` assembler, as this plugin's per-agent composition uses it. */

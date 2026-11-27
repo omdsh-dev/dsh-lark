@@ -110,7 +110,11 @@ export async function runCommandLine(
   if (commands === undefined) {
     return { reply: `⚠️ 本部署没有组合命令运行时，\`/${name}\` 无法执行。`, resolved: false }
   }
-  const execution = await commands.execute(agent, trimmed, signal)
+  // Four arguments, in the host's order: the attachment list is positional and
+  // an omitted one shifts the signal into its place, which the host then reads
+  // as `undefined.aborted`. This channel submits no attachments with a typed
+  // command line, so the list is empty — but it has to be there.
+  const execution = await commands.execute(agent, trimmed, [], signal)
   if (execution === undefined) {
     return { reply: `⚠️ 未知命令 \`/${name}\`。\n\n${helpText(commands, agent)}`, resolved: false }
   }

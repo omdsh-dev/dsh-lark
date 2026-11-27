@@ -20,7 +20,7 @@ function fakeCommands(replies: Record<string, string>) {
   const ran: string[] = []
   const commands: HostCommands = {
     list: () => [],
-    execute: async (_agent, line) => {
+    execute: async (_agent, line, _attachments, _signal) => {
       ran.push(line)
       const text = replies[line.trim()]
       return text === undefined
@@ -113,6 +113,32 @@ describe('switching the preset', () => {
     expect(outcome.ok).toBe(false)
     expect(await switchPreset(agent, undefined, UNCONFINED_PRESET, AbortSignal.timeout(1000)))
       .toEqual({ ok: false, detail: 'no command runtime is composed' })
+  })
+
+  it('passes the attachments argument, with the signal last', async () => {
+    // The host's `execute` is positional — `(agent, line, attachments, signal)`
+    // — and checks `signal.aborted` before it looks at anything else. A caller
+    // that omits the attachment list hands the host its signal one place too
+    // early and `undefined` in its place, which is a TypeError on EVERY host
+    // command from the chat, not a missing capability. So the position is the
+    // contract, and this pins it: an empty list present, the caller's signal
+    // last and identical.
+    const calls: unknown[][] = []
+    const commands: HostCommands = {
+      list: () => [],
+      execute: async (...args: unknown[]) => {
+        calls.push(args)
+        return { result: { kind: 'success' as const, text: 'preset danger-full-access' } }
+      },
+    }
+    const controller = new AbortController()
+    await switchPreset(agent, commands, UNCONFINED_PRESET, controller.signal)
+    expect(calls).toHaveLength(1)
+    const [receivedAgent, line, attachments, signal] = calls[0]!
+    expect(receivedAgent).toBe(agent)
+    expect(line).toBe('/permission danger-full-access')
+    expect(attachments).toEqual([])
+    expect(signal).toBe(controller.signal)
   })
 })
 
@@ -228,7 +254,7 @@ describe('a switch cancelled after the command started', () => {
     const reason = new Error('the conversation moved on')
     const commands: HostCommands = {
       list: () => [],
-      execute: async (_agent, _line, signal) => {
+      execute: async (_agent, _line, _attachments, signal) => {
         await new Promise((_resolve, reject) => {
           signal?.addEventListener('abort', () => { reject(signal.reason as Error) }, { once: true })
         })
