@@ -874,6 +874,30 @@ export function installBridge(
     return pending
   }
 
+  /**
+   * Make the session the desktop groups under the workspace its header names.
+   *
+   * Grouping is an ACCOUNT the host keeps beside the log, not a derivation from
+   * the session's cwd: a session created by an older build — or opened first
+   * from another surface — resumes fine and still sits under "Ungrouped" in the
+   * desktop, while `/status` reads that same cwd and reports the workspace. The
+   * account is re-asserted on every open; `attachSession` is idempotent and
+   * validates the header cwd against the record, so a genuine mismatch reports
+   * instead of silently mis-grouping.
+   * @param sessionId - the session that was just opened.
+   */
+  const ensureGrouped = async (sessionId: string): Promise<void> => {
+    // The channel's own canonical path first: it is what the session was
+    // created with, and a differently-cased copy of the same directory must
+    // not mint a second workspace record.
+    const directory = pathBySession.get(sessionId) ?? defaultCwd
+    const workspace = await workspaceRecordFor(directory)
+    if (workspace === undefined) return
+    await workspace.attachSession(sessionId).catch((error: unknown) => {
+      notify(`lark-channel: session ${sessionId} stays ungrouped: ${String(error)}`)
+    })
+  }
+
   // Operator-facing, so it goes to the process stream as well as the logger:
   // the shipped profiles compose no logger printer, and a silently swallowed
   // outbound failure is indistinguishable from a hung chat.
@@ -1141,11 +1165,8 @@ export function installBridge(
         agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
         setup: composition.setup,
       })
-      if (workspace !== undefined) {
-        await workspace.attachSession(sessionId).catch((error: unknown) => {
-          notify(`lark-channel: session ${sessionId} stays ungrouped: ${String(error)}`)
-        })
-      }
+      // Grouping is re-asserted once per open (see ensureGrouped), so the
+      // create rung does not attach here as well.
       // The panel is app-wide, and the command list is only knowable from an
       // agent's scope, so the first chat to exist is what can publish it.
       publishSlashPanel(handle.agent)
@@ -1709,6 +1730,9 @@ export function installBridge(
     }
     try {
       const opened = await sessions.acquire(msg)
+      // Grouping is an ACCOUNT the host keeps beside the log; a resumed session
+      // is exactly the one whose account can be missing. See ensureGrouped.
+      await ensureGrouped(opened.handle.agent.session.id)
       const binding = await bindingFor(opened.handle.agent.session.id, msg)
       // A slash line is a control, not a prompt: the host runs it without a
       // model turn, so it must not be handed to the model as text — and it
