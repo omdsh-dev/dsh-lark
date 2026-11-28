@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The permission picker reads the `permissions` projection the host actually publishes. DSH 0.2.2 stores the folded session state (`preset` / `sandbox` / `approval`) and publishes `currentValue` only as the wire view a remote client renders, so a reader that expected `{ currentValue, options }` saw the preset in force as unknown, offered no rows at all, skipped the read-back after a switch, and could not find the unconfined preset an approval card offers to open a conversation with. The offer now comes from the deployment's own table (`permissionPresets.names` + `resolve`) — the same table `/permission` validates against — while the value in force is read from the folded state, falling back to the host's derivation and then to the committed knobs. The shipped presets carry bilingual labels, a landed switch states its direction, and a name outside the table is answered with the table.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
