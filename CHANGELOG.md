@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A plan review reaches the chat instead of the desktop. The plan service is composed inside the agent's preset group with `isolate: { planMode: true }`, so this channel's own context can never read it — and the shadow's registration was gated on that lookup, which therefore never passed: the agent kept the host's `exit_plan_mode`, whose review asks through the single `userQuestions` provider the desktop owns, and the chat showed the tool call and no card. Switching through the service failed the same way when the gate was simply removed. The shadow is now registered whenever a plan review is possible at all, refuses outside plan mode by reading the session log exactly as the host tool does, and leaves plan mode by running the host's own `/plan off` command, which runs inside the group and drives the service there. A switch that fails after the chat approved is reported to the model rather than lost.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
