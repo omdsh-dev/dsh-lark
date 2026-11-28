@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync } from 'node:fs'
+﻿import { mkdtempSync, realpathSync } from 'node:fs'
 import { chmod, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
@@ -389,6 +389,23 @@ describe('dsh-lark-channel', () => {
     expect(harness.fake.state.disconnects).toBe(1)
     expect(harness.fake.state.subscriptions).toBe(0)
     expect(harness.agents.created[0]!.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('ends a running turn before the plugin unload releases its agent', async () => {
+    // Unloading the plugin disposes its agents, and a turn cut by disposal is
+    // committed from the host loop's finally — an ending it never assigned is
+    // 	urn/end { reason: null }, which bricks the session's projection.
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage())
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const agent = harness.agents.created[0]!.agent
+    agent.drive(true)
+    const disposing = harness.dispose()
+    await vi.waitFor(() => {
+      expect(agent.cancel).toHaveBeenCalledWith('the channel is shutting down')
+    })
+    agent.drive(false)
+    await disposing
   })
 
   describe('agent composition', () => {
@@ -3950,5 +3967,25 @@ describe('dsh-lark-channel', () => {
     await fiber.dispose()
     expect(unregister).toHaveBeenCalledTimes(1)
     await removeService()
+  })
+})
+
+describe('releasing a conversation with a turn still running', () => {
+  it('cancels the turn before disposing the agent', async () => {
+    // Disposing mid-turn is what leaves the host's log with
+    // `turn/end { reason: null }`, which its own continuation projection then
+    // dereferences. Cancelling first ends the turn where a reason exists.
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const agent = harness.agents.created[0]!.agent
+    agent.drive(true)
+    const released = harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+    await vi.waitFor(() => {
+      expect(agent.cancel).toHaveBeenCalledWith('the conversation moved to another session')
+    })
+    agent.drive(false)
+    await released
+    await harness.dispose()
   })
 })

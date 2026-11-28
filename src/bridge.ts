@@ -1374,12 +1374,42 @@ export function installBridge(
       // the window and write to a session being disposed. Shut the writing
       // down first, then take the agent away.
       await maintenance.cancel(releasedId)
+      await settleActiveTurn(releasedId)
       await sessions.release(key)
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
       aimBySession.delete(releasedId)
       questions.cancelSession(releasedId)
     }
+  }
+
+  /**
+   * Let a running turn end through the host's own path before its agent is
+   * taken away.
+   *
+   * `/cd` and `/new` dispose a live agent; the host commits the turn's ending
+   * from the loop's `finally`, and an ending that was never assigned is written
+   * as `reason: null` — a record the host's own continuation projection
+   * dereferences, which is what makes the desktop show "历史加载失败" for a
+   * session this channel merely moved away from. Cancelling first ends the turn
+   * where a reason IS known; the wait is bounded, because the dispose that
+   * follows must not hang on a loop that cannot stop.
+   * @param sessionId - the session being released.
+   */
+  const settleActiveTurn = async (sessionId: string): Promise<void> => {
+    const agent = sessions.agentFor(sessionId)
+    if (agent === undefined) return
+    try {
+      agent.cancel('the conversation moved to another session')
+    } catch {
+      // A cancel that throws is no worse than the disposal that follows it.
+    }
+    const idle = agent.whenIdle?.()
+    if (idle === undefined) return
+    await Promise.race([
+      idle,
+      new Promise<void>((resolve) => { setTimeout(resolve, 2000) }),
+    ]).catch(() => undefined)
   }
 
   /** Everything `/status` reports, read fresh from channel state. */
