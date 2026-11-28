@@ -1051,7 +1051,7 @@ export function installBridge(
    * @returns the composition every rung of one session's ladder applies.
    * @throws when the roster supplies no such preset.
    */
-  const composeAgent = async (): Promise<AgentComposition> => {
+  const composeAgent = async (sessionId: string): Promise<AgentComposition> => {
     // Loader siblings mount concurrently; await the complete application so a
     // first message arriving during boot never sees a half-composed agent world.
     await (ctx.get('loader') as HostLoader | undefined)?.await()
@@ -1068,6 +1068,7 @@ export function installBridge(
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
         composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+        composedSessions.add(sessionId)
       },
     }
   }
@@ -1078,11 +1079,46 @@ export function installBridge(
    * Resolving a preset re-reads the roster, and a first-contact chat walks every
    * rung, so an uncached ladder would read the roster once per rung.
    */
+  /**
+   * Sessions whose agent already carries this channel's tools (its composition
+   * ran, here or in an earlier process). Adoption composes only what is missing.
+   */
+  const composedSessions = new Set<string>()
+
+  /**
+   * Give an agent ANOTHER owner created this channel's tools.
+   *
+   * A chat may continue a session the desktop is already driving (a picked
+   * session, or the active conversation). The ladder's lookup rung adopts that
+   * live agent instead of creating one, and an adopted agent kept the original
+   * owner's composition: the host's own `ask_user_question` then answers on the
+   * desktop's single userQuestions provider, so a question asked through the
+   * chat never reaches the chat. Composing this channel's tools into the agent's
+   * own scope is what makes the question tool (and send_file, the plan review
+   * and the standing prompt) present for the turns this chat drives.
+   * @param agent - the live agent the lookup rung found.
+   */
+  const adoptComposition = (agent: HostAgent): void => {
+    const id = agent.session.id
+    if (composedSessions.has(id)) return
+    const agentCtx = agent.ctx
+    if (agentCtx === undefined) {
+      notify(`lark-channel: ${id} is live under another owner and exposes no scope to compose; a question asked on it stays on that owner's surface`)
+      return
+    }
+    try {
+      composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+      composedSessions.add(id)
+    } catch (error) {
+      notify(`lark-channel: could not add this channel's tools to ${id}: ${String(error)}`)
+    }
+  }
+
   const compositions = new Map<string, Promise<AgentComposition>>()
   const compositionFor = (sessionId: string): Promise<AgentComposition> => {
     let pending = compositions.get(sessionId)
     if (pending === undefined) {
-      pending = composeAgent()
+      pending = composeAgent(sessionId)
       compositions.set(sessionId, pending)
       // A rejected composition is not replayed: the next message may arrive
       // after the roster it named was fixed.
@@ -1096,7 +1132,9 @@ export function installBridge(
   const ladder: SessionLadder = {
     lookup: (sessionId) => {
       const agent = agents.get(sessionId)
-      // An agent another owner published is theirs to dispose.
+      // An agent another owner published is theirs to dispose — but this chat is
+      // about to drive it, so it must carry this channel's tools.
+      if (agent !== undefined) adoptComposition(agent)
       return agent === undefined ? undefined : { agent, dispose: () => Promise.resolve() }
     },
     resume: async (sessionId) => {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Narrow local contracts for the DSH host services and events this plugin
  * consumes. Keeping these structural copies (instead of importing host source
  * packages) lets the package build self-contained; a composed DSH profile
@@ -178,6 +178,12 @@ export interface HostAgent {
   /** The single identity shared with {@link session}. */
   readonly id: string
   readonly session: HostSession
+  /**
+   * The agent's own scope, when the host exposes it. This channel registers its
+   * tools into an agent it ADOPTS here; a host that keeps the scope private
+   * leaves such an agent without them, which the bridge reports.
+   */
+  readonly ctx?: Context | undefined
   /** Queue an ordinary follow-up turn and wake the driver. */
   followup(message: HostUserMessage): void
   /**
