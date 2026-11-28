@@ -87,7 +87,7 @@ import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from 
 import type { StatusFields } from './status.ts'
 import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue, shadowQuestionTool } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
-import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
+import type { PlanReviewPorts } from './plan.ts'
 import type { PermissionActionValue, PresetOption } from './permission.ts'
 import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
@@ -595,15 +595,20 @@ function composeChatAgent(
   if (!shadowed && askQuestions !== undefined) denied.add(QUESTION_TOOL)
 
   // The plan tool is shadowed for the same reason and on the same terms: its
-  // review reaches for that same single-provider seam. Only worth registering
-  // where a plan service exists to leave plan mode afterwards — without one
-  // the host tool is not composed either, so there is nothing to shadow.
+  // review reaches for that same single-provider seam. Registration cannot be
+  // gated on the plan service being visible HERE: that service is composed
+  // inside the agent's preset group with `isolate: { planMode: true }`, so it
+  // is never readable from this side, and gating on it silently left the review
+  // on the desktop's single userQuestions provider. The shadow checks plan mode
+  // when it is CALLED, exactly as the host tool does, and leaves plan mode
+  // through the host's own `/plan off` command.
   const shadowedPlan = planReview !== undefined
-    && planReview.planMode() !== undefined
     && !denied.has(PLAN_TOOL)
     && tools?.register !== undefined
   if (shadowedPlan) tools?.register?.(shadowPlanTool(planReview!))
-  if (!shadowedPlan && planReview?.planMode() !== undefined) denied.add(PLAN_TOOL)
+  // A registry too old to shadow leaves the host's GUI-only review in place;
+  // denying it keeps the review from landing where nobody in the chat can see it.
+  if (!shadowedPlan && planReview !== undefined) denied.add(PLAN_TOOL)
 
   // `send_file` is NOT a shadow — the host has no tool of that name — but it is
   // registered on the same terms, because it is the same kind of thing: a
@@ -1013,7 +1018,16 @@ export function installBridge(
       })
       return { selected: answer.selected, ...answer.custom === undefined ? {} : { custom: answer.custom } }
     },
-    planMode: () => ctx.get('planMode') as HostPlanMode | undefined,
+    // The plan service is isolated inside the agent's preset group, so it
+    // cannot be read from here; the host's `/plan off` command runs inside that
+    // group and is the public way to switch the state it owns.
+    leavePlanMode: async (agent, signal) => {
+      const commands = ctx.get('commands') as HostCommands | undefined
+      if (commands === undefined) throw new Error('this deployment composed no command runtime to leave plan mode with')
+      const execution = await commands.execute(agent, '/plan off', signal ?? new AbortController().signal)
+      if (execution === undefined) throw new Error('the host composed no /plan command to leave plan mode with')
+      if (execution.result.kind === 'error') throw new Error(`leaving plan mode failed: ${execution.result.text}`)
+    },
   }
 
   /**

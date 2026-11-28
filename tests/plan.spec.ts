@@ -17,22 +17,23 @@ function fakeAgent(events: { type: string; data: unknown }[] = [{ type: 'plan/mo
 /** Ports recording what the review published and how it was answered. */
 function createPorts(
   answer: { selected: string[]; custom?: string },
-  options: { planMode?: boolean } = {},
+  options: { leaveFails?: string } = {},
 ) {
   const published: string[] = []
   const headings: (string | undefined)[] = []
-  const switched: boolean[] = []
+  const left: string[] = []
   const ports: PlanReviewPorts = {
     publish: async (_sessionId, plan) => { published.push(plan) },
     review: async (_sessionId, heading) => {
       headings.push(heading)
       return answer
     },
-    planMode: () => options.planMode === false
-      ? undefined
-      : { set: (_agent, active) => { switched.push(active); return 'queued' } },
+    leavePlanMode: async (agent) => {
+      if (options.leaveFails !== undefined) throw new Error(options.leaveFails)
+      left.push(agent.session.id)
+    },
   }
-  return { ports, published, headings, switched }
+  return { ports, published, headings, left }
 }
 
 /** The plan a well-behaved model presents. */
@@ -65,33 +66,33 @@ describe('plan review', () => {
   })
 
   it('publishes the plan, then leaves plan mode on approval', async () => {
-    const { ports, published, headings, switched } = createPorts({ selected: ['批准，开始执行'] })
+    const { ports, published, headings, left } = createPorts({ selected: ['批准，开始执行'] })
     const tool = shadowPlanTool(ports) as Runnable
 
     expect(await tool.execute({ plan: PLAN }, { agent: fakeAgent() })).toEqual({ approved: true })
     // The plan goes out whole, as the model wrote it.
     expect(published).toEqual([PLAN])
     expect(headings).toEqual(['迁移计划'])
-    expect(switched).toEqual([false])
+    expect(left).toEqual(['s1'])
   })
 
   it('stays in plan mode on every answer that is not approval', async () => {
     const kept = createPorts({ selected: ['继续规划'] })
     await expect((shadowPlanTool(kept.ports) as Runnable).execute({ plan: PLAN }, { agent: fakeAgent() }))
       .rejects.toThrow('revise the plan and present it again')
-    expect(kept.switched).toEqual([])
+    expect(kept.left).toEqual([])
 
     // Typed words are feedback the model revises against, so they ride back.
     const feedback = createPorts({ selected: [], custom: '回滚方案还没写' })
     await expect((shadowPlanTool(feedback.ports) as Runnable).execute({ plan: PLAN }, { agent: fakeAgent() }))
       .rejects.toThrow('回滚方案还没写')
-    expect(feedback.switched).toEqual([])
+    expect(feedback.left).toEqual([])
 
     // A dismissed review is someone about to speak: stop, do not re-present.
     const dismissed = createPorts({ selected: [] })
     await expect((shadowPlanTool(dismissed.ports) as Runnable).execute({ plan: PLAN }, { agent: fakeAgent() }))
       .rejects.toThrow('wait for their message')
-    expect(dismissed.switched).toEqual([])
+    expect(dismissed.left).toEqual([])
   })
 
   it('refuses before it publishes anything the chat would have to read', async () => {
@@ -105,19 +106,24 @@ describe('plan review', () => {
       .execute({ plan: '步骤一' }, { agent: fakeAgent() }))
       .rejects.toThrow('# heading')
 
-    const noService = createPorts({ selected: ['批准，开始执行'] }, { planMode: false })
-    await expect((shadowPlanTool(noService.ports) as Runnable).execute({ plan: PLAN }, { agent: fakeAgent() }))
-      .rejects.toThrow('no plan-mode service')
-
     // None of those reached the chat: a refusal the model can act on is not
     // worth a message the human has to read.
-    expect([...outside.published, ...headless.published, ...noService.published]).toEqual([])
+    expect([...outside.published, ...headless.published]).toEqual([])
+  })
+
+  it('reports a switch that failed after the chat approved', async () => {
+    // The approval already happened, so the plan was published; what the model
+    // needs is the truth about the mode it is still in, not a retry.
+    const failed = createPorts({ selected: ['批准，开始执行'] }, { leaveFails: 'leaving plan mode failed: unknown command' })
+    await expect((shadowPlanTool(failed.ports) as Runnable).execute({ plan: PLAN }, { agent: fakeAgent() }))
+      .rejects.toThrow('leaving plan mode failed')
+    expect(failed.published).toEqual([PLAN])
   })
 
   it('reviews anyway when the registry is too old to expose the session log', async () => {
-    const { ports, switched } = createPorts({ selected: ['批准，开始执行'] })
+    const { ports, left } = createPorts({ selected: ['批准，开始执行'] })
     const agent = { id: 's1', session: { id: 's1' }, followup: () => {}, cancel: () => {} }
     expect(await (shadowPlanTool(ports) as Runnable).execute({ plan: PLAN }, { agent })).toEqual({ approved: true })
-    expect(switched).toEqual([false])
+    expect(left).toEqual(['s1'])
   })
 })

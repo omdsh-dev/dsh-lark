@@ -453,8 +453,11 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('shadows the plan tool where a plan service exists to leave plan mode', async () => {
-      const harness = await mountChannel({}, { planMode: { set: () => 'queued' } })
+    it('shadows the plan tool even when the plan service is not visible here', async () => {
+      // The plan service is composed INSIDE the agent's preset group with
+      // `isolate: { planMode: true }`, so this context can never read it.
+      // Gating registration on it was what left the review on the desktop.
+      const harness = await mountChannel({})
       const created = await firstAgent(harness)
       expect(created.registeredTools.map((tool) => tool.name)).toContain('exit_plan_mode')
       expect(created.denyReason('exit_plan_mode')).toBeUndefined()
@@ -3863,10 +3866,8 @@ describe('dsh-lark-channel', () => {
   })
 
   it('reviews a plan in the chat: the plan as a message, the decision as a card', async () => {
-    const switched: { active: boolean }[] = []
-    const harness = await mountChannel({}, {
-      planMode: { set: (_agent: unknown, active: boolean) => { switched.push({ active }); return 'queued' } },
-    })
+    const commands = createFakeCommands([{ name: 'plan', description: '进入或离开计划模式' }])
+    const harness = await mountChannel({}, { commands: commands.service })
     await harness.fake.emitMessage(fakeMessage({ content: 'plan the migration' }))
     await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
     const created = harness.agents.created[0]!
@@ -3890,8 +3891,9 @@ describe('dsh-lark-channel', () => {
     const approve = cardControls(card.card)[0]!
     await harness.fake.emitCardAction(clickAction(approve.value))
     expect(await approved).toEqual({ approved: true })
-    // Leaving plan mode is the host service's own switch, not a copy of it.
-    expect(switched).toEqual([{ active: false }])
+    // Leaving plan mode runs the host's own `/plan off`, not a copy of its state
+    // machine: the service itself is isolated inside the agent's preset group.
+    expect(commands.executed).toContain('/plan off')
     await harness.dispose()
   })
 

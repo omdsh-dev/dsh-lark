@@ -12,8 +12,9 @@
  * It is SHADOWED instead, exactly as the question tool is: an agent-scoped
  * registration of the same name, which the host's layered tool registry
  * resolves before the global one. The review becomes the card this channel
- * already asks with, and approval calls the plan service's own public switch,
- * so the state transition stays the host's rather than a copy of it.
+ * already asks with, and approval leaves plan mode by running the host's own
+ * `/plan off` command, so the state transition stays the host's rather than a
+ * copy of it.
  *
  * The plan itself does NOT ride the card. It is markdown a model wrote, and
  * this module's rule is that model text inside a card renders literally — which
@@ -46,19 +47,7 @@ const DESCRIPTION = 'Use only in plan mode. Present your plan for the user\'s re
   + 'The user may approve (carry out the plan from your next step) or keep planning — their feedback '
   + 'comes back in the tool result; revise and present again.'
 
-/** The plan service, narrowed to the one call this module makes. */
-export interface HostPlanMode {
-  /**
-   * Switch one agent's plan mode. Public by the service's own contract — the
-   * `/plan` command drives it through this same method.
-   * @param agent - the agent whose session carries the state.
-   * @param active - the state to move to.
-   * @returns how the switch landed; mid-turn it queues to the next step.
-   */
-  set(agent: HostAgent, active: boolean): 'committed' | 'queued' | 'cancelled' | 'noop'
-}
-
-/** What the shadow needs from the bridge to ask, and to switch. */
+/** What the shadow needs from the bridge to ask, and to leave plan mode. */
 export interface PlanReviewPorts {
   /**
    * Send the plan to the chat as an ordinary message.
@@ -77,8 +66,18 @@ export interface PlanReviewPorts {
     heading: string | undefined,
     signal: AbortSignal | undefined,
   ): Promise<{ readonly selected: readonly string[]; readonly custom?: string | undefined }>
-  /** The plan service, when this deployment composed one. */
-  planMode(): HostPlanMode | undefined
+  /**
+   * Leave plan mode for this agent, once the chat approved the plan.
+   *
+   * The plan service is composed INSIDE the agent's preset group with
+   * `isolate: { planMode: true }`, so no context on this side can read it. The
+   * host's own `/plan off` command can, because it runs inside that group and
+   * drives the service from there — which is why this port is an action rather
+   * than a service handle.
+   * @param agent - the agent whose session carries the state.
+   * @param signal - the tool execution's cancellation.
+   */
+  leavePlanMode(agent: HostAgent, signal: AbortSignal | undefined): Promise<void>
 }
 
 /** Whether plan mode is active, folded from the session log; the last one wins. */
@@ -173,10 +172,6 @@ export function shadowPlanTool(ports: PlanReviewPorts): object {
       if (!/^#\s+\S/.test(plan.trim())) {
         throw new Error(`${PLAN_TOOL} requires a non-empty markdown plan starting with a # heading`)
       }
-      const planMode = ports.planMode()
-      if (planMode === undefined) {
-        throw new Error('no plan-mode service is available to leave plan mode; ask the user to switch the session mode instead')
-      }
       const sessionId = agent.session.id
       await ports.publish(sessionId, plan)
       const answer = await ports.review(sessionId, firstHeading(plan), context.signal)
@@ -205,7 +200,7 @@ export function shadowPlanTool(ports: PlanReviewPorts): object {
       // Mid-turn this queues to the next step, which is when the model's next
       // request is assembled — the same boundary the host tool's own switch
       // lands on.
-      planMode.set(agent, false)
+      await ports.leavePlanMode(agent, context.signal)
       return { approved: true }
     },
   }
