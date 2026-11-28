@@ -46,6 +46,7 @@ import type {
   HostSessionEvent,
   HostSessionProjections,
   HostCommands,
+  HostCommandDescriptor,
   HostContentBlock,
   HostSystemPrompt,
   HostTools,
@@ -501,6 +502,27 @@ const MAX_PENDING_FILE_SENDS = 3
  * agent dies between accepting a followup and starting its turn.
  */
 const MAX_PENDING_TARGETS = 500
+
+/**
+ * What the bot's `/` panel says for one host command.
+ *
+ * The host describes its commands for whoever types them at a terminal, in
+ * English, and that text is what a panel row showed — beside this channel's own
+ * rows, which are Chinese and name the surface the command actually has here.
+ * `/permission` is the row that matters most: in this channel it is also a card
+ * with buttons, a current preset and a switch the host performs, so a row
+ * advertising "switch the permission preset (sandbox mode + approval policy)"
+ * both reads as foreign and undersells it. Only commands this channel gives a
+ * surface of its own are restated; everything else keeps the host's words.
+ * @param descriptor - the host's own row.
+ * @returns the description to register on the panel.
+ */
+function panelDescription(descriptor: HostCommandDescriptor): string {
+  if (descriptor.name === PERMISSION_COMMAND) {
+    return '查看或切换本会话的权限预设（沙箱范围 + 审批策略）'
+  }
+  return descriptor.description
+}
 
 /**
  * Reduce one presentation title to a single safe card line: the value is
@@ -1253,7 +1275,10 @@ export function installBridge(
     panelPublished = true
     const hosted = (ctx.get('commands') as HostCommands | undefined)?.list(agent) ?? []
     const desired = [
-      ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
+      ...hosted.map(descriptor => ({
+        name: descriptor.name,
+        description: panelDescription(descriptor),
+      })),
       { name: STOP_COMMAND, description: '停止当前任务' },
       { name: CD_COMMAND, description: '切换本会话的工作区目录' },
       { name: WS_COMMAND, description: '查看可用工作区' },
@@ -1264,8 +1289,9 @@ export function installBridge(
       { name: SESSIONS_COMMAND, description: '列出可接续的会话，点一行就切过去' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
-    void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
+    void syncSlashPanel(port, desired, notify).then(({ added, updated, removed }) => {
       if (added.length > 0) notify(`lark-channel: registered /${added.join(', /')} on the bot's slash panel`)
+      if (updated.length > 0) notify(`lark-channel: refreshed the text of /${updated.join(', /')} on the bot's slash panel`)
       if (removed.length > 0) notify(`lark-channel: removed /${removed.join(', /')} from the bot's slash panel`)
     })
   }

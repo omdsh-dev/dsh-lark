@@ -4,13 +4,14 @@
  * message, so a chat only discovers what this channel accepts if the panel is
  * kept in step with it.
  *
- * The sync reconciles: it creates what the panel is missing and removes what
- * this channel no longer offers. An additive-only sync was tried first, on the
- * reasoning that the panel belongs to the app and a human might have curated
- * it. Drift turned out to be the real cost — a command removed from the channel
- * stayed in the menu and answered "unknown command" for everyone who picked it
- * — while a deployment that does curate its own menu has `syncSlashCommands`
- * to turn this off.
+ * The sync reconciles THREE things, not two: what the panel is missing, what
+ * this channel no longer offers, and what it offers with text that has since
+ * changed. The third was the gap that made a fixed command look unfixed — the
+ * panel kept the description it was created with, so `/permission` went on
+ * advertising the host's old one-line English summary long after this channel
+ * gave it a card, a picker and a Chinese name. The platform has no update
+ * route, so a changed description is repaired by removing the entry and
+ * registering it again.
  * @module dsh-lark-channel/slash-panel
  */
 
@@ -18,6 +19,12 @@
 export interface PanelCommand {
   readonly command: string
   readonly commandId: string
+  /**
+   * The description the panel shows for it, when the platform reports one.
+   * Absent means "cannot tell": the entry is left alone rather than rewritten
+   * against a description nobody managed to read.
+   */
+  readonly description?: string | undefined
 }
 
 /** The panel operations this sync needs from the transport. */
@@ -39,15 +46,18 @@ export interface DesiredCommand {
 /** What one reconciliation changed, for the caller to report. */
 export interface PanelSync {
   readonly added: string[]
+  /** Entries re-registered because their description no longer matched. */
+  readonly updated: string[]
   readonly removed: string[]
 }
 
 /**
- * Make the panel offer exactly what this channel accepts.
+ * Make the panel offer exactly what this channel accepts, under the text it
+ * accepts it with.
  * @param port - the panel operations.
  * @param desired - what this channel accepts.
  * @param notify - operator console line.
- * @returns the names added and removed.
+ * @returns the names added, re-registered and removed.
  */
 export async function syncSlashPanel(
   port: SlashPanelPort,
@@ -61,19 +71,42 @@ export async function syncSlashPanel(
     // Discovery is a convenience; a channel whose app cannot list commands
     // still accepts every one of them typed by hand.
     notify(`lark-channel: slash-command panel not synced: ${error instanceof Error ? error.message : String(error)}`)
-    return { added: [], removed: [] }
+    return { added: [], updated: [], removed: [] }
   }
-  const known = new Set(existing.map(entry => entry.command))
+  const known = new Map(existing.map(entry => [entry.command, entry]))
   const wanted = new Set(desired.map(command => command.name))
   const added: string[] = []
+  const updated: string[] = []
   const removed: string[] = []
   for (const command of desired) {
-    if (known.has(command.name)) continue
+    const entry = known.get(command.name)
+    if (entry === undefined) {
+      try {
+        await port.createSlashCommand(command.name, command.description)
+        added.push(command.name)
+      } catch (error) {
+        notify(`lark-channel: could not register /${command.name}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      continue
+    }
+    if (entry.description === undefined || entry.description === command.description) continue
+    // Replace, not patch: the platform offers create and delete only. A delete
+    // that lands and a create that does not would leave the menu WITHOUT the
+    // command, so that half is reported as the loss it is.
+    try {
+      await port.deleteSlashCommand(entry.commandId)
+    } catch (error) {
+      notify(`lark-channel: could not refresh /${command.name}: ${error instanceof Error ? error.message : String(error)}`)
+      continue
+    }
     try {
       await port.createSlashCommand(command.name, command.description)
-      added.push(command.name)
+      updated.push(command.name)
     } catch (error) {
-      notify(`lark-channel: could not register /${command.name}: ${error instanceof Error ? error.message : String(error)}`)
+      notify(
+        `lark-channel: removed /${command.name} to refresh its text but could not register it again: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
     }
   }
   for (const entry of existing) {
@@ -85,5 +118,5 @@ export async function syncSlashPanel(
       notify(`lark-channel: could not remove /${entry.command}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  return { added, removed }
+  return { added, updated, removed }
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The bot's `/` panel keeps up with a command's TEXT, not only its name. The platform registers a command with a description and offers no update, so an entry that already existed was never touched again — `/permission` went on advertising the host's English one-liner long after the channel had given it a card, a picker, and a current-preset row. The sync now compares descriptions as well: a changed one is repaired by removing the entry and registering it again (the only route the platform offers), the refresh is reported, and an entry whose description the platform could not report is left alone rather than rewritten against a guess.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),

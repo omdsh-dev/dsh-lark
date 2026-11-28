@@ -1586,6 +1586,51 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('describes /permission by the surface it has here, not the host\'s English line', async () => {
+      // The panel is the discovery surface: a row is all a person sees before
+      // choosing. `/permission` is not only the line the host documents — it is
+      // also a card with buttons, a current preset and a switch the host
+      // performs — so the host's "switch the permission preset (sandbox mode +
+      // approval policy)" reads as foreign beside this channel's Chinese rows
+      // and says nothing about what pressing it does here.
+      const commands = createFakeCommands([
+        { name: 'permission', description: 'Switch the permission preset (sandbox mode + approval policy)' },
+        { name: 'clear', description: 'Start a new conversation' },
+      ])
+      const harness = await mountChannel({}, { commands: commands.service })
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.fake.createdDescriptions.length).toBeGreaterThan(2) })
+      const registered = new Map(harness.fake.createdDescriptions.map(entry => [entry.command, entry.description]))
+      expect(registered.get('permission')).toBe('查看或切换本会话的权限预设（沙箱范围 + 审批策略）')
+      // A command this channel gives no surface of its own keeps the host's words.
+      expect(registered.get('clear')).toBe('Start a new conversation')
+      await harness.dispose()
+    })
+
+    it('refreshes an entry the panel registered with text that has since changed', async () => {
+      // The visible half of the same bug: the entry already exists, so an
+      // additive sync left it advertising whatever it was created with —
+      // forever, across every restart. The platform cannot patch a description,
+      // so the sync replaces the entry, and says so.
+      const commands = createFakeCommands([
+        { name: 'permission', description: 'Switch the permission preset (sandbox mode + approval policy)' },
+      ])
+      const harness = await mountChannel({}, { commands: commands.service })
+      harness.fake.panelCommands.push('permission')
+      harness.fake.panelDescriptions.set('permission', 'Switch the permission preset (sandbox mode + approval policy)')
+
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.fake.panelDeleted).toContain('permission') })
+      await vi.waitFor(() => {
+        expect(harness.fake.createdDescriptions).toContainEqual({
+          command: 'permission',
+          description: '查看或切换本会话的权限预设（沙箱范围 + 审批策略）',
+        })
+      })
+      expect(harness.notices.some((line) => line.includes('refreshed the text of /permission'))).toBe(true)
+      await harness.dispose()
+    })
+
   describe('workspace grouping', () => {
     it('accounts a chat session under the workspace for its directory', async () => {
       const cwd = process.cwd()
