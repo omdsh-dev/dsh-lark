@@ -66,7 +66,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 |---|---|
 | Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place |
 | Continue a session | `/sessions` lists what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; `/cd` and `/new` return it to the derived session |
-| Workspaces | `/ws` lists, `/cd` switches; returning to one resumes the work you left there |
+| Workspaces | `/ws` lists, `/cd` switches; returning to one resumes the work you left there, and a switch never resumes a session that belongs to another directory |
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |

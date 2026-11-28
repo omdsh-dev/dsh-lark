@@ -3952,3 +3952,49 @@ describe('dsh-lark-channel', () => {
     await removeService()
   })
 })
+
+describe('a stored session that belongs to another directory', () => {
+  it('opens the next epoch instead of resuming it', async () => {
+    // The deployment default keeps the plain id, so a chat whose first log was
+    // created when the default pointed elsewhere would otherwise resume that
+    // log forever and answer from the wrong directory.
+    const corpus = createFakeSessionQuery([{ id: 'lark-oc_chat_1', cwd: 'C:\\workspaces\\somewhere-else' }])
+    const harness = await mountChannel({}, { sessionQuery: corpus.query })
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    expect(harness.agents.resumed).not.toContain('lark-oc_chat_1')
+    expect(harness.agents.created[0]!.agent.session.id).toBe('lark-oc_chat_1--e1')
+    await harness.dispose()
+  })
+
+  it('adopts the newest stored epoch that does belong to this directory', async () => {
+    // A conversation that has started over keeps its context per directory:
+    // the repair must land on the newest session this directory actually has,
+    // not on an empty number whose log was never spoken to.
+    const here = process.cwd()
+    const corpus = createFakeSessionQuery([
+      { id: 'lark-oc_chat_1', cwd: 'C:\\workspaces\\somewhere-else' },
+      { id: 'lark-oc_chat_1--e1', cwd: 'C:\\workspaces\\somewhere-else' },
+      { id: 'lark-oc_chat_1--e2', cwd: here },
+    ])
+    const harness = await mountChannel({}, { sessionQuery: corpus.query })
+    harness.agents.resumable.add('lark-oc_chat_1--e2')
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1--e2') })
+    expect(harness.agents.resumed).not.toContain('lark-oc_chat_1')
+    expect(harness.agents.made).toEqual([])
+    await harness.dispose()
+  })
+
+  it('resumes it when it was created in this conversation\'s directory', async () => {
+    const here = process.cwd()
+    const corpus = createFakeSessionQuery([{ id: 'lark-oc_chat_1', cwd: here }])
+    const harness = await mountChannel({}, { sessionQuery: corpus.query })
+    harness.agents.resumable.add('lark-oc_chat_1')
+    await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+    await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1') })
+    expect(harness.agents.created).toHaveLength(1)
+    expect(harness.agents.made).toEqual([])
+    await harness.dispose()
+  })
+})

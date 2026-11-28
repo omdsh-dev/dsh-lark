@@ -1160,6 +1160,118 @@ export function installBridge(
   const sessions = new ConversationSessions(config.sessionScope, ladder, sessionIdForKey)
 
   /**
+   * Whether two directory spellings name the same place. Canonical where the
+   * filesystem can answer, resolved where it cannot — a stored session may name
+   * a directory that has since been removed, and that is still not this one.
+   * @param left - one path.
+   * @param right - the other.
+   * @returns true when they are the same directory.
+   */
+  const sameDirectory = (left: string, right: string): boolean => {
+    const normalize = (value: string): string => canonicalPathOf(value) ?? resolve(value)
+    const a = normalize(left)
+    const b = normalize(right)
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+  }
+
+  /**
+   * The directory each stored session was created in, read once.
+   *
+   * A session id says which conversation and directory a log belongs to only by
+   * convention: the deployment default keeps the plain id, so a log created
+   * when the default was a different path carries an id that looks exactly like
+   * this conversation's own. The corpus is what actually knows.
+   */
+  let storedDirectories: Promise<Map<string, string>> | undefined
+  const storedDirectoryOf = async (sessionId: string): Promise<string | undefined> => {
+    storedDirectories ??= (async () => {
+      const map = new Map<string, string>()
+      const query = ctx.get('sessionQuery') as HostSessionQuery | undefined
+      if (query === undefined) return map
+      try {
+        for (const record of await query.listSessions()) {
+          const id = record.header?.id
+          const cwd = record.header?.cwd
+          if (typeof id === 'string' && typeof cwd === 'string') map.set(id, cwd)
+        }
+      } catch (error) {
+        notify(`lark-channel: could not read the stored sessions: ${failureDetail(error)}`)
+      }
+      return map
+    })()
+    return (await storedDirectories).get(sessionId)
+  }
+
+  /**
+   * Make the session a conversation opens be the one for ITS directory.
+   *
+   * The id is derived from (conversation × directory), but the default
+   * directory keeps the plain id — so a chat whose log was created when the
+   * deployment default pointed somewhere else keeps deriving an id that is
+   * already taken by that older, wrong-directory session. Resuming it is
+   * invisible until every tool runs and every reply lands in the old place;
+   * `/cd` to the current directory then reports "already there" and cannot fix
+   * it, because the id does not change.
+   *
+   * The repair is the channel's own epoch: a session for this directory that
+   * does not exist yet is the next epoch of the same conversation. It is
+   * checked once per opening, so a restart, a `/cd`, and a hand-edited settings
+   * file all heal the same way.
+   * @param key - the conversation about to be opened.
+   * @returns the epoch it advanced to, or undefined when nothing had to move.
+   */
+  const alignSessionDirectory = async (key: string): Promise<number | undefined> => {
+    const wanted = chatWorkspaces.pathFor(key)
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const sessionId = sessionIdOf(key)
+      const stored = await storedDirectoryOf(sessionId)
+      if (stored === undefined || sameDirectory(stored, wanted)) return undefined
+      // A pick that points at another directory is the thing being overridden;
+      // drop it before advancing the epoch, or the id never changes.
+      if (chatSessionPicks.pickFor(key) !== undefined) {
+        await chatSessionPicks.set(key, undefined)
+        notify(`lark-channel: dropped the session pick for ${key} — it was created in ${stored}, not ${wanted}`)
+        continue
+      }
+      const base = chatWorkspaces.baseSessionIdFor(key)
+      // The context this conversation actually built in this directory lives on
+      // an epoch that exists; a fresh number would start empty beside it. Take
+      // the newest such epoch, and only mint a new one when there is none.
+      const existing = await newestEpochIn(base, wanted)
+      const change = existing === undefined
+        ? await chatEpochs.startNew(base)
+        : { epoch: existing, durable: await chatEpochs.adopt(base, existing) }
+      notify(
+        `lark-channel: ${sessionId} was created in ${stored}, but this conversation is in ${wanted}; `
+        + `opened the ${existing === undefined ? 'new' : 'stored'} session for ${wanted} (epoch ${change.epoch}) instead of resuming it`,
+      )
+      return change.epoch
+    }
+    return undefined
+  }
+
+  /**
+   * The newest stored epoch of one base id that belongs to a directory.
+   * @param base - the conversation's id at epoch zero.
+   * @param directory - the directory the conversation runs in.
+   * @returns the epoch number, or undefined when no stored epoch is that directory's.
+   */
+  const newestEpochIn = async (base: string, directory: string): Promise<number | undefined> => {
+    if (storedDirectories === undefined) return undefined
+    const map = await storedDirectories
+    let newest: number | undefined
+    for (const [id, cwd] of map) {
+      if (!id.startsWith(`${base}--e`)) continue
+      const suffix = id.slice(base.length + 3)
+      if (!/^\d+$/.test(suffix)) continue
+      if (!sameDirectory(cwd, directory)) continue
+      const epoch = Number.parseInt(suffix, 10)
+      if (newest === undefined || epoch > newest) newest = epoch
+    }
+    return newest
+  }
+
+  /**
    * The renderer for one session, opened on first use and kept until the fiber
    * unwinds: it holds the turn's streaming card, which outlives any one message.
    * @param sessionId - the session whose events it renders.
@@ -1708,6 +1820,8 @@ export function installBridge(
       return
     }
     try {
+      const conversation = conversationKey(config.sessionScope, msg)
+      await alignSessionDirectory(conversation)
       const opened = await sessions.acquire(msg)
       const binding = await bindingFor(opened.handle.agent.session.id, msg)
       // A slash line is a control, not a prompt: the host runs it without a
