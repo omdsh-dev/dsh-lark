@@ -1602,6 +1602,23 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('re-asserts grouping when a stored session is resumed', async () => {
+      // The account can be missing even though the header cwd is right: the
+      // session may predate the registry knowing this directory. A resume has
+      // to heal it, or the desktop keeps filing the chat under Ungrouped while
+      // `/status` reads that same cwd and reports the workspace.
+      const cwd = process.cwd()
+      const workspaces = createFakeWorkspaces({ [cwd]: 'ws_existing' })
+      const harness = await mountChannel({ cwd }, { workspaces: workspaces.service })
+      harness.agents.resumable.add('lark-oc_chat_1')
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1') })
+      await vi.waitFor(() => {
+        expect(workspaces.attached).toContainEqual({ workspaceId: 'ws_existing', sessionId: 'lark-oc_chat_1' })
+      })
+      await harness.dispose()
+    })
+
     it('registers the directory when no workspace claims it', async () => {
       const cwd = process.cwd()
       const workspaces = createFakeWorkspaces()

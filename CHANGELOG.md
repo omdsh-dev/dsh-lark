@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A chat session the channel only RESUMED now joins its workspace in the desktop. Grouping is an account the host keeps beside the session log, and the channel only recorded it when IT created the session: a conversation restored after a restart, opened first from another surface, or older than the registry that lists it resumed fine and still sat under Ungrouped, while `/status` read the session's own cwd and named the workspace. Every open now re-asserts the account through the host's idempotent `attachSession`, which validates the header cwd against the record.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
