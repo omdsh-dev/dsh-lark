@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A permission switch is read back before it is claimed. A host accepting the command line is not the session holding the preset; what a chat and the desktop both display is the session's `permissions` projection, so that is what is read once the switch settles, and a projection that still shows another preset is reported as the failure it is instead of "已切到 X". A typed switch cancelled while queued (a `/new`, `/cd`, or model switch released the agent first) now says that it did not happen, instead of staying silent after having been acknowledged.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),
