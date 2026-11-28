@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A chat that continues a session the desktop is already driving now gets this channel's tools on that agent. The ladder ADOPTS a live agent instead of creating one, and adoption used to keep the other owner's composition: the host's own `ask_user_question` answered on the desktop's single userQuestions provider, so the chat showed the tool call and no option card, and `send_file`/the plan review were missing for the same reason. The channel's composition is now applied to the adopted agent's own scope once per agent, and a host that keeps that scope private is reported rather than silently left without a question tool.
+
 ## 0.0.7 — 2026-08-19
 
 Thanks to @HarveyZed for `/session` (#9, the groundwork for `/sessions`),

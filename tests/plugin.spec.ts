@@ -399,6 +399,33 @@ describe('dsh-lark-channel', () => {
       return harness.agents.created[0]!
     }
 
+    it('gives a live agent another owner created this channel\'s tools', async () => {
+      // A chat may continue a session the desktop is already driving. The agent
+      // is adopted, not re-created, so its tool scope came from the desktop: the
+      // host's own ask_user_question answers on the desktop's userQuestions
+      // provider and the chat sees no options. This composition is the fix.
+      const harness = await mountChannel()
+      const live = harness.agents.declareLive('lark-oc_chat_1')
+      const registered: string[] = []
+      const scope = new Context()
+      scope.provide('tools', {
+        register: (definition: { name: string }) => {
+          registered.push(definition.name)
+          return () => undefined
+        },
+        guard: () => () => undefined,
+      })
+      scope.provide('systemPrompt', { section: () => undefined })
+      Object.assign(live, { ctx: scope })
+
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.looked).toContain('lark-oc_chat_1') })
+      await vi.waitFor(() => { expect(registered).toContain('ask_user_question') })
+      // The channel's own file tool and standing prompt travel with it.
+      expect(registered).toContain('send_file')
+      await harness.dispose()
+    })
+
     it('joins the roster default preset so the model gets tools', async () => {
       const roster = createFakePresets(['default', 'reviewer'])
       const harness = await mountChannel({}, { presets: roster.presets })
